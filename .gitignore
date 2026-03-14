@@ -1,0 +1,37 @@
+.DS_Store
+
+.idea/
+
+# Python cache and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+build/
+dist/
+*.egg-info/
+site/
+
+# Generated temporal_sbm run artifacts
+.stress_runs/
+graph_tool_out/
+*.gt
+*.pkl.gz
+processed_data/
+BAK/
+docs/
+*.bak
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+
+# Local dependencies for the methods figure pipeline
+docs/methods_figures/node_modules/

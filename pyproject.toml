@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netforge"
+version = "0.1.0"
+description = "NetForge for temporal network block model experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "matplotlib>=3.10",
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "holidays>=0.40",
+]
+keywords = ["graph-tool", "stochastic block model", "temporal networks"]
+
+[project.scripts]
+netforge = "temporal_sbm.cli:main"
+
+[project.optional-dependencies]
+docs = [
+  "mkdocs>=1.6",
+  "mkdocs-material>=9.6",
+  "mkdocstrings[python]>=0.30",
+]
+
+[tool.setuptools.packages.find]
+include = ["temporal_sbm", "temporal_sbm.*"]

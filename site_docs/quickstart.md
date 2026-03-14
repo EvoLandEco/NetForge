@@ -1,0 +1,94 @@
+# Quickstart
+
+This quickstart builds the Dutch toy dataset locally and runs the same three-stage workflow most NetForge users will use on real data.
+
+## Toy dataset location
+
+```text
+examples/
+  public/
+    nl_corop.geojson
+  toy_nl/
+    build_toy_nl_dataset.py
+    processed_data/
+      TOY_NL/
+        edges.csv
+        node_features.npy
+        node_map.csv
+        node_schema.json
+        dataset_manifest.json
+```
+
+Generate the source files first:
+
+```bash
+python examples/toy_nl/build_toy_nl_dataset.py
+```
+
+That command writes `examples/toy_nl/processed_data/TOY_NL/`. The directory is ignored, so the generated files stay local.
+
+## What the toy data encode
+
+The toy panel covers `2019-12-16` through `2020-01-12` and includes 12 farm nodes across four Dutch COROP areas:
+
+- `CR17` Utrecht
+- `CR23` Groot-Amsterdam
+- `CR24` Het Gooi en Vechtstreek
+- `CR26` Agglomeratie 's-Gravenhage
+
+The example is designed to show three signals clearly:
+
+- larger farms exchange more weight
+- longer routes exchange less weight
+- weekends and Dutch public holidays carry less activity
+
+The basemap for geographic plots is stored at `examples/public/nl_corop.geojson`.
+
+## Step 1: fit the model
+
+```bash
+netforge fit \
+  --data-root examples/toy_nl/processed_data \
+  --dataset TOY_NL \
+  --directed \
+  --weight-col trade \
+  --weight-model discrete-poisson \
+  --weight-transform none \
+  --date-start 2019-12-16 \
+  --date-end 2020-01-12
+```
+
+By default, the run directory is:
+
+```text
+examples/toy_nl/processed_data/TOY_NL/graph_tool_out/netforge/
+```
+
+## Step 2: generate synthetic panels
+
+```bash
+netforge generate \
+  --run-dir examples/toy_nl/processed_data/TOY_NL/graph_tool_out/netforge \
+  --num-samples 3 \
+  --seed 2026 \
+  --posterior-partition-sweeps 25 \
+  --posterior-partition-sweep-niter 10
+```
+
+This writes generated panels under `generated/` inside the run directory.
+
+## Step 3: write diagnostics
+
+```bash
+netforge report \
+  --run-dir examples/toy_nl/processed_data/TOY_NL/graph_tool_out/netforge \
+  --detailed-diagnostics \
+  --diagnostic-top-k 8 \
+  --html-report
+```
+
+The report stage writes tables and figures under `diagnostics/`, including the HTML report.
+
+## Before you swap in your own data
+
+Read the [data format guide](data-format.md) before building a new dataset. NetForge expects one fixed dataset layout, and the node matrix uses direct indexing: row `n` must match `node_id == n`.
