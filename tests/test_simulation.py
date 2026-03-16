@@ -79,6 +79,11 @@ class SimulationTests(unittest.TestCase):
             tmp_path = Path(tmpdir)
             per_snapshot_a = tmp_path / "run_a_per_snapshot.csv"
             per_snapshot_b = tmp_path / "run_b_per_snapshot.csv"
+            observed_outcomes = tmp_path / "observed_outcomes.csv"
+            synthetic_outcomes_a = tmp_path / "run_a_synthetic_outcomes.csv"
+            synthetic_outcomes_b = tmp_path / "run_b_synthetic_outcomes.csv"
+            outcome_summary_a = tmp_path / "run_a_outcome_distribution_summary.csv"
+            outcome_summary_b = tmp_path / "run_b_outcome_distribution_summary.csv"
             pd.DataFrame(
                 {
                     "day_index": [0],
@@ -95,6 +100,46 @@ class SimulationTests(unittest.TestCase):
                     "synthetic_farm_prevalence": [3.0],
                 }
             ).to_csv(per_snapshot_b, index=False)
+            pd.DataFrame(
+                {
+                    "farm_attack_rate": [0.1, 0.2],
+                    "farm_peak_prevalence": [2.0, 3.0],
+                    "farm_peak_day_index": [4.0, 5.0],
+                    "farm_duration_days": [8.0, 9.0],
+                }
+            ).to_csv(observed_outcomes, index=False)
+            pd.DataFrame(
+                {
+                    "farm_attack_rate": [0.11, 0.13],
+                    "farm_peak_prevalence": [2.0, 2.0],
+                    "farm_peak_day_index": [4.0, 6.0],
+                    "farm_duration_days": [7.0, 10.0],
+                }
+            ).to_csv(synthetic_outcomes_a, index=False)
+            pd.DataFrame(
+                {
+                    "farm_attack_rate": [0.14, 0.16],
+                    "farm_peak_prevalence": [3.0, 4.0],
+                    "farm_peak_day_index": [6.0, 7.0],
+                    "farm_duration_days": [9.0, 11.0],
+                }
+            ).to_csv(synthetic_outcomes_b, index=False)
+            pd.DataFrame(
+                {
+                    "metric": ["farm_attack_rate", "farm_peak_prevalence", "farm_peak_day_index", "farm_duration_days"],
+                    "wasserstein_distance": [0.01, 0.02, 0.03, 0.04],
+                    "original_median": [0.10, 2.0, 4.0, 8.5],
+                    "synthetic_median": [0.12, 2.5, 5.0, 8.0],
+                }
+            ).to_csv(outcome_summary_a, index=False)
+            pd.DataFrame(
+                {
+                    "metric": ["farm_attack_rate", "farm_peak_prevalence", "farm_peak_day_index", "farm_duration_days"],
+                    "wasserstein_distance": [0.02, 0.03, 0.04, 0.05],
+                    "original_median": [0.10, 2.0, 4.0, 8.5],
+                    "synthetic_median": [0.14, 3.0, 6.0, 10.0],
+                }
+            ).to_csv(outcome_summary_b, index=False)
 
             reports = [
                 {
@@ -109,7 +154,12 @@ class SimulationTests(unittest.TestCase):
                         "farm_peak_prevalence_wasserstein": 0.2,
                         "farm_duration_wasserstein": 0.3,
                     },
-                    "outputs": {"per_snapshot_csv": str(per_snapshot_a)},
+                    "outputs": {
+                        "per_snapshot_csv": str(per_snapshot_a),
+                        "observed_outcomes": str(observed_outcomes),
+                        "synthetic_outcomes": str(synthetic_outcomes_a),
+                        "outcome_distribution_summary": str(outcome_summary_a),
+                    },
                 },
                 {
                     "sample_label": "maxent_micro__rewire_none__sample_0001",
@@ -123,7 +173,12 @@ class SimulationTests(unittest.TestCase):
                         "farm_peak_prevalence_wasserstein": 0.22,
                         "farm_duration_wasserstein": 0.35,
                     },
-                    "outputs": {"per_snapshot_csv": str(per_snapshot_b)},
+                    "outputs": {
+                        "per_snapshot_csv": str(per_snapshot_b),
+                        "observed_outcomes": str(observed_outcomes),
+                        "synthetic_outcomes": str(synthetic_outcomes_b),
+                        "outcome_distribution_summary": str(outcome_summary_b),
+                    },
                 },
             ]
 
@@ -134,6 +189,7 @@ class SimulationTests(unittest.TestCase):
             )
 
             self.assertEqual(aggregated["sample_class"], "posterior_predictive")
+            self.assertTrue(Path(aggregated["outputs"]["distribution_png"]).exists())
 
     def test_write_scientific_validation_report_reads_custom_simulation_dir(self):
         with TemporaryDirectory() as tmpdir:
@@ -259,6 +315,14 @@ class SimulationTests(unittest.TestCase):
             self.assertIn(".summary-card, .figure-card, .artifact-card, .table-card { min-width: 0; }", report_html)
             self.assertIn(".figure-frame { min-width: 0; overflow: hidden;", report_html)
             self.assertIn(".table-wrap { max-width: 100%; overflow: auto;", report_html)
+            self.assertIn(".dataframe.report-table {", report_html)
+            self.assertIn("width: max-content;", report_html)
+            self.assertIn("white-space: nowrap;", report_html)
+            self.assertIn(".figure-popout-button {", report_html)
+            self.assertIn("id='figure_overlay'", report_html)
+            self.assertIn("id='figure_overlay_zoom_in'", report_html)
+            self.assertIn("id='figure_overlay_save'", report_html)
+            self.assertIn("document.querySelectorAll('.figure-popout-button')", report_html)
             self.assertIn("<div class='table-card'><div class='table-wrap'><table class='report-table'>", report_html)
 
     def test_write_region_geo_html_uses_stacked_metric_sections_and_scale_switch(self):
