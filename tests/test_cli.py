@@ -25,6 +25,11 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(argv, ["generate", "--run-dir", "/tmp/run"])
 
+    def test_normalise_argv_keeps_explicit_sweep_subcommand(self):
+        argv = _normalise_argv(["sweep", "--config", "/tmp/sweep.json"])
+
+        self.assertEqual(argv, ["sweep", "--config", "/tmp/sweep.json"])
+
     def test_build_parser_accepts_run_arguments_after_normalisation(self):
         parser = build_parser()
         args = parser.parse_args(
@@ -42,6 +47,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.dataset, "CR35")
         self.assertEqual(args.output_dir, None)
         self.assertEqual(args.weight_model, "auto")
+
+    def test_build_parser_accepts_sweep_arguments(self):
+        parser = build_parser()
+        args = parser.parse_args(["sweep", "--config", "/tmp/sweep.json"])
+
+        self.assertEqual(args.command, "sweep")
+        self.assertEqual(args.config, "/tmp/sweep.json")
 
 
 if __name__ == "__main__":

@@ -7312,12 +7312,16 @@ def run_command(args: argparse.Namespace) -> dict[str, object]:
     if str(getattr(args, "scenario_set", "single")) != "major":
         return _run_single_configuration(args)
 
+    return run_scenario_set(args, _major_scenarios())
+
+
+def run_scenario_set(args: argparse.Namespace, scenarios: list[SimulationScenario]) -> dict[str, object]:
     run_dir = Path(args.run_dir).expanduser().resolve()
     scenario_root = Path(args.output_dir).expanduser().resolve() if args.output_dir else run_dir / "simulation_scenarios"
     scenario_root.mkdir(parents=True, exist_ok=True)
 
     scenario_rows: list[dict[str, object]] = []
-    for scenario in _major_scenarios():
+    for scenario in scenarios:
         scenario_args = _namespace_with_overrides(args, scenario.overrides)
         scenario_output_dir = scenario_root / scenario.name
         LOGGER.info("Running simulation scenario | name=%s | output_dir=%s", scenario.name, scenario_output_dir)

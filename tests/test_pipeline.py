@@ -9,6 +9,8 @@ import pandas as pd
 from temporal_sbm.pipeline import (
     _align_external_weight_values,
     _detect_transformed_external_weight_companion,
+    _merge_generated_sample_records,
+    _merge_generated_setting_records,
     prepare_data,
     resolve_input_paths,
     _sample_kwargs,
@@ -106,6 +108,48 @@ class PipelineWeightAlignmentTests(unittest.TestCase):
         self.assertEqual(kwargs["max_ent"], False)
         self.assertEqual(kwargs["n_iter"], 123)
         self.assertEqual(kwargs["sample_params"], False)
+
+    def test_merge_generated_sample_records_keeps_prior_settings(self):
+        existing = [
+            {
+                "sample_manifest_path": "/tmp/generated/micro/sample_0000/sample_manifest.json",
+                "setting_label": "micro__rewire_none",
+                "sample_index": 0,
+            }
+        ]
+        new_records = [
+            {
+                "sample_manifest_path": "/tmp/generated/canonical/sample_0000/sample_manifest.json",
+                "setting_label": "canonical_ml__rewire_none",
+                "sample_index": 0,
+            }
+        ]
+
+        merged = _merge_generated_sample_records(existing, new_records)
+
+        self.assertEqual(
+            [record["setting_label"] for record in merged],
+            ["canonical_ml__rewire_none", "micro__rewire_none"],
+        )
+
+    def test_merge_generated_setting_records_replaces_same_setting_manifest(self):
+        existing = [
+            {
+                "setting_manifest_path": "/tmp/generated/micro/setting_manifest.json",
+                "setting_label": "micro__rewire_none",
+                "num_samples_requested": 2,
+            }
+        ]
+        replacement = {
+            "setting_manifest_path": "/tmp/generated/micro/setting_manifest.json",
+            "setting_label": "micro__rewire_none",
+            "num_samples_requested": 3,
+        }
+
+        merged = _merge_generated_setting_records(existing, replacement)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["num_samples_requested"], 3)
 
 
 class PipelineInputFormatTests(unittest.TestCase):

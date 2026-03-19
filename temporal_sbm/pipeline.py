@@ -2210,16 +2210,21 @@ def sample_synthetic_panel(
 
     rewire_model = str(getattr(args, "rewire_model", "none"))
     sample_manifest_path = output_dir / "sample_manifest.json"
+    setting_dir = output_dir.parent
     payload = {
         "sample_dir": str(output_dir),
         "sample_manifest_path": str(sample_manifest_path),
         "synthetic_edges_csv": str(panel_path),
         "snapshot_dir": str(snapshot_dir),
         "setting_label": _generation_setting_label(args),
+        "setting_dir": str(setting_dir),
+        "setting_manifest_path": str(setting_dir / "setting_manifest.json"),
         "node_partition_path": str(partition_path),
         "partition_source": "posterior_refresh" if int(getattr(args, "posterior_partition_sweeps", 0)) > 0 else "fitted_state",
         "sample_class": "sensitivity_analysis" if rewire_model != "none" else "posterior_predictive",
+        "sample_seed": int(seed),
         "edge_count": int(len(panel_frame)),
+        "generation_args": _serialise_generation_args(args),
         "sample_settings": {
             "sample_mode": _generation_sample_mode_label(args),
             "sample_canonical": bool(getattr(args, "sample_canonical", False)),
@@ -2250,6 +2255,75 @@ def save_json(payload: dict, path: Path) -> str:
 
 def load_json(path: Path) -> dict:
     return json.loads(Path(path).read_text())
+
+
+def _json_ready(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_ready(subvalue) for key, subvalue in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(subvalue) for subvalue in value]
+    if isinstance(value, np.ndarray):
+        return [_json_ready(subvalue) for subvalue in value.tolist()]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return None if not np.isfinite(float(value)) else float(value)
+    if pd.isna(value):
+        return None
+    return value
+
+
+def _serialise_generation_args(args: argparse.Namespace) -> dict[str, object]:
+    return {str(key): _json_ready(value) for key, value in vars(args).items()}
+
+
+def _merge_generated_sample_records(existing: list[dict], new_records: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for record in existing:
+        key = str(
+            record.get("sample_manifest_path")
+            or record.get("synthetic_edges_csv")
+            or record.get("sample_label")
+            or len(merged)
+        )
+        merged[key] = record
+    for record in new_records:
+        key = str(
+            record.get("sample_manifest_path")
+            or record.get("synthetic_edges_csv")
+            or record.get("sample_label")
+            or len(merged)
+        )
+        merged[key] = record
+    return sorted(
+        merged.values(),
+        key=lambda record: (
+            str(record.get("setting_label") or ""),
+            int(record.get("sample_index", 0)),
+            str(record.get("sample_manifest_path") or ""),
+        ),
+    )
+
+
+def _merge_generated_setting_records(existing: list[dict], new_record: dict) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for record in existing:
+        key = str(
+            record.get("setting_manifest_path")
+            or record.get("setting_dir")
+            or record.get("setting_label")
+            or len(merged)
+        )
+        merged[key] = record
+    key = str(
+        new_record.get("setting_manifest_path")
+        or new_record.get("setting_dir")
+        or new_record.get("setting_label")
+    )
+    merged[key] = new_record
+    return sorted(merged.values(), key=lambda record: str(record.get("setting_label") or ""))
 
 
 def write_fit_artifacts(
@@ -2450,7 +2524,27 @@ def generate_command(args: argparse.Namespace) -> list[dict]:
         save_json(sample_manifest, Path(sample_manifest["sample_manifest_path"]))
         sample_records.append(sample_manifest)
 
-    manifest["generated_samples"] = sample_records
+    setting_manifest_path = generated_root / "setting_manifest.json"
+    setting_manifest = {
+        "setting_label": _generation_setting_label(args),
+        "setting_dir": str(generated_root),
+        "setting_manifest_path": str(setting_manifest_path),
+        "num_samples_requested": int(args.num_samples),
+        "generation_args": _serialise_generation_args(args),
+        "sample_manifest_paths": [str(record["sample_manifest_path"]) for record in sample_records],
+        "sample_labels": [str(record["sample_label"]) for record in sample_records],
+        "sample_indices": [int(record["sample_index"]) for record in sample_records],
+    }
+    save_json(setting_manifest, setting_manifest_path)
+
+    manifest["generated_samples"] = _merge_generated_sample_records(
+        list(manifest.get("generated_samples", [])),
+        sample_records,
+    )
+    manifest["generated_settings"] = _merge_generated_setting_records(
+        list(manifest.get("generated_settings", [])),
+        setting_manifest,
+    )
     save_json(manifest, Path(manifest["manifest_path"]))
     LOGGER.info("Generated %s synthetic sample(s) under %s", len(sample_records), generated_root)
     LOGGER.debug("Generated sample manifests | %s", sample_records)

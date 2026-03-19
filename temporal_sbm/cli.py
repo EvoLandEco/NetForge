@@ -255,7 +255,7 @@ def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _normalise_argv(argv: Optional[Iterable[str]]) -> list[str]:
     argv = list(argv or [])
-    commands = {"run", "fit", "generate", "report"}
+    commands = {"run", "fit", "generate", "report", "sweep"}
     if not argv:
         return ["run", *argv]
     if any(arg in {"-h", "--help"} for arg in argv) and not any(arg in commands for arg in argv):
@@ -302,6 +302,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compare one specific synthetic edge CSV. If omitted, every saved sample in the run directory is reported.",
     )
     report_parser.add_argument("--sample-label", default=None, help="Label used in report filenames.")
+
+    sweep_parser = subparsers.add_parser("sweep", help="Run a configured generation sweep, then report and simulate it.")
+    add_runtime_arguments(sweep_parser)
+    sweep_parser.add_argument("--config", required=True, help="Path to a JSON sweep configuration file.")
     return parser
 
 
@@ -669,6 +673,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.command == "report":
         run_report_stage(args)
         _finalize_log_artifacts(log_path, Path(args.run_dir).expanduser().resolve())
+        return 0
+
+    if args.command == "sweep":
+        from temporal_sbm.sweep import run_sweep_command
+
+        result = run_sweep_command(args)
+        run_dir = Path(str(result["run_dir"])).expanduser().resolve()
+        _finalize_log_artifacts(log_path, run_dir)
         return 0
 
     if args.command == "run":
