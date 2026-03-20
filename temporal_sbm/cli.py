@@ -148,6 +148,11 @@ def add_fit_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-deg-corr", action="store_true", help="Disable degree correction in the fitted SBM.")
     parser.add_argument("--overlap", action="store_true", help="Fit an overlapping base partition.")
     parser.add_argument("--fit-quiet", action="store_true", help="Reduce graph-tool verbosity during fitting.")
+    parser.add_argument(
+        "--exclude-weight-from-fit",
+        action="store_true",
+        help="Keep edge weights out of SBM inference and leave weight sampling to the saved generator.",
+    )
     parser.add_argument("--refine-multiflip-rounds", type=int, default=0, help="Extra multiflip refinement rounds after the initial fit.")
     parser.add_argument("--refine-multiflip-niter", type=int, default=10, help="Iterations per multiflip refinement round.")
     parser.add_argument("--anneal-niter", type=int, default=0, help="If positive, run graph-tool annealing for this many iterations.")
@@ -204,6 +209,30 @@ def add_generation_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=3,
         help="Minimum observed edges in a layer/block-pair cell before backing off to a broader edge-weight sampler.",
+    )
+    parser.add_argument(
+        "--weight-generation-mode",
+        default="parametric",
+        choices=["parametric", "legacy"],
+        help="Use the saved parametric weight generator or the legacy empirical backoff sampler.",
+    )
+    parser.add_argument(
+        "--weight-parametric-partition-policy",
+        default="fixed",
+        choices=["fixed", "refit_on_refresh"],
+        help="Keep the fitted weight generator fixed or refit it after each posterior partition refresh.",
+    )
+    parser.add_argument(
+        "--weight-parametric-family",
+        default="auto",
+        choices=["auto", "shifted-negbin", "negbin", "lognormal"],
+        help="Weight family used by the parametric generator when weighted generation is enabled.",
+    )
+    parser.add_argument(
+        "--weight-prior-strength",
+        type=float,
+        default=5.0,
+        help="Pseudo-count strength used by the parametric weight model for partial pooling.",
     )
     parser.add_argument(
         "--rewire-model",
@@ -320,6 +349,15 @@ def _resolve_run_dir_for_logging(args: argparse.Namespace) -> Optional[Path]:
         return Path(args.output_dir).expanduser().resolve()
     if args.command in {"generate", "report"} and getattr(args, "run_dir", None):
         return Path(args.run_dir).expanduser().resolve()
+    if args.command == "sweep" and getattr(args, "config", None):
+        try:
+            payload = load_json(Path(args.config).expanduser().resolve())
+        except Exception:
+            return None
+        fit_section = payload.get("fit") if isinstance(payload, dict) else None
+        output_dir = fit_section.get("output_dir") if isinstance(fit_section, dict) else None
+        if output_dir:
+            return Path(str(output_dir)).expanduser().resolve()
     return None
 
 

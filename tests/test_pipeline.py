@@ -9,8 +9,11 @@ import pandas as pd
 from temporal_sbm.pipeline import (
     _align_external_weight_values,
     _detect_transformed_external_weight_companion,
+    _fit_includes_edge_weight_covariate,
     _merge_generated_sample_records,
     _merge_generated_setting_records,
+    _standalone_weight_model,
+    _weight_generation_mode_name,
     prepare_data,
     resolve_input_paths,
     _sample_kwargs,
@@ -150,6 +153,28 @@ class PipelineWeightAlignmentTests(unittest.TestCase):
 
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["num_samples_requested"], 3)
+
+    def test_weight_generation_mode_name_defaults_to_parametric(self):
+        self.assertEqual(_weight_generation_mode_name(argparse.Namespace()), "parametric")
+
+    def test_fit_includes_edge_weight_covariate_follows_flag(self):
+        self.assertTrue(_fit_includes_edge_weight_covariate(argparse.Namespace(exclude_weight_from_fit=False)))
+        self.assertFalse(_fit_includes_edge_weight_covariate(argparse.Namespace(exclude_weight_from_fit=True)))
+
+    def test_standalone_weight_model_tracks_weight_column(self):
+        prepared = argparse.Namespace(weight_column="trade")
+
+        model = _standalone_weight_model(prepared)
+
+        self.assertEqual(
+            model,
+            {
+                "input_column": "trade",
+                "output_column": "trade",
+                "candidate_label": "separate_parametric_generator",
+                "fit_as_edge_covariate": False,
+            },
+        )
 
 
 class PipelineInputFormatTests(unittest.TestCase):

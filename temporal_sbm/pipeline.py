@@ -1268,6 +1268,25 @@ def _build_weight_candidates(
     return candidates
 
 
+def _weight_generation_mode_name(args: argparse.Namespace) -> str:
+    return str(getattr(args, "weight_generation_mode", "parametric")).strip().lower()
+
+
+def _fit_includes_edge_weight_covariate(args: argparse.Namespace) -> bool:
+    return not bool(getattr(args, "exclude_weight_from_fit", False))
+
+
+def _standalone_weight_model(prepared: PreparedData) -> Optional[dict[str, Any]]:
+    if not prepared.weight_column:
+        return None
+    return {
+        "input_column": prepared.weight_column,
+        "output_column": prepared.weight_column,
+        "candidate_label": "separate_parametric_generator",
+        "fit_as_edge_covariate": False,
+    }
+
+
 def fit_nested_sbm(
     graph: Any,
     covariate_specs: Iterable[CovariateSpec],
@@ -1750,6 +1769,595 @@ def _posterior_partition_state(
 
 
 
+
+WEIGHT_GENERATOR_PAYLOAD_FORMAT = "parametric_weight_generator_v1"
+
+
+def _canonical_weight_channel(
+    src_type: Optional[int],
+    dst_type: Optional[int],
+    directed: bool,
+) -> tuple[Optional[int], Optional[int]]:
+    if src_type is None or dst_type is None:
+        return None, None
+    src = int(src_type)
+    dst = int(dst_type)
+    if not directed and src > dst:
+        src, dst = dst, src
+    return src, dst
+
+
+def _canonical_weight_key(
+    ts_value: Optional[int],
+    r: Optional[int],
+    s: Optional[int],
+    src_type: Optional[int],
+    dst_type: Optional[int],
+    directed: bool,
+) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
+    src_type, dst_type = _canonical_weight_channel(src_type, dst_type, directed)
+    ts_out = None if ts_value is None else int(ts_value)
+    r_out = None if r is None else int(r)
+    s_out = None if s is None else int(s)
+    if not directed and r_out is not None and s_out is not None and r_out > s_out:
+        r_out, s_out = s_out, r_out
+    return ts_out, r_out, s_out, src_type, dst_type
+
+
+def _weight_key_to_str(
+    key: tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]],
+) -> str:
+    return "|".join("" if value is None else str(int(value)) for value in key)
+
+
+def _weight_key_from_str(
+    text_value: str,
+) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
+    parts = str(text_value).split("|")
+    if len(parts) != 5:
+        raise ValueError(f"Invalid serialised weight-cell key: {text_value!r}")
+    return tuple(None if part == "" else int(part) for part in parts)  # type: ignore[return-value]
+
+
+def _weight_key_level(
+    key: tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]],
+) -> str:
+    ts_value, r, s, src_type, dst_type = key
+    if ts_value is None and r is None and s is None and src_type is None and dst_type is None:
+        return "global"
+    if ts_value is None and r is None and s is None and src_type is not None and dst_type is not None:
+        return "channel"
+    if ts_value is not None and r is None and s is None and src_type is None and dst_type is None:
+        return "layer"
+    if ts_value is None and r is not None and s is not None:
+        return "block_pair"
+    if ts_value is not None and r is None and s is None and src_type is not None and dst_type is not None:
+        return "layer_channel"
+    if ts_value is not None and r is not None and s is not None:
+        return "exact"
+    raise ValueError(f"Unrecognised weight-cell key: {key}")
+
+
+def _weight_cell_keys(
+    ts_value: int,
+    r: int,
+    s: int,
+    *,
+    src_type: Optional[int],
+    dst_type: Optional[int],
+    directed: bool,
+) -> dict[str, tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]]:
+    return {
+        "exact": _canonical_weight_key(ts_value, r, s, src_type, dst_type, directed),
+        "block_pair": _canonical_weight_key(None, r, s, src_type, dst_type, directed),
+        "layer_channel": _canonical_weight_key(ts_value, None, None, src_type, dst_type, directed),
+        "channel": _canonical_weight_key(None, None, None, src_type, dst_type, directed),
+        "layer": _canonical_weight_key(ts_value, None, None, None, None, directed),
+        "global": _canonical_weight_key(None, None, None, None, None, directed),
+    }
+
+
+def _weight_parent_keys(
+    key: tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]],
+    directed: bool,
+) -> list[tuple[str, tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]]]:
+    level = _weight_key_level(key)
+    ts_value, r, s, src_type, dst_type = key
+    global_key = _canonical_weight_key(None, None, None, None, None, directed)
+    channel_key = _canonical_weight_key(None, None, None, src_type, dst_type, directed)
+    layer_key = _canonical_weight_key(ts_value, None, None, None, None, directed)
+    layer_channel_key = _canonical_weight_key(ts_value, None, None, src_type, dst_type, directed)
+    block_pair_key = _canonical_weight_key(None, r, s, src_type, dst_type, directed)
+
+    if level == "global":
+        return []
+    if level == "channel":
+        return [("global", global_key)]
+    if level == "layer":
+        return [("global", global_key)]
+    if level == "block_pair":
+        return [("channel", channel_key), ("global", global_key)]
+    if level == "layer_channel":
+        return [("channel", channel_key), ("layer", layer_key), ("global", global_key)]
+    if level == "exact":
+        return [
+            ("block_pair", block_pair_key),
+            ("layer_channel", layer_channel_key),
+            ("channel", channel_key),
+            ("layer", layer_key),
+            ("global", global_key),
+        ]
+    raise ValueError(f"Unsupported weight-cell level: {level}")
+
+
+def _nb2_alpha_from_stats(stats: WeightCellStats) -> Optional[float]:
+    if stats.n <= 1:
+        return None
+    mean_x = float(stats.sum_x / stats.n)
+    if not np.isfinite(mean_x) or mean_x <= 1e-12:
+        return 0.0
+    var_x = float(stats.sum_x2 / stats.n - mean_x * mean_x)
+    var_x = max(var_x, 0.0)
+    alpha = (var_x - mean_x) / max(mean_x * mean_x, 1e-12)
+    return float(max(alpha, 0.0))
+
+
+def _sample_nb2(
+    rng: np.random.Generator,
+    *,
+    mean: float,
+    alpha: float,
+) -> int:
+    mean = max(float(mean), 0.0)
+    alpha = max(float(alpha), 0.0)
+    if mean <= 1e-12:
+        return 0
+    if alpha <= 1e-10:
+        return int(rng.poisson(mean))
+
+    shape = 1.0 / alpha
+    if not np.isfinite(shape) or shape >= 1e8:
+        return int(rng.poisson(mean))
+
+    rate = float(rng.gamma(shape=shape, scale=mean / shape))
+    return int(rng.poisson(max(rate, 0.0)))
+
+
+def _select_parametric_weight_family(
+    raw_weights: np.ndarray,
+    requested: str,
+) -> dict[str, Any]:
+    values = np.asarray(raw_weights, dtype=float)
+    if values.size == 0:
+        raise ValueError("A parametric weight generator requires at least one observed weight.")
+
+    requested = str(requested).strip().lower()
+    is_nonnegative = bool(np.all(values >= 0))
+    is_positive = bool(np.all(values > 0))
+    is_integer = bool(is_nonnegative and _looks_like_int_array(values))
+
+    if requested == "auto":
+        if is_integer and is_positive:
+            return {
+                "family": "shifted-negbin",
+                "shift": 1,
+                "transform": "none",
+                "support": "positive_integer",
+            }
+        if is_integer and is_nonnegative:
+            return {
+                "family": "negbin",
+                "shift": 0,
+                "transform": "none",
+                "support": "nonnegative_integer",
+            }
+        if is_positive:
+            return {
+                "family": "lognormal",
+                "shift": 0,
+                "transform": "log",
+                "support": "positive_real",
+            }
+        if is_nonnegative:
+            return {
+                "family": "lognormal",
+                "shift": 0,
+                "transform": "log1p",
+                "support": "nonnegative_real",
+            }
+        raise ValueError("Parametric weight generation only supports nonnegative weights in this pipeline.")
+
+    if requested in {"shifted-negbin", "shifted_nbinom", "shifted-negbinom", "shifted_nb"}:
+        if not is_integer or not is_positive:
+            raise ValueError("The shifted negative-binomial generator requires strictly positive integer weights.")
+        return {
+            "family": "shifted-negbin",
+            "shift": 1,
+            "transform": "none",
+            "support": "positive_integer",
+        }
+
+    if requested in {"negbin", "negative-binomial", "negative_binomial", "nb"}:
+        if not is_integer or not is_nonnegative:
+            raise ValueError("The negative-binomial generator requires nonnegative integer weights.")
+        return {
+            "family": "negbin",
+            "shift": 0,
+            "transform": "none",
+            "support": "nonnegative_integer",
+        }
+
+    if requested in {"lognormal", "log-normal"}:
+        if not is_nonnegative:
+            raise ValueError("The log-normal generator requires nonnegative weights.")
+        return {
+            "family": "lognormal",
+            "shift": 0,
+            "transform": "log" if is_positive else "log1p",
+            "support": "positive_real" if is_positive else "nonnegative_real",
+        }
+
+    raise ValueError(
+        f"Unknown parametric weight generator family: {requested!r}. "
+        "Use auto, shifted-negbin, negbin, or lognormal."
+    )
+
+
+def _parametric_weight_shrinkage(args: argparse.Namespace) -> dict[str, float]:
+    prior_strength = max(0.0, float(getattr(args, "weight_prior_strength", 5.0)))
+    return {
+        "block_pair": prior_strength,
+        "layer_channel": prior_strength,
+        "channel": 2.0 * prior_strength,
+        "layer": 2.0 * prior_strength,
+        "global": 4.0 * prior_strength,
+    }
+
+
+def _fit_parametric_weight_generator_model(
+    observed_edges: pd.DataFrame,
+    base: Any,
+    weight_model: dict,
+    directed: bool,
+    args: argparse.Namespace,
+) -> dict:
+    weight_col = str(weight_model.get("output_column") or weight_model.get("input_column"))
+    required = {"u", "i", "ts", weight_col}
+    missing = required.difference(observed_edges.columns)
+    if missing:
+        raise ValueError(
+            "Observed edge table is missing required columns for parametric weight fitting: "
+            f"{sorted(missing)}"
+        )
+
+    frame = observed_edges[["u", "i", "ts", weight_col]].copy()
+    frame["u"] = pd.to_numeric(frame["u"], errors="raise").astype(np.int64)
+    frame["i"] = pd.to_numeric(frame["i"], errors="raise").astype(np.int64)
+    frame["ts"] = pd.to_numeric(frame["ts"], errors="raise").astype(np.int64)
+    frame[weight_col] = pd.to_numeric(frame[weight_col], errors="raise").astype(float)
+    raw_weights = frame[weight_col].to_numpy(dtype=float, copy=False)
+    if raw_weights.size == 0:
+        raise ValueError("No observed weights are available for parametric fitting.")
+
+    node_id_prop = base.g.vp["node_id"] if "node_id" in base.g.vp else None
+    if node_id_prop is None:
+        raise RuntimeError("Fitted graph is missing the vertex property 'node_id' required for weight fitting.")
+    type_prop = base.g.vp["type"] if "type" in base.g.vp else None
+    blocks = np.asarray(base.get_nonoverlap_blocks().a, dtype=np.int64)
+
+    node_id_to_block: dict[int, int] = {}
+    node_id_to_type: dict[int, int] = {}
+    for index in range(int(base.g.num_vertices())):
+        vertex = base.g.vertex(index)
+        node_id = int(node_id_prop[vertex])
+        node_id_to_block[node_id] = int(blocks[index])
+        if type_prop is not None:
+            node_id_to_type[node_id] = int(type_prop[vertex])
+
+    family_spec = _select_parametric_weight_family(
+        raw_weights,
+        requested=str(getattr(args, "weight_parametric_family", "auto")),
+    )
+
+    if family_spec["family"] == "lognormal":
+        if family_spec["transform"] == "log":
+            model_values = np.log(raw_weights)
+        else:
+            model_values = np.log1p(raw_weights)
+    else:
+        shift = int(family_spec["shift"])
+        model_values = np.round(raw_weights).astype(np.int64) - shift
+        if np.any(model_values < 0):
+            raise ValueError(
+                "The selected parametric count family produced negative shifted weights. "
+                "Check the observed support or choose a different family."
+            )
+        model_values = model_values.astype(float)
+
+    stats: dict[
+        tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]],
+        WeightCellStats,
+    ] = defaultdict(WeightCellStats)
+
+    for row, model_value in zip(frame.itertuples(index=False), model_values):
+        u_block = node_id_to_block.get(int(row.u))
+        v_block = node_id_to_block.get(int(row.i))
+        if u_block is None or v_block is None:
+            continue
+
+        src_type = node_id_to_type.get(int(row.u)) if node_id_to_type else None
+        dst_type = node_id_to_type.get(int(row.i)) if node_id_to_type else None
+        for key in _weight_cell_keys(
+            int(row.ts),
+            int(u_block),
+            int(v_block),
+            src_type=src_type,
+            dst_type=dst_type,
+            directed=bool(directed),
+        ).values():
+            stats[key].update(float(model_value))
+
+    global_key = _canonical_weight_key(None, None, None, None, None, bool(directed))
+    if global_key not in stats or stats[global_key].n <= 0:
+        raise RuntimeError("Failed to accumulate global sufficient statistics for parametric weights.")
+
+    shrinkage = _parametric_weight_shrinkage(args)
+    fitted_params: dict[
+        tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]],
+        dict[str, Any],
+    ] = {}
+
+    level_order = ["global", "channel", "layer", "block_pair", "layer_channel", "exact"]
+    for level in level_order:
+        level_keys = sorted(
+            [key for key in stats if _weight_key_level(key) == level],
+            key=_weight_key_to_str,
+        )
+        for key in level_keys:
+            cell_stats = stats[key]
+            parent_keys = _weight_parent_keys(key, bool(directed))
+
+            mean_num = float(cell_stats.sum_x)
+            mean_den = float(cell_stats.n)
+            for parent_name, parent_key in parent_keys:
+                parent_params = fitted_params.get(parent_key)
+                if parent_params is None or int(parent_params.get("n", 0)) <= 0:
+                    continue
+                strength = min(float(shrinkage.get(parent_name, 0.0)), float(parent_params["n"]))
+                if strength <= 0.0:
+                    continue
+                mean_num += strength * float(parent_params["mean"])
+                mean_den += strength
+            mean_hat = mean_num / mean_den if mean_den > 0.0 else 0.0
+
+            param_record: dict[str, Any] = {
+                "level": level,
+                "n": int(cell_stats.n),
+                "mean": float(mean_hat),
+            }
+
+            if family_spec["family"] == "lognormal":
+                raw_var = None
+                if cell_stats.n > 0:
+                    raw_mean = float(cell_stats.sum_x / cell_stats.n)
+                    raw_var = float(cell_stats.sum_x2 / cell_stats.n - raw_mean * raw_mean)
+                    raw_var = max(raw_var, 1e-9)
+
+                var_num = 0.0
+                var_den = 0.0
+                if raw_var is not None and cell_stats.n > 1:
+                    own_weight = float(cell_stats.n - 1)
+                    var_num += own_weight * raw_var
+                    var_den += own_weight
+
+                for parent_name, parent_key in parent_keys:
+                    parent_params = fitted_params.get(parent_key)
+                    if parent_params is None or "variance" not in parent_params or int(parent_params.get("n", 0)) <= 0:
+                        continue
+                    strength = min(float(shrinkage.get(parent_name, 0.0)), float(parent_params["n"]))
+                    if strength <= 0.0:
+                        continue
+                    var_num += strength * float(parent_params["variance"])
+                    var_den += strength
+
+                if var_den <= 0.0:
+                    variance_hat = raw_var if raw_var is not None else 1.0
+                else:
+                    variance_hat = var_num / var_den
+                param_record["variance"] = float(max(variance_hat, 1e-9))
+            else:
+                raw_alpha = _nb2_alpha_from_stats(cell_stats)
+                alpha_num = 0.0
+                alpha_den = 0.0
+                if raw_alpha is not None and cell_stats.n > 1:
+                    own_weight = float(cell_stats.n - 1)
+                    alpha_num += own_weight * float(raw_alpha)
+                    alpha_den += own_weight
+
+                for parent_name, parent_key in parent_keys:
+                    parent_params = fitted_params.get(parent_key)
+                    if parent_params is None or "alpha" not in parent_params or int(parent_params.get("n", 0)) <= 0:
+                        continue
+                    strength = min(float(shrinkage.get(parent_name, 0.0)), float(parent_params["n"]))
+                    if strength <= 0.0:
+                        continue
+                    alpha_num += strength * float(parent_params["alpha"])
+                    alpha_den += strength
+
+                alpha_hat = alpha_num / alpha_den if alpha_den > 0.0 else 0.0
+                param_record["alpha"] = float(max(alpha_hat, 0.0))
+                param_record["shift"] = int(family_spec["shift"])
+
+            fitted_params[key] = param_record
+
+    serialised_cells = {
+        _weight_key_to_str(key): value
+        for key, value in sorted(fitted_params.items(), key=lambda item: _weight_key_to_str(item[0]))
+    }
+    level_counts = Counter(value["level"] for value in serialised_cells.values())
+
+    model = {
+        "format": WEIGHT_GENERATOR_PAYLOAD_FORMAT,
+        "mode": "parametric",
+        "output_column": weight_col,
+        "directed": bool(directed),
+        "family": family_spec["family"],
+        "transform": family_spec["transform"],
+        "shift": int(family_spec["shift"]),
+        "support": family_spec["support"],
+        "fallback_order": ["exact", "block_pair", "layer_channel", "channel", "layer", "global"],
+        "cells": serialised_cells,
+        "node_blocks": {str(node_id): int(block_id) for node_id, block_id in sorted(node_id_to_block.items())},
+        "node_types": {str(node_id): int(type_value) for node_id, type_value in sorted(node_id_to_type.items())},
+        "shrinkage": {name: float(value) for name, value in shrinkage.items()},
+        "reference_partition_source": "fitted_or_refreshed_state",
+        "summary": {
+            "num_cells": int(len(serialised_cells)),
+            "level_counts": {str(level): int(count) for level, count in sorted(level_counts.items())},
+            "weight_column": weight_col,
+            "family": family_spec["family"],
+            "support": family_spec["support"],
+            "model_scale_summary": _format_numeric_summary(model_values),
+            "raw_weight_summary": _format_numeric_summary(raw_weights),
+        },
+    }
+    LOGGER.info(
+        "Fitted parametric weight generator | column=%s | family=%s | cells=%s",
+        weight_col,
+        family_spec["family"],
+        len(serialised_cells),
+    )
+    LOGGER.debug("Parametric weight generator summary | %s", model["summary"])
+    return model
+
+
+class ParametricWeightSampler:
+    def __init__(
+        self,
+        weight_generator_model: dict,
+        directed: bool,
+        rng: np.random.Generator,
+    ) -> None:
+        if str(weight_generator_model.get("format")) != WEIGHT_GENERATOR_PAYLOAD_FORMAT:
+            raise ValueError(
+                "Unsupported parametric weight generator payload format: "
+                f"{weight_generator_model.get('format')!r}"
+            )
+        self.weight_col = str(weight_generator_model["output_column"])
+        self.family = str(weight_generator_model["family"])
+        self.transform = str(weight_generator_model.get("transform", "none"))
+        self.shift = int(weight_generator_model.get("shift", 0))
+        self.directed = bool(directed)
+        self.rng = rng
+        self.fallback_order = [str(value) for value in weight_generator_model.get("fallback_order", [])]
+        self.cells = {
+            _weight_key_from_str(key): value
+            for key, value in weight_generator_model.get("cells", {}).items()
+        }
+        self.resolution_counts: Counter[str] = Counter()
+
+    def _resolve_params(
+        self,
+        ts_value: int,
+        r: int,
+        s: int,
+        *,
+        src_type: Optional[int],
+        dst_type: Optional[int],
+    ) -> tuple[dict[str, Any], str]:
+        keys = _weight_cell_keys(
+            int(ts_value),
+            int(r),
+            int(s),
+            src_type=src_type,
+            dst_type=dst_type,
+            directed=self.directed,
+        )
+        for label in self.fallback_order:
+            key = keys.get(label)
+            if key is None:
+                continue
+            params = self.cells.get(key)
+            if params is not None:
+                return params, label
+
+        global_key = _canonical_weight_key(None, None, None, None, None, self.directed)
+        params = self.cells.get(global_key)
+        if params is None:
+            raise RuntimeError("Parametric weight generator is missing the global fallback cell.")
+        return params, "global"
+
+    def sample(
+        self,
+        ts_value: int,
+        r: int,
+        s: int,
+        *,
+        src_type: Optional[int] = None,
+        dst_type: Optional[int] = None,
+    ) -> float | int:
+        if not self.directed and r > s:
+            r, s = s, r
+        src_type, dst_type = _canonical_weight_channel(src_type, dst_type, self.directed)
+        params, resolution = self._resolve_params(
+            int(ts_value),
+            int(r),
+            int(s),
+            src_type=src_type,
+            dst_type=dst_type,
+        )
+        self.resolution_counts[resolution] += 1
+
+        mean_x = max(float(params.get("mean", 0.0)), 0.0)
+        if self.family in {"shifted-negbin", "negbin"}:
+            alpha = max(float(params.get("alpha", 0.0)), 0.0)
+            sampled = _sample_nb2(self.rng, mean=mean_x, alpha=alpha)
+            return int(max(0, sampled + self.shift))
+
+        if self.family == "lognormal":
+            variance = max(float(params.get("variance", 1.0)), 1e-9)
+            sampled_x = float(self.rng.normal(loc=mean_x, scale=math.sqrt(variance)))
+            if self.transform == "log":
+                return max(0.0, float(np.exp(sampled_x)))
+            if self.transform == "log1p":
+                return max(0.0, float(np.expm1(sampled_x)))
+            raise ValueError(f"Unsupported parametric transform: {self.transform!r}")
+
+        raise ValueError(f"Unsupported parametric weight family: {self.family!r}")
+
+
+def _aligned_blocks_for_weight_generation(
+    gt: Any,
+    base: Any,
+    blocks: np.ndarray,
+    node_id_prop: Any,
+    weight_generator_model: Optional[dict],
+) -> np.ndarray:
+    if not weight_generator_model:
+        return blocks
+
+    node_blocks = weight_generator_model.get("node_blocks")
+    if not isinstance(node_blocks, dict) or not node_blocks:
+        return blocks
+
+    reference = np.asarray(blocks, dtype=np.int64).copy()
+    for index in range(int(base.g.num_vertices())):
+        node_id = int(node_id_prop[base.g.vertex(index)])
+        reference[index] = int(node_blocks.get(str(node_id), reference[index]))
+
+    try:
+        aligned = np.asarray(gt.align_partition_labels(blocks, reference), dtype=np.int64)
+        if aligned.shape == reference.shape:
+            LOGGER.debug(
+                "Aligned sampled partition labels to the stored weight-model labels | overlap=%.6f",
+                float(np.mean(aligned == reference)) if aligned.size else 1.0,
+            )
+            return aligned
+    except Exception as exc:
+        LOGGER.debug("Block-label alignment for weight generation failed | %s", exc)
+    return blocks
+
+
 class EdgeWeightSampler:
     def __init__(
         self,
@@ -2050,6 +2658,7 @@ class EdgeWeightSampler:
         raise ValueError(f"Unsupported edge-weight rec_type: {self.rec_type}")
 
 
+
 def sample_synthetic_panel(
     graph: Any,
     nested_state: Any,
@@ -2060,35 +2669,72 @@ def sample_synthetic_panel(
     args: argparse.Namespace,
     observed_edges: Optional[pd.DataFrame] = None,
     weight_model: Optional[dict] = None,
+    weight_generator_model: Optional[dict] = None,
 ) -> dict:
     gt = _require_graph_tool()
     gt.seed_rng(int(seed))
+    weight_partition_policy = str(getattr(args, "weight_parametric_partition_policy", "fixed")).strip().lower()
     LOGGER.debug(
-        "Sampling synthetic panel | output_dir=%s | directed=%s | seed=%s | layer_count=%s | weight_model=%s",
+        "Sampling synthetic panel | output_dir=%s | directed=%s | seed=%s | layer_count=%s | "
+        "weight_model=%s | weight_generator=%s | weight_partition_policy=%s",
         output_dir,
         directed,
         seed,
         len(layer_map),
         weight_model,
+        None if weight_generator_model is None else weight_generator_model.get("summary"),
+        weight_partition_policy,
     )
 
     sampled_state = _posterior_partition_state(nested_state, seed=seed, args=args)
     base = _base_state(sampled_state)
     lid_to_state = map_graph_lid_to_state_lid(sampled_state)
     LOGGER.debug("Sampled state ready | %s", _state_summary_text(sampled_state))
+
     node_id_prop = base.g.vp["node_id"] if "node_id" in base.g.vp else None
     if node_id_prop is None:
         raise RuntimeError("Fitted graph is missing the vertex property 'node_id'.")
 
     blocks = np.asarray(base.get_nonoverlap_blocks().a, dtype=np.int64)
-    partition_records = [
-        {
+    active_weight_generator = weight_generator_model
+    weight_generation_mode = "none"
+
+    if weight_model is not None and observed_edges is not None and weight_partition_policy == "refit_on_refresh":
+        active_weight_generator = _fit_parametric_weight_generator_model(
+            observed_edges=observed_edges,
+            base=base,
+            weight_model=weight_model,
+            directed=directed,
+            args=args,
+        )
+        weight_generation_mode = "parametric_refit"
+    elif active_weight_generator is not None:
+        weight_generation_mode = "parametric_fixed"
+
+    weight_blocks = blocks
+    if active_weight_generator is not None and weight_partition_policy != "refit_on_refresh":
+        weight_blocks = _aligned_blocks_for_weight_generation(
+            gt=gt,
+            base=base,
+            blocks=blocks,
+            node_id_prop=node_id_prop,
+            weight_generator_model=active_weight_generator,
+        )
+
+    partition_records = []
+    include_weight_blocks = active_weight_generator is not None and not np.array_equal(weight_blocks, blocks)
+    for index in range(int(base.g.num_vertices())):
+        record = {
             "node_id": int(node_id_prop[base.g.vertex(index)]),
             "block_id": int(blocks[index]),
         }
-        for index in range(int(base.g.num_vertices()))
-    ]
-    partition_frame = pd.DataFrame(partition_records).sort_values(["node_id", "block_id"]).reset_index(drop=True)
+        if include_weight_blocks:
+            record["weight_block_id"] = int(weight_blocks[index])
+        partition_records.append(record)
+
+    partition_frame = pd.DataFrame(partition_records).sort_values(
+        ["node_id", "block_id"] + (["weight_block_id"] if include_weight_blocks else [])
+    ).reset_index(drop=True)
     partition_path = Path(output_dir) / "sample_node_partition.csv"
     partition_path.parent.mkdir(parents=True, exist_ok=True)
     partition_frame.to_csv(partition_path, index=False)
@@ -2096,7 +2742,14 @@ def sample_synthetic_panel(
     weight_col = None
     weight_sampler = None
     type_prop = base.g.vp["type"] if "type" in base.g.vp else None
-    if weight_model and observed_edges is not None:
+    if active_weight_generator is not None:
+        weight_col = str(active_weight_generator["output_column"])
+        weight_sampler = ParametricWeightSampler(
+            weight_generator_model=active_weight_generator,
+            directed=directed,
+            rng=np.random.default_rng(int(seed)),
+        )
+    elif weight_model and observed_edges is not None:
         weight_col = str(weight_model.get("output_column") or weight_model.get("input_column"))
         node_id_to_base = {
             int(node_id_prop[base.g.vertex(index)]): int(index)
@@ -2118,6 +2771,7 @@ def sample_synthetic_panel(
             rng=np.random.default_rng(int(seed)),
             node_id_to_type=node_id_to_type,
         )
+        weight_generation_mode = "empirical_backoff"
 
     output_dir = Path(output_dir)
     snapshot_dir = output_dir / "snapshots"
@@ -2159,13 +2813,22 @@ def sample_synthetic_panel(
             if weight_sampler is not None and weight_col:
                 src_type = int(type_prop[base.g.vertex(u_base)]) if type_prop is not None else None
                 dst_type = int(type_prop[base.g.vertex(v_base)]) if type_prop is not None else None
-                record[weight_col] = weight_sampler.sample(
-                    ts_value=int(ts_value),
-                    r=int(blocks[u_base]),
-                    s=int(blocks[v_base]),
-                    src_type=src_type,
-                    dst_type=dst_type,
-                )
+                if weight_generation_mode.startswith("parametric"):
+                    record[weight_col] = weight_sampler.sample(
+                        ts_value=int(ts_value),
+                        r=int(weight_blocks[u_base]),
+                        s=int(weight_blocks[v_base]),
+                        src_type=src_type,
+                        dst_type=dst_type,
+                    )
+                else:
+                    record[weight_col] = weight_sampler.sample(
+                        ts_value=int(ts_value),
+                        r=int(blocks[u_base]),
+                        s=int(blocks[v_base]),
+                        src_type=src_type,
+                        dst_type=dst_type,
+                    )
             if not directed and record["u"] > record["i"]:
                 record["u"], record["i"] = record["i"], record["u"]
             records.append(record)
@@ -2195,7 +2858,8 @@ def sample_synthetic_panel(
     panel_frame = panel_frame.drop_duplicates(["u", "i", "ts", "snapshot"]).reset_index(drop=True)
     panel_path = output_dir / "synthetic_edges.csv"
     panel_frame.to_csv(panel_path, index=False)
-    if weight_sampler is not None:
+
+    if weight_sampler is not None and hasattr(weight_sampler, "resolution_counts"):
         LOGGER.debug("Weight sampling resolution counts | %s", dict(weight_sampler.resolution_counts))
     LOGGER.debug(
         "Synthetic panel summary | rows_before_dedup=%s | rows_after_dedup=%s%s",
@@ -2236,13 +2900,22 @@ def sample_synthetic_panel(
             "rewire_persist": bool(getattr(args, "rewire_persist", False)),
             "is_sensitivity_analysis": bool(rewire_model != "none"),
             "weight_sampler_channel_aware": bool(type_prop is not None and weight_sampler is not None),
+            "weight_generation_mode": weight_generation_mode,
+            "weight_parametric_partition_policy": weight_partition_policy,
         },
     }
     if weight_col and weight_col in panel_frame.columns:
         payload["weight_column"] = weight_col
         payload["weight_total"] = float(panel_frame[weight_col].sum()) if len(panel_frame) else 0.0
+    if active_weight_generator is not None:
+        payload["weight_generator_family"] = str(active_weight_generator.get("family"))
+        payload["weight_generator_summary"] = _json_ready(active_weight_generator.get("summary", {}))
     if rewire_summaries:
         payload["rewire_summaries"] = rewire_summaries
+    if weight_sampler is not None and hasattr(weight_sampler, "resolution_counts"):
+        payload["weight_sampling_resolution_counts"] = {
+            str(key): int(value) for key, value in sorted(weight_sampler.resolution_counts.items())
+        }
     save_json(payload, sample_manifest_path)
     return payload
 
@@ -2326,6 +2999,7 @@ def _merge_generated_setting_records(existing: list[dict], new_record: dict) -> 
     return sorted(merged.values(), key=lambda record: str(record.get("setting_label") or ""))
 
 
+
 def write_fit_artifacts(
     prepared: PreparedData,
     graph: Any,
@@ -2334,6 +3008,7 @@ def write_fit_artifacts(
     args: argparse.Namespace,
     fit_covariates: list[str],
     weight_model: Optional[dict] = None,
+    weight_generator_model: Optional[dict] = None,
 ) -> dict:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2344,12 +3019,15 @@ def write_fit_artifacts(
     layer_map_path = output_dir / "layer_map.json"
     filtered_edges_path = output_dir / "input_edges_filtered.csv"
     node_attributes_path = output_dir / "node_attributes.csv"
+    weight_generator_path = output_dir / "weight_generator_model.json" if weight_generator_model is not None else None
 
     graph.save(str(graph_path))
     save_state(nested_state, state_path)
     save_json({str(ts): int(lid) for ts, lid in prepared.layer_map.items()}, layer_map_path)
     prepared.original_edges.to_csv(filtered_edges_path, index=False)
     write_node_attributes(prepared, node_attributes_path, node_blocks=extract_node_block_map(graph))
+    if weight_generator_model is not None and weight_generator_path is not None:
+        save_json(weight_generator_model, weight_generator_path)
 
     input_summary = {
         "edge_count": int(len(prepared.original_edges)),
@@ -2391,9 +3069,17 @@ def write_fit_artifacts(
         "edge_covariate_scope": "realized_edges_only",
         "rewired_samples_are_sensitivity_analyses": True,
         "weight_model": weight_model,
+        "weight_generator_path": str(weight_generator_path) if weight_generator_path is not None else None,
+        "weight_generator_summary": weight_generator_model.get("summary") if weight_generator_model is not None else None,
+        "weight_generation_mode": (
+            "parametric"
+            if weight_generator_model is not None
+            else ("empirical_backoff" if weight_model is not None else None)
+        ),
         "fit_options": {
             "deg_corr": not args.no_deg_corr,
             "overlap": bool(args.overlap),
+            "exclude_weight_from_fit": bool(getattr(args, "exclude_weight_from_fit", False)),
             "refine_multiflip_rounds": int(args.refine_multiflip_rounds),
             "refine_multiflip_niter": int(args.refine_multiflip_niter),
             "anneal_niter": int(args.anneal_niter),
@@ -2408,12 +3094,14 @@ def write_fit_artifacts(
     save_json(manifest, manifest_path)
     manifest["manifest_path"] = str(manifest_path)
     LOGGER.debug(
-        "Fit artifacts written | graph_path=%s | state_path=%s | layer_map_path=%s | filtered_edges_path=%s | node_attributes_path=%s | manifest_path=%s",
+        "Fit artifacts written | graph_path=%s | state_path=%s | layer_map_path=%s | filtered_edges_path=%s | "
+        "node_attributes_path=%s | weight_generator_path=%s | manifest_path=%s",
         graph_path,
         state_path,
         layer_map_path,
         filtered_edges_path,
         node_attributes_path,
+        weight_generator_path,
         manifest_path,
     )
     return manifest
@@ -2436,12 +3124,22 @@ def update_manifest(run_dir: Path, **updates: Any) -> dict:
     return manifest
 
 
+
 def fit_command(args: argparse.Namespace) -> dict:
     LOGGER.debug("Starting fit command | args=%s", vars(args))
     prepared = prepare_data(args)
     graph = build_layered_graph(prepared, directed=bool(args.directed))
     base_covariate_specs = _select_covariate_specs(_available_covariate_specs(graph), getattr(args, "fit_covariates", None))
-    weight_candidates = _build_weight_candidates(prepared, graph, args)
+    weight_generation_mode = _weight_generation_mode_name(args)
+    if _fit_includes_edge_weight_covariate(args):
+        weight_candidates = _build_weight_candidates(prepared, graph, args)
+    else:
+        LOGGER.info("Edge weights are excluded from SBM fitting and will be handled by the weight generator.")
+        if prepared.weight_column and weight_generation_mode in {"legacy", "empirical", "empirical_backoff"}:
+            raise ValueError(
+                "Edge weights cannot be excluded from SBM fitting when legacy weight generation is requested."
+            )
+        weight_candidates = []
     _log_covariate_specs("Default fit covariates", base_covariate_specs)
     _log_covariate_interpretation_notes(base_covariate_specs)
     t0 = pd.Timestamp.utcnow()
@@ -2453,7 +3151,24 @@ def fit_command(args: argparse.Namespace) -> dict:
         prepared=prepared,
         args=args,
     )
+    if weight_model is None and prepared.weight_column and weight_generation_mode in {"parametric", "model", "generative"}:
+        weight_model = _standalone_weight_model(prepared)
     attach_partition_maps(graph, nested_state)
+
+    weight_generator_model = None
+    if weight_model is not None and weight_generation_mode in {"parametric", "model", "generative"}:
+        weight_generator_model = _fit_parametric_weight_generator_model(
+            observed_edges=prepared.original_edges,
+            base=_base_state(nested_state),
+            weight_model=weight_model,
+            directed=bool(args.directed),
+            args=args,
+        )
+    elif weight_model is not None and weight_generation_mode not in {"legacy", "empirical", "empirical_backoff", "none"}:
+        raise ValueError(
+            "Unknown weight_generation_mode. Use 'parametric' to save a fully fitted generator or "
+            "'legacy' to keep the empirical backoff sampler."
+        )
 
     manifest = write_fit_artifacts(
         prepared,
@@ -2463,6 +3178,7 @@ def fit_command(args: argparse.Namespace) -> dict:
         args,
         fit_covariates=fit_covariates,
         weight_model=weight_model,
+        weight_generator_model=weight_generator_model,
     )
     LOGGER.info(
         "Fitted layered nested SBM in %s | run dir: %s",
@@ -2471,6 +3187,7 @@ def fit_command(args: argparse.Namespace) -> dict:
     )
     LOGGER.debug("Fit manifest summary | %s", manifest)
     return manifest
+
 
 
 def generate_command(args: argparse.Namespace) -> list[dict]:
@@ -2489,8 +3206,19 @@ def generate_command(args: argparse.Namespace) -> list[dict]:
     )
 
     weight_model = manifest.get("weight_model")
+    weight_generator_model = None
     observed_edges = None
-    if weight_model:
+    weight_partition_policy = str(getattr(args, "weight_parametric_partition_policy", "fixed")).strip().lower()
+
+    if manifest.get("weight_generator_path"):
+        weight_generator_model = load_json(Path(manifest["weight_generator_path"]))
+        LOGGER.debug(
+            "Loaded saved parametric weight generator | path=%s | summary=%s",
+            manifest["weight_generator_path"],
+            None if weight_generator_model is None else weight_generator_model.get("summary"),
+        )
+
+    if weight_model and (weight_generator_model is None or weight_partition_policy == "refit_on_refresh"):
         observed_edges = pd.read_csv(manifest["filtered_input_edges_path"])
         _log_edge_frame_debug(
             "Observed edge frame for weighted generation",
@@ -2518,6 +3246,7 @@ def generate_command(args: argparse.Namespace) -> list[dict]:
             args=args,
             observed_edges=observed_edges,
             weight_model=weight_model,
+            weight_generator_model=weight_generator_model,
         )
         sample_manifest["sample_index"] = int(sample_index)
         sample_manifest["sample_label"] = f"sample_{sample_index:04d}"
