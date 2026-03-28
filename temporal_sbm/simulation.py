@@ -1865,6 +1865,61 @@ def _summarise_daily_interval_calibration(
     }
 
 
+def _summarise_daily_mean_comparison(
+    per_snapshot: pd.DataFrame,
+    metric_name: str,
+) -> dict[str, object]:
+    observed_col = f"original_{metric_name}_mean"
+    synthetic_col = f"synthetic_{metric_name}_mean"
+
+    if observed_col not in per_snapshot.columns or synthetic_col not in per_snapshot.columns:
+        return {
+            "metric": metric_name,
+            "metric_type": "daily_mean",
+            "valid_count": 0,
+            "observed_curve_mean": np.nan,
+            "synthetic_curve_mean": np.nan,
+            "curve_correlation": np.nan,
+            "mean_delta": np.nan,
+            "mean_abs_delta": np.nan,
+            "rmse": np.nan,
+            "max_abs_delta": np.nan,
+        }
+
+    observed = pd.to_numeric(per_snapshot[observed_col], errors="coerce")
+    synthetic = pd.to_numeric(per_snapshot[synthetic_col], errors="coerce")
+    valid = observed.notna() & synthetic.notna()
+    if not bool(valid.any()):
+        return {
+            "metric": metric_name,
+            "metric_type": "daily_mean",
+            "valid_count": 0,
+            "observed_curve_mean": np.nan,
+            "synthetic_curve_mean": np.nan,
+            "curve_correlation": np.nan,
+            "mean_delta": np.nan,
+            "mean_abs_delta": np.nan,
+            "rmse": np.nan,
+            "max_abs_delta": np.nan,
+        }
+
+    obs = observed.loc[valid].to_numpy(dtype=float)
+    syn = synthetic.loc[valid].to_numpy(dtype=float)
+    delta = syn - obs
+    return {
+        "metric": metric_name,
+        "metric_type": "daily_mean",
+        "valid_count": int(len(obs)),
+        "observed_curve_mean": float(np.mean(obs)),
+        "synthetic_curve_mean": float(np.mean(syn)),
+        "curve_correlation": _safe_correlation(obs, syn),
+        "mean_delta": float(np.mean(delta)),
+        "mean_abs_delta": float(np.mean(np.abs(delta))),
+        "rmse": float(np.sqrt(np.mean(np.square(delta)))),
+        "max_abs_delta": float(np.max(np.abs(delta))) if len(delta) else np.nan,
+    }
+
+
 def _summarise_scalar_calibration(
     observed_scalar: pd.DataFrame,
     synthetic_scalar: pd.DataFrame,
@@ -2530,6 +2585,17 @@ def _compare_simulation_outputs(
             "reservoir_positive_regions",
         ]
     ])
+    daily_mean_comparison = pd.DataFrame([
+        _summarise_daily_mean_comparison(per_snapshot, metric_name)
+        for metric_name in [
+            "farm_prevalence",
+            "farm_incidence",
+            "farm_cumulative_incidence",
+            "reservoir_total",
+            "reservoir_max",
+            "reservoir_positive_regions",
+        ]
+    ])
     scalar_calibration = pd.DataFrame([
         _summarise_scalar_calibration(observed_scalar, synthetic_scalar, metric_name)
         for metric_name in [
@@ -2660,6 +2726,18 @@ def _compare_simulation_outputs(
         "reservoir_total_interval_coverage": _calibration_lookup(daily_calibration, "reservoir_total", "interval_coverage"),
         "farm_prevalence_interval_width_mean": _calibration_lookup(daily_calibration, "farm_prevalence", "mean_interval_width"),
         "farm_incidence_interval_width_mean": _calibration_lookup(daily_calibration, "farm_incidence", "mean_interval_width"),
+        "farm_prevalence_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "farm_prevalence", "curve_correlation"),
+        "farm_incidence_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "farm_incidence", "curve_correlation"),
+        "farm_cumulative_incidence_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "farm_cumulative_incidence", "curve_correlation"),
+        "reservoir_total_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "reservoir_total", "curve_correlation"),
+        "reservoir_max_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "reservoir_max", "curve_correlation"),
+        "reservoir_positive_regions_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "reservoir_positive_regions", "curve_correlation"),
+        "farm_prevalence_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "farm_prevalence", "mean_abs_delta"),
+        "farm_incidence_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "farm_incidence", "mean_abs_delta"),
+        "farm_cumulative_incidence_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "farm_cumulative_incidence", "mean_abs_delta"),
+        "reservoir_total_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "reservoir_total", "mean_abs_delta"),
+        "reservoir_max_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "reservoir_max", "mean_abs_delta"),
+        "reservoir_positive_regions_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "reservoir_positive_regions", "mean_abs_delta"),
         "farm_attack_rate_observed_median_in_synthetic_90pct": _calibration_lookup(scalar_calibration, "farm_attack_rate", "observed_median_in_synthetic_90pct"),
         "farm_attack_rate_observed_median_tail_area": _calibration_lookup(scalar_calibration, "farm_attack_rate", "observed_median_tail_area"),
         "farm_attack_rate_synthetic_interval_width": _calibration_lookup(scalar_calibration, "farm_attack_rate", "synthetic_interval_width"),
@@ -2718,6 +2796,7 @@ def _compare_simulation_outputs(
         "synthetic_daily": synthetic_daily,
         "outcome_distribution_summary": outcome_summary,
         "daily_calibration": daily_calibration,
+        "daily_mean_comparison": daily_mean_comparison,
         "scalar_calibration": scalar_calibration,
         "trajectory_distribution_summary": trajectory_distribution_summary,
         "lag_diagnostics": lag_diagnostics,
@@ -2753,6 +2832,7 @@ DETAIL_GROUP_KEYS: dict[str, list[str]] = {
     "observed_daily": ["day_index", "ts"],
     "synthetic_daily": ["day_index", "ts"],
     "daily_calibration": ["metric"],
+    "daily_mean_comparison": ["metric"],
     "scalar_calibration": ["metric"],
     "trajectory_distribution_summary": ["metric"],
     "lag_diagnostics": ["metric"],
@@ -3188,7 +3268,7 @@ def _write_curve_delta_plot(
     fig, axes = plt.subplots(2, 2, figsize=(13.2, 9.2), constrained_layout=True)
     axes_array = np.atleast_1d(axes).ravel()
     _style_figure(fig, axes_array)
-    fig.suptitle(f"Observed vs synthetic trajectory deltas: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
+    fig.suptitle(f"Observed vs synthetic median trajectory deltas: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
     x_values = per_snapshot["day_index"].to_numpy(dtype=float)
     for ax, (column, title) in zip(axes_array, metric_specs):
         values = _frame_numeric_series(per_snapshot, column).fillna(0.0).to_numpy(dtype=float)
@@ -3202,6 +3282,61 @@ def _write_curve_delta_plot(
         ax.set_xlabel("Day index")
         ax.set_ylabel("Synthetic - observed")
     output_path = output_dir / f"{sample_label}_delta.png"
+    _save_figure(fig, output_path)
+    plt.close(fig)
+    return output_path
+
+
+def _write_daily_mean_comparison_plot(
+    per_snapshot: pd.DataFrame,
+    summary: dict,
+    output_dir: Path,
+    sample_label: str,
+) -> Optional[Path]:
+    if per_snapshot.empty:
+        return None
+    metric_specs = [
+        ("farm_prevalence_mean", "Farm prevalence mean", "Infectious farms", "farm_prevalence_mean_curve_correlation"),
+        ("farm_incidence_mean", "Farm incidence mean", "Newly infected farms", "farm_incidence_mean_curve_correlation"),
+        ("farm_cumulative_incidence_mean", "Farm cumulative-incidence mean", "Cumulative infected farms", "farm_cumulative_incidence_mean_curve_correlation"),
+        ("reservoir_total_mean", "Reservoir total mean", "Reservoir pressure total", "reservoir_total_mean_curve_correlation"),
+        ("reservoir_max_mean", "Reservoir max mean", "Largest regional pressure", "reservoir_max_mean_curve_correlation"),
+        ("reservoir_positive_regions_mean", "Positive reservoir regions mean", "Regions above zero pressure", "reservoir_positive_regions_mean_curve_correlation"),
+    ]
+    available_specs = [
+        spec
+        for spec in metric_specs
+        if f"original_{spec[0]}" in per_snapshot.columns and f"synthetic_{spec[0]}" in per_snapshot.columns
+    ]
+    if not available_specs:
+        return None
+    plt = _load_matplotlib()
+    if plt is None:
+        return None
+    ncols = 2
+    nrows = int(math.ceil(len(available_specs) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14.6, max(5.2, 4.5 * nrows)), constrained_layout=True)
+    axes_array = np.atleast_1d(axes).ravel()
+    _style_figure(fig, axes_array)
+    fig.suptitle(f"Observed vs synthetic daily mean trajectories: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
+    for ax, (value_column, title, y_label, summary_key) in zip(axes_array, available_specs):
+        base_name = value_column[: -len("_mean")]
+        _plot_metric_panel(
+            ax,
+            per_snapshot=per_snapshot,
+            value_column=value_column,
+            title=title,
+            y_label=y_label,
+            summary_value=summary.get(summary_key),
+            lower_column=f"{base_name}_q05",
+            upper_column=f"{base_name}_q95",
+            observed_label="Observed mean",
+            synthetic_label="Synthetic mean",
+        )
+    for ax in axes_array[len(available_specs):]:
+        ax.axis("off")
+
+    output_path = output_dir / f"{sample_label}_daily_mean_compare.png"
     _save_figure(fig, output_path)
     plt.close(fig)
     return output_path
@@ -3531,7 +3666,11 @@ def _simulation_figure_reading_notes(*, include_scenario_overview: bool = False)
             ),
             (
                 "Delta view",
-                "Delta curves are synthetic minus observed. Long runs above zero mean the synthetic process overshoots the observed panel, while long runs below zero mean it misses sustained activity.",
+                "Delta curves are synthetic minus observed medians. Long runs above zero mean the synthetic process overshoots the observed panel, while long runs below zero mean it misses sustained activity.",
+            ),
+            (
+                "Daily mean view",
+                "The daily mean figure shows the average trajectory across replicates. It is useful when the daily median stays at zero and hides timing or magnitude shifts that are still visible in the mean.",
             ),
             (
                 "Distribution and parity views",
@@ -3572,6 +3711,10 @@ def _simulation_table_reading_notes(*, include_scenario_scorecard: bool = False)
             (
                 "Daily 90% coverage",
                 "Coverage near 0.9 means the observed daily path usually sits inside the synthetic 90% band. Much lower values point to bias or bands that are too narrow, while values pinned near 1 can also mean the bands are too wide.",
+            ),
+            (
+                "Daily mean comparison",
+                "These columns compare the mean trajectory across replicates for each day. Correlation rewards matching timing and shape, while mean absolute delta shows the average size of the daily gap.",
             ),
             (
                 "Scalar in-band flags and tail area",
@@ -3674,6 +3817,7 @@ def write_report(
     observed_scalar = detailed_outputs.get("observed_outcomes", pd.DataFrame())
     synthetic_scalar = detailed_outputs.get("synthetic_outcomes", pd.DataFrame())
     daily_calibration = detailed_outputs.get("daily_calibration", pd.DataFrame())
+    daily_mean_comparison = detailed_outputs.get("daily_mean_comparison", pd.DataFrame())
     scalar_calibration = detailed_outputs.get("scalar_calibration", pd.DataFrame())
     uncertainty_decomposition = detailed_outputs.get("uncertainty_decomposition", pd.DataFrame())
     observed_region_daily = detailed_outputs.get("observed_region_daily", pd.DataFrame())
@@ -3689,6 +3833,7 @@ def write_report(
     farm_corop_summary = detailed_outputs.get("farm_corop_summary", pd.DataFrame())
     dashboard_path = _write_sample_dashboard(per_snapshot, summary, outcome_summary, output_dir, sample_label)
     delta_path = _write_curve_delta_plot(per_snapshot, output_dir, sample_label)
+    daily_mean_path = _write_daily_mean_comparison_plot(per_snapshot, summary, output_dir, sample_label)
     distribution_path = _write_outcome_distribution_plot(observed_scalar, synthetic_scalar, outcome_summary, output_dir, sample_label)
     parity_path = _write_sample_parity_plot(outcome_summary, output_dir, sample_label)
     channel_path = _write_channel_diagnostics_plot(per_snapshot, summary, output_dir, sample_label)
@@ -3752,18 +3897,25 @@ def write_report(
             f"- Replicates per panel: {int(summary.get('num_replicates', 0))}",
             f"- Farm prevalence-curve correlation: {float(summary.get('farm_prevalence_curve_correlation', 0.0) or 0.0):.4f}",
             f"- Farm incidence-curve correlation: {float(summary.get('farm_incidence_curve_correlation', 0.0) or 0.0):.4f}",
+            f"- Farm prevalence mean-curve correlation: {float(summary.get('farm_prevalence_mean_curve_correlation', 0.0) or 0.0):.4f}",
+            f"- Farm incidence mean-curve correlation: {float(summary.get('farm_incidence_mean_curve_correlation', 0.0) or 0.0):.4f}",
             f"- Farm attack-rate Wasserstein distance: {float(summary.get('farm_attack_rate_wasserstein', 0.0) or 0.0):.4f}",
             f"- Farm peak-prevalence Wasserstein distance: {float(summary.get('farm_peak_prevalence_wasserstein', 0.0) or 0.0):.4f}",
             f"- Farm peak-day Wasserstein distance: {float(summary.get('farm_peak_day_wasserstein', 0.0) or 0.0):.4f}",
             f"- Farm duration Wasserstein distance: {float(summary.get('farm_duration_wasserstein', 0.0) or 0.0):.4f}",
             f"- Mean absolute farm-prevalence delta: {float(summary.get('mean_abs_farm_prevalence_delta', 0.0) or 0.0):.4f}",
             f"- Mean absolute farm-incidence delta: {float(summary.get('mean_abs_farm_incidence_delta', 0.0) or 0.0):.4f}",
+            f"- Mean absolute farm-prevalence daily-mean gap: {float(summary.get('farm_prevalence_mean_curve_mae', 0.0) or 0.0):.4f}",
+            f"- Mean absolute farm-incidence daily-mean gap: {float(summary.get('farm_incidence_mean_curve_mae', 0.0) or 0.0):.4f}",
             "",
             "## Secondary checks",
             "",
             f"- Farm cumulative-incidence correlation: {float(summary.get('farm_cumulative_incidence_curve_correlation', 0.0) or 0.0):.4f}",
+            f"- Farm cumulative-incidence mean-curve correlation: {float(summary.get('farm_cumulative_incidence_mean_curve_correlation', 0.0) or 0.0):.4f}",
             f"- Reservoir-total correlation: {float(summary.get('reservoir_total_curve_correlation', 0.0) or 0.0):.4f}",
+            f"- Reservoir-total mean-curve correlation: {float(summary.get('reservoir_total_mean_curve_correlation', 0.0) or 0.0):.4f}",
             f"- Reservoir-max correlation: {float(summary.get('reservoir_max_curve_correlation', 0.0) or 0.0):.4f}",
+            f"- Reservoir-max mean-curve correlation: {float(summary.get('reservoir_max_mean_curve_correlation', 0.0) or 0.0):.4f}",
             f"- Farm cumulative-incidence Wasserstein distance: {float(summary.get('farm_cumulative_incidence_wasserstein', 0.0) or 0.0):.4f}",
             f"- Farm prevalence AUC Wasserstein distance: {float(summary.get('farm_prevalence_auc_wasserstein', 0.0) or 0.0):.4f}",
             f"- Reservoir-total AUC Wasserstein distance: {float(summary.get('reservoir_total_auc_wasserstein', 0.0) or 0.0):.4f}",
@@ -3833,6 +3985,24 @@ def write_report(
             f"- Best lagged reservoir-total correlation: {_metric_text(summary.get('reservoir_total_best_lag_correlation'))} at lag {_metric_text(summary.get('reservoir_total_best_lag_days'), digits=0)} days",
         ])
 
+    if not daily_mean_comparison.empty:
+        lines.extend([
+            "",
+            "## Daily mean comparison",
+            "",
+            "These metrics compare the mean trajectory across replicates for each day. They are useful when daily medians stay flat for long stretches and hide smaller timing shifts.",
+            "",
+            "| Metric | Mean-curve corr | Mean abs daily gap | RMSE | Max abs daily gap |",
+            "|---|---:|---:|---:|---:|",
+        ])
+        for _, row in daily_mean_comparison.iterrows():
+            metric = str(row.get("metric", ""))
+            corr = _metric_text(row.get("curve_correlation"), digits=3)
+            mean_abs_delta = _metric_text(row.get("mean_abs_delta"), digits=3)
+            rmse = _metric_text(row.get("rmse"), digits=3)
+            max_abs_delta = _metric_text(row.get("max_abs_delta"), digits=3)
+            lines.append(f"| {metric} | {corr} | {mean_abs_delta} | {rmse} | {max_abs_delta} |")
+
     if not daily_calibration.empty or not scalar_calibration.empty:
         lines.extend([
             "",
@@ -3896,6 +4066,8 @@ def write_report(
         lines.append(f"- Dashboard PNG: `{Path(dashboard_path).name}`")
     if delta_path is not None:
         lines.append(f"- Delta PNG: `{Path(delta_path).name}`")
+    if daily_mean_path is not None:
+        lines.append(f"- Daily mean-comparison PNG: `{Path(daily_mean_path).name}`")
     if distribution_path is not None:
         lines.append(f"- Distribution PNG: `{Path(distribution_path).name}`")
     if parity_path is not None:
@@ -3921,6 +4093,8 @@ def write_report(
         payload["dashboard_png"] = str(dashboard_path)
     if delta_path is not None:
         payload["delta_png"] = str(delta_path)
+    if daily_mean_path is not None:
+        payload["daily_mean_png"] = str(daily_mean_path)
     if distribution_path is not None:
         payload["distribution_png"] = str(distribution_path)
     if parity_path is not None:
@@ -3936,12 +4110,13 @@ def write_report(
         payload["region_geo_payload_js"] = str(region_geo_html_path.with_name(f"{region_geo_html_path.stem}_payload.js"))
     payload.update(detail_paths)
     LOGGER.debug(
-        "Simulation artifacts written | per_snapshot_csv=%s | summary_json=%s | report_md=%s | dashboard_png=%s | delta_png=%s | distribution_png=%s | parity_png=%s | region_spatial_png=%s | region_geo_html=%s",
+        "Simulation artifacts written | per_snapshot_csv=%s | summary_json=%s | report_md=%s | dashboard_png=%s | delta_png=%s | daily_mean_png=%s | distribution_png=%s | parity_png=%s | region_spatial_png=%s | region_geo_html=%s",
         csv_path,
         json_path,
         md_path,
         dashboard_path,
         delta_path,
+        daily_mean_path,
         distribution_path,
         parity_path,
         region_spatial_path,
@@ -3990,6 +4165,18 @@ def _summary_payload_to_row(label: str, payload: dict[str, object]) -> Optional[
         "reservoir_total_interval_coverage",
         "farm_prevalence_interval_width_mean",
         "farm_incidence_interval_width_mean",
+        "farm_prevalence_mean_curve_correlation",
+        "farm_incidence_mean_curve_correlation",
+        "farm_cumulative_incidence_mean_curve_correlation",
+        "reservoir_total_mean_curve_correlation",
+        "reservoir_max_mean_curve_correlation",
+        "reservoir_positive_regions_mean_curve_correlation",
+        "farm_prevalence_mean_curve_mae",
+        "farm_incidence_mean_curve_mae",
+        "farm_cumulative_incidence_mean_curve_mae",
+        "reservoir_total_mean_curve_mae",
+        "reservoir_max_mean_curve_mae",
+        "reservoir_positive_regions_mean_curve_mae",
         "farm_attack_rate_observed_median_in_synthetic_90pct",
         "farm_attack_rate_observed_median_tail_area",
         "farm_peak_prevalence_observed_median_in_synthetic_90pct",
@@ -4887,6 +5074,7 @@ def write_scientific_validation_report(
         expected_assets = [
             ("dashboard", "Dashboard", "png"),
             ("delta", "Delta", "png"),
+            ("daily_mean_compare", "Daily mean fig", "png"),
             ("distribution", "Distribution fig", "png"),
             ("parity", "Parity", "png"),
             ("channel_diagnostics", "Channel", "png"),
@@ -4895,6 +5083,7 @@ def write_scientific_validation_report(
             ("region_geo_compare", "Interactive map", "html"),
             ("outcome_distribution_summary", "Outcome table", "csv"),
             ("trajectory_distribution_summary", "Trajectory table", "csv"),
+            ("daily_mean_comparison", "Daily mean table", "csv"),
             ("daily_calibration", "Daily calib", "csv"),
             ("scalar_calibration", "Scalar calib", "csv"),
             ("uncertainty_decomposition", "Uncertainty", "csv"),
@@ -4936,6 +5125,7 @@ def write_scientific_validation_report(
         section_id = section_id_for_sample(sample_label)
         dashboard_path = artifact_path(sample_label, "dashboard")
         delta_path = artifact_path(sample_label, "delta")
+        daily_mean_path = artifact_path(sample_label, "daily_mean_compare")
         distribution_path = artifact_path(sample_label, "distribution")
         parity_path = artifact_path(sample_label, "parity")
         channel_path = artifact_path(sample_label, "channel_diagnostics")
@@ -4946,6 +5136,7 @@ def write_scientific_validation_report(
         summary_json_path = artifact_path(sample_label, "summary", extension="json")
         per_snapshot_csv_path = artifact_path(sample_label, "per_snapshot", extension="csv")
         outcome_distribution_csv_path = artifact_path(sample_label, "outcome_distribution_summary", extension="csv")
+        daily_mean_comparison_path = artifact_path(sample_label, "daily_mean_comparison", extension="csv")
         daily_calibration_path = artifact_path(sample_label, "daily_calibration", extension="csv")
         scalar_calibration_path = artifact_path(sample_label, "scalar_calibration", extension="csv")
         uncertainty_decomposition_path = artifact_path(sample_label, "uncertainty_decomposition", extension="csv")
@@ -4966,7 +5157,8 @@ def write_scientific_validation_report(
         farm_corop_csv_path = artifact_path(sample_label, "farm_corop_summary", extension="csv")
         figures = [
             figure_tag(dashboard_path, f"{sample_label} trajectory dashboard", title_text="Trajectory dashboard"),
-            figure_tag(delta_path, f"{sample_label} trajectory deltas", title_text="Trajectory deltas"),
+            figure_tag(delta_path, f"{sample_label} trajectory median deltas", title_text="Trajectory median deltas"),
+            figure_tag(daily_mean_path, f"{sample_label} daily mean trajectories", title_text="Daily mean trajectories"),
             figure_tag(distribution_path, f"{sample_label} replicate outcome distributions", title_text="Replicate outcome distributions"),
             figure_tag(parity_path, f"{sample_label} median parity checks", title_text="Median parity checks"),
             figure_tag(channel_path, f"{sample_label} hybrid-channel diagnostics", title_text="Hybrid-channel diagnostics"),
@@ -4984,6 +5176,7 @@ def write_scientific_validation_report(
             (summary_json_path, "Summary JSON"),
             (per_snapshot_csv_path, "Per-day summary CSV"),
             (outcome_distribution_csv_path, "Outcome distribution summary CSV"),
+            (daily_mean_comparison_path, "Daily mean-comparison CSV"),
             (daily_calibration_path, "Daily calibration CSV"),
             (scalar_calibration_path, "Scalar calibration CSV"),
             (uncertainty_decomposition_path, "Uncertainty decomposition CSV"),
@@ -5021,6 +5214,7 @@ def write_scientific_validation_report(
 
         pill_entries = [
             f"Prev corr {fmt_from_row(row, 'farm_prevalence_curve_correlation')}",
+            f"Prev mean corr {fmt_from_row(row, 'farm_prevalence_mean_curve_correlation')}",
             f"Attack W1 {fmt_from_row(row, 'farm_attack_rate_wasserstein')}",
             f"Farm risk corr {fmt_from_row(row, 'farm_attack_probability_correlation')}",
             f"Region spatial corr {fmt_from_row(row, 'region_reservoir_spatial_correlation_mean')}",
@@ -5063,6 +5257,11 @@ def write_scientific_validation_report(
                     outcome_distribution_csv_path,
                     "Outcome distribution summary",
                     note="Observed and synthetic scalar endpoints compared with Wasserstein distance and median location.",
+                ),
+                table_card_from_csv(
+                    daily_mean_comparison_path,
+                    "Daily mean comparison",
+                    note="Mean trajectory comparison across days for the main epidemic metrics.",
                 ),
                 table_card_from_csv(
                     daily_calibration_path,
@@ -5205,6 +5404,8 @@ def write_scientific_validation_report(
         ("sample_label", "Setting"),
         ("farm_prevalence_curve_correlation", "Farm prevalence corr"),
         ("farm_incidence_curve_correlation", "Farm incidence corr"),
+        ("farm_prevalence_mean_curve_correlation", "Farm prevalence mean corr"),
+        ("farm_incidence_mean_curve_correlation", "Farm incidence mean corr"),
         ("farm_cumulative_incidence_curve_correlation", "Cum. incidence corr"),
         ("reservoir_total_curve_correlation", "Reservoir corr"),
         ("farm_attack_probability_correlation", "Farm risk corr"),
@@ -6758,6 +6959,7 @@ def write_scenario_comparison_report(
         scenario_path = Path(str(row["output_dir"]))
         dashboard_path = relative_asset(scenario_path / f"{setting_label}_dashboard.png")
         delta_path = relative_asset(scenario_path / f"{setting_label}_delta.png")
+        daily_mean_path = relative_asset(scenario_path / f"{setting_label}_daily_mean_compare.png")
         distribution_path = relative_asset(scenario_path / f"{setting_label}_distribution.png")
         parity_path = relative_asset(scenario_path / f"{setting_label}_parity.png")
         channel_path = relative_asset(scenario_path / f"{setting_label}_channel_diagnostics.png")
@@ -6766,7 +6968,8 @@ def write_scenario_comparison_report(
         figures = "".join(
             fig for fig in [
                 figure_tag(dashboard_path, f"{scenario_name} trajectory dashboard"),
-                figure_tag(delta_path, f"{scenario_name} trajectory deltas"),
+                figure_tag(delta_path, f"{scenario_name} trajectory median deltas"),
+                figure_tag(daily_mean_path, f"{scenario_name} daily mean trajectories"),
                 figure_tag(distribution_path, f"{scenario_name} replicate distributions"),
                 figure_tag(parity_path, f"{scenario_name} parity summary"),
                 figure_tag(channel_path, f"{scenario_name} hybrid-channel diagnostics"),
@@ -6780,6 +6983,7 @@ def write_scenario_comparison_report(
         )
         pills = [
             f"<span class='metric-pill'>Prev corr {fmt_from_row(row, 'farm_prevalence_curve_correlation')}</span>",
+            f"<span class='metric-pill'>Prev mean corr {fmt_from_row(row, 'farm_prevalence_mean_curve_correlation')}</span>",
             f"<span class='metric-pill'>Attack W1 {fmt_from_row(row, 'farm_attack_rate_wasserstein')}</span>",
             f"<span class='metric-pill'>Peak W1 {fmt_from_row(row, 'farm_peak_prevalence_wasserstein')}</span>",
             f"<span class='metric-pill'>Duration W1 {fmt_from_row(row, 'farm_duration_wasserstein')}</span>",
@@ -6815,6 +7019,8 @@ def write_scenario_comparison_report(
         ("scenario_name", "Scenario"),
         ("farm_prevalence_curve_correlation", "Prev corr"),
         ("farm_incidence_curve_correlation", "Inc corr"),
+        ("farm_prevalence_mean_curve_correlation", "Prev mean corr"),
+        ("farm_incidence_mean_curve_correlation", "Inc mean corr"),
         ("farm_cumulative_incidence_curve_correlation", "Cum corr"),
         ("reservoir_total_curve_correlation", "Reservoir corr"),
         ("farm_attack_probability_correlation", "Farm risk corr"),
@@ -6835,6 +7041,18 @@ def write_scenario_comparison_report(
         ("reservoir_total_interval_coverage", "Reservoir 90% cov"),
     ]
     available_daily = [(key, label) for key, label in daily_calibration_columns if key in summary_rows.columns]
+    daily_mean_columns = [
+        ("scenario_name", "Scenario"),
+        ("farm_prevalence_mean_curve_correlation", "Prev mean corr"),
+        ("farm_incidence_mean_curve_correlation", "Inc mean corr"),
+        ("farm_cumulative_incidence_mean_curve_correlation", "Cum mean corr"),
+        ("reservoir_total_mean_curve_correlation", "Reservoir mean corr"),
+        ("farm_prevalence_mean_curve_mae", "Prev mean MAE"),
+        ("farm_incidence_mean_curve_mae", "Inc mean MAE"),
+        ("farm_cumulative_incidence_mean_curve_mae", "Cum mean MAE"),
+        ("reservoir_total_mean_curve_mae", "Reservoir mean MAE"),
+    ]
+    available_daily_mean = [(key, label) for key, label in daily_mean_columns if key in summary_rows.columns]
 
     scalar_uncertainty_columns = [
         ("scenario_name", "Scenario"),
@@ -7020,6 +7238,39 @@ def write_scenario_comparison_report(
         for _, row in summary_rows.iterrows():
             cells = []
             for key, _ in available_daily:
+                if key == "scenario_name":
+                    cells.append(f"<td>{html.escape(str(row.get(key)))}</td>")
+                else:
+                    cells.append(f"<td>{fmt_from_row(row, key)}</td>")
+            html_parts.append("<tr>" + "".join(cells) + "</tr>")
+        html_parts.extend(
+            [
+                "</tbody></table>",
+                "</div>",
+                "</section>",
+            ]
+        )
+
+    if len(available_daily_mean) > 1:
+        html_parts.extend(
+            [
+                "<section class='section'>",
+                _render_section_heading(
+                    "Daily mean comparison",
+                    control_id="daily_mean_comparison_explain",
+                    explain_text="These columns compare the mean trajectory across replicates for each day. Higher correlations mean the timing and shape line up well, while lower mean absolute error means the daily gap stays small.",
+                    button_label="How to read this table",
+                ),
+                "<p class='subtitle'>These columns summarize the daywise mean trajectory fit. They are helpful when the median stays flat at zero for long stretches and hides smaller shifts in timing or scale.</p>",
+                "<div class='table-wrap'>",
+                "<table class='report-table'>",
+                "<thead><tr>" + "".join(f"<th>{html.escape(label)}</th>" for _, label in available_daily_mean) + "</tr></thead>",
+                "<tbody>",
+            ]
+        )
+        for _, row in summary_rows.iterrows():
+            cells = []
+            for key, _ in available_daily_mean:
                 if key == "scenario_name":
                     cells.append(f"<td>{html.escape(str(row.get(key)))}</td>")
                 else:

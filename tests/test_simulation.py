@@ -376,6 +376,8 @@ class SimulationTests(unittest.TestCase):
                     "ts": [10, 11],
                     "original_farm_prevalence": [1.0, 2.0],
                     "synthetic_farm_prevalence": [1.0, 3.0],
+                    "original_farm_prevalence_mean": [1.1, 2.2],
+                    "synthetic_farm_prevalence_mean": [1.0, 2.8],
                     "original_farm_incidence": [1.0, 1.0],
                     "synthetic_farm_incidence": [1.0, 2.0],
                     "original_farm_incidence_mean": [0.8, 1.1],
@@ -388,12 +390,20 @@ class SimulationTests(unittest.TestCase):
                     "synthetic_farm_infection_event_probability": [0.40, 0.65],
                     "original_farm_cumulative_incidence": [1.0, 2.0],
                     "synthetic_farm_cumulative_incidence": [1.0, 3.0],
+                    "original_farm_cumulative_incidence_mean": [1.0, 2.1],
+                    "synthetic_farm_cumulative_incidence_mean": [1.2, 2.9],
                     "original_reservoir_total": [0.5, 0.8],
                     "synthetic_reservoir_total": [0.4, 1.0],
+                    "original_reservoir_total_mean": [0.55, 0.82],
+                    "synthetic_reservoir_total_mean": [0.48, 0.98],
                     "original_reservoir_max": [0.2, 0.3],
                     "synthetic_reservoir_max": [0.2, 0.4],
+                    "original_reservoir_max_mean": [0.25, 0.31],
+                    "synthetic_reservoir_max_mean": [0.24, 0.39],
                     "original_reservoir_positive_regions": [1.0, 2.0],
                     "synthetic_reservoir_positive_regions": [1.0, 3.0],
+                    "original_reservoir_positive_regions_mean": [1.1, 2.1],
+                    "synthetic_reservoir_positive_regions_mean": [1.0, 2.8],
                     "farm_prevalence_delta": [0.0, 1.0],
                     "farm_incidence_delta": [0.0, 1.0],
                     "farm_cumulative_incidence_delta": [0.0, 1.0],
@@ -403,6 +413,14 @@ class SimulationTests(unittest.TestCase):
             summary = {
                 "farm_prevalence_curve_correlation": 0.9,
                 "farm_incidence_curve_correlation": 0.8,
+                "farm_prevalence_mean_curve_correlation": 0.88,
+                "farm_incidence_mean_curve_correlation": 0.84,
+                "farm_cumulative_incidence_mean_curve_correlation": 0.82,
+                "reservoir_total_mean_curve_correlation": 0.74,
+                "reservoir_max_mean_curve_correlation": 0.66,
+                "reservoir_positive_regions_mean_curve_correlation": 0.78,
+                "farm_prevalence_mean_curve_mae": 0.15,
+                "farm_incidence_mean_curve_mae": 0.22,
                 "farm_cumulative_incidence_curve_correlation": 0.85,
                 "reservoir_total_curve_correlation": 0.7,
                 "reservoir_max_curve_correlation": 0.6,
@@ -446,6 +464,20 @@ class SimulationTests(unittest.TestCase):
                     "synthetic_median": [0.3, 4.0, 3.0, 6.0, 3.0, 4.0, 1.5, 0.5],
                 }
             )
+            daily_mean_comparison = pd.DataFrame(
+                {
+                    "metric": [
+                        "farm_prevalence",
+                        "farm_incidence",
+                        "farm_cumulative_incidence",
+                        "reservoir_total",
+                    ],
+                    "curve_correlation": [0.88, 0.84, 0.82, 0.74],
+                    "mean_abs_delta": [0.15, 0.22, 0.31, 0.18],
+                    "rmse": [0.16, 0.24, 0.33, 0.20],
+                    "max_abs_delta": [0.30, 0.50, 0.70, 0.40],
+                }
+            )
 
             outputs = write_report(
                 per_snapshot,
@@ -456,16 +488,20 @@ class SimulationTests(unittest.TestCase):
                     "observed_outcomes": observed_outcomes,
                     "synthetic_outcomes": synthetic_outcomes,
                     "outcome_distribution_summary": outcome_summary,
+                    "daily_mean_comparison": daily_mean_comparison,
                 },
             )
 
             self.assertTrue(Path(outputs["dashboard_png"]).exists())
             self.assertTrue(Path(outputs["delta_png"]).exists())
+            self.assertTrue(Path(outputs["daily_mean_png"]).exists())
             self.assertTrue(Path(outputs["distribution_png"]).exists())
             self.assertTrue(Path(outputs["parity_png"]).exists())
+            self.assertTrue(Path(outputs["daily_mean_comparison"]).exists())
             report_md = Path(outputs["report_md"]).read_text(encoding="utf-8")
             self.assertIn("## How to read the figures", report_md)
             self.assertIn("## How to read the tables", report_md)
+            self.assertIn("## Daily mean comparison", report_md)
 
     @unittest.skipUnless(HAS_MATPLOTLIB, "matplotlib not installed in test environment")
     def test_write_scenario_comparison_report_creates_html(self):
@@ -487,6 +523,14 @@ class SimulationTests(unittest.TestCase):
                     "report_path": [str(scenario_output / "scientific_validation_report.html")],
                     "farm_prevalence_curve_correlation": [0.9],
                     "farm_incidence_curve_correlation": [0.8],
+                    "farm_prevalence_mean_curve_correlation": [0.88],
+                    "farm_incidence_mean_curve_correlation": [0.84],
+                    "farm_cumulative_incidence_mean_curve_correlation": [0.82],
+                    "reservoir_total_mean_curve_correlation": [0.74],
+                    "farm_prevalence_mean_curve_mae": [0.15],
+                    "farm_incidence_mean_curve_mae": [0.22],
+                    "farm_cumulative_incidence_mean_curve_mae": [0.31],
+                    "reservoir_total_mean_curve_mae": [0.18],
                     "farm_cumulative_incidence_curve_correlation": [0.85],
                     "reservoir_total_curve_correlation": [0.7],
                     "farm_attack_rate_wasserstein": [0.1],
@@ -520,6 +564,7 @@ class SimulationTests(unittest.TestCase):
             self.assertIn("How to read this figure", report_html)
             self.assertIn("How to read this table", report_html)
             self.assertIn("Daily calibration", report_html)
+            self.assertIn("Daily mean comparison", report_html)
             self.assertIn("Scalar calibration and uncertainty", report_html)
 
 

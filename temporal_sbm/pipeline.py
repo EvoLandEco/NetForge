@@ -71,6 +71,18 @@ DEFAULT_COVARIATES = (
     "ft_cosine",
 )
 
+DEFAULT_METADATA_FIELDS = (
+    "corop",
+    "num_farms_bin",
+    "total_animals_bin",
+    "centroid_grid",
+    "ft_tokens",
+)
+DEFAULT_METADATA_GRID_KM = 50.0
+DEFAULT_METADATA_NUMERIC_BINS = 5
+DEFAULT_METADATA_FT_TOP_K = 3
+METADATA_LAYER_NAME = "__metadata__"
+
 
 WEIGHT_PROP_RAW = "_edge_weight_raw"
 WEIGHT_PROP_INT = "_edge_weight_int"
@@ -405,6 +417,237 @@ def _feature_index(columns: list[str], *names: str) -> Optional[int]:
     return None
 
 
+def _extract_node_scalars_from_arrays(
+    node_features: np.ndarray,
+    node_feature_columns: list[str],
+    centroid_x_index: int,
+    centroid_y_index: int,
+) -> dict[str, np.ndarray]:
+    features = node_features[1:]
+    columns = node_feature_columns
+
+    num_farms_index = _feature_index(columns, "num_farms")
+    if num_farms_index is None:
+        num_farms = np.ones(features.shape[0], dtype=float)
+    else:
+        num_farms = features[:, num_farms_index].astype(float)
+
+    animals_index = _feature_index(columns, "herd_giab23_pigs", "total_animals")
+    if animals_index is not None:
+        total_animals = features[:, animals_index].astype(float)
+    else:
+        animal_indices = [index for index, name in enumerate(columns) if name.startswith("total_diergroep_")]
+        total_animals = (
+            features[:, animal_indices].astype(float).sum(axis=1) if animal_indices else np.zeros(features.shape[0], dtype=float)
+        )
+
+    ft_indices = [index for index, name in enumerate(columns) if name.startswith("count_ft_")]
+    if ft_indices:
+        ft_matrix = features[:, ft_indices].astype(float)
+        ft_norm = np.linalg.norm(ft_matrix, axis=1)
+    else:
+        ft_matrix = np.zeros((features.shape[0], 0), dtype=float)
+        ft_norm = np.zeros(features.shape[0], dtype=float)
+
+    cx = features[:, centroid_x_index].astype(float)
+    cy = features[:, centroid_y_index].astype(float)
+
+    return {
+        "cx": cx,
+        "cy": cy,
+        "num_farms": num_farms,
+        "total_animals": total_animals,
+        "ft_matrix": ft_matrix,
+        "ft_norm": ft_norm,
+    }
+
+
+def _joint_metadata_model_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "joint_metadata_model", True))
+
+
+def _parse_metadata_fields(args: argparse.Namespace) -> list[str]:
+    raw_value = getattr(args, "metadata_fields", None)
+    if raw_value is None:
+        return list(DEFAULT_METADATA_FIELDS)
+    if isinstance(raw_value, str):
+        parts = [part.strip() for part in raw_value.split(",") if part.strip()]
+    else:
+        parts = [str(part).strip() for part in raw_value if str(part).strip()]
+    if len(parts) == 1 and parts[0].lower() in {"none", "off", "false", "no"}:
+        return []
+    return parts
+
+
+def _metadata_quantile_labels(values: Iterable[float], prefix: str, bins: int) -> pd.Series:
+    series = pd.Series(values, dtype=float)
+    out = pd.Series([None] * len(series), dtype=object)
+    clean = series.replace([np.inf, -np.inf], np.nan)
+    mask = clean.notna()
+    if mask.sum() <= 0:
+        return out
+    unique_values = int(clean[mask].nunique())
+    if unique_values <= 1:
+        out.loc[mask] = f"{prefix}_q0"
+        return out
+    q = max(1, min(int(bins), int(mask.sum()), unique_values))
+    try:
+        ranked = clean[mask].rank(method="first")
+        codes = pd.qcut(ranked, q=q, labels=False, duplicates="drop")
+        out.loc[mask] = [f"{prefix}_q{int(code)}" for code in codes.astype(int)]
+    except Exception:
+        out.loc[mask] = f"{prefix}_q0"
+    return out
+
+
+def _build_joint_metadata_links(
+    *,
+    compact_to_original: np.ndarray,
+    node_features: np.ndarray,
+    node_feature_columns: list[str],
+    centroid_x_index: int,
+    centroid_y_index: int,
+    active_compact_mask: np.ndarray,
+    node_map_csv: Path,
+    args: argparse.Namespace,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    fields = _parse_metadata_fields(args)
+    if not _joint_metadata_model_enabled(args) or not fields:
+        empty = pd.DataFrame(columns=["u", "tag_key", "tag_kind", "tag_value"])
+        return empty, {
+            "enabled": False,
+            "fields_requested": list(fields),
+            "fields_used": [],
+            "num_links": 0,
+            "num_tags": 0,
+            "field_link_counts": {},
+            "field_tag_counts": {},
+        }
+
+    scalars = _extract_node_scalars_from_arrays(
+        node_features=node_features,
+        node_feature_columns=node_feature_columns,
+        centroid_x_index=centroid_x_index,
+        centroid_y_index=centroid_y_index,
+    )
+    node_frame = pd.DataFrame(
+        {
+            "compact_id": np.arange(len(compact_to_original), dtype=np.int64),
+            "node_id": compact_to_original.astype(np.int64),
+            "active_in_window": active_compact_mask.astype(np.int8),
+            "num_farms": scalars["num_farms"].astype(float),
+            "total_animals": scalars["total_animals"].astype(float),
+            "cx": scalars["cx"].astype(float),
+            "cy": scalars["cy"].astype(float),
+        }
+    )
+    node_map = pd.read_csv(node_map_csv)
+    merge_columns = ["node_id"] + [column for column in node_map.columns if column != "node_id" and column not in node_frame.columns]
+    node_frame = node_frame.merge(node_map[merge_columns].drop_duplicates(subset=["node_id"]), on="node_id", how="left")
+
+    numeric_bins = max(1, int(getattr(args, "metadata_numeric_bins", DEFAULT_METADATA_NUMERIC_BINS)))
+    grid_km = max(1e-6, float(getattr(args, "metadata_grid_km", DEFAULT_METADATA_GRID_KM)))
+    ft_top_k = max(1, int(getattr(args, "metadata_ft_top_k", DEFAULT_METADATA_FT_TOP_K)))
+    grid_m = 1000.0 * grid_km
+
+    records: list[dict[str, Any]] = []
+    field_link_counts: Counter[str] = Counter()
+    field_tag_values: dict[str, set[str]] = defaultdict(set)
+
+    def add_token(kind: str, compact_id: int, value: object) -> None:
+        if pd.isna(value):
+            return
+        token_value = str(value).strip()
+        if not token_value or token_value.lower() in {"nan", "none"}:
+            return
+        records.append(
+            {
+                "u": int(compact_id),
+                "tag_key": f"{kind}::{token_value}",
+                "tag_kind": kind,
+                "tag_value": token_value,
+            }
+        )
+        field_link_counts[kind] += 1
+        field_tag_values[kind].add(token_value)
+
+    for field in fields:
+        if field == "corop" and "corop" in node_frame.columns:
+            for row in node_frame.itertuples(index=False):
+                add_token("corop", int(row.compact_id), getattr(row, "corop", None))
+            continue
+
+        if field == "type_label" and "type" in node_frame.columns:
+            for row in node_frame.itertuples(index=False):
+                add_token("type_label", int(row.compact_id), getattr(row, "type", None))
+            continue
+
+        if field == "num_farms_bin":
+            labels = _metadata_quantile_labels(node_frame["num_farms"], "num_farms", numeric_bins)
+            for compact_id, label in zip(node_frame["compact_id"], labels):
+                add_token("num_farms_bin", int(compact_id), label)
+            continue
+
+        if field == "total_animals_bin":
+            labels = _metadata_quantile_labels(node_frame["total_animals"], "total_animals", numeric_bins)
+            for compact_id, label in zip(node_frame["compact_id"], labels):
+                add_token("total_animals_bin", int(compact_id), label)
+            continue
+
+        if field == "centroid_grid":
+            grid_x = np.floor(node_frame["cx"].astype(float).to_numpy() / grid_m).astype(np.int64)
+            grid_y = np.floor(node_frame["cy"].astype(float).to_numpy() / grid_m).astype(np.int64)
+            for compact_id, gx, gy in zip(node_frame["compact_id"], grid_x, grid_y):
+                add_token("centroid_grid", int(compact_id), f"{int(gx)}_{int(gy)}")
+            continue
+
+        if field == "ft_tokens":
+            ft_indices = [index for index, name in enumerate(node_feature_columns) if name.startswith("count_ft_")]
+            features = node_features[1:]
+            if ft_indices:
+                ft_names = [node_feature_columns[index][len("count_ft_"):] for index in ft_indices]
+                ft_matrix = features[:, ft_indices].astype(float)
+                for compact_id, row_values in zip(node_frame["compact_id"].astype(int).tolist(), ft_matrix):
+                    positive = np.flatnonzero(row_values > 0)
+                    if positive.size == 0:
+                        continue
+                    order = positive[np.argsort(-row_values[positive], kind="stable")][:ft_top_k]
+                    for idx in order:
+                        add_token("ft_tokens", int(compact_id), ft_names[int(idx)])
+            continue
+
+        if field in node_frame.columns:
+            column = node_frame[field]
+            if pd.api.types.is_numeric_dtype(column) and column.nunique(dropna=True) > max(numeric_bins, 10):
+                labels = _metadata_quantile_labels(column.astype(float), field, numeric_bins)
+                for compact_id, label in zip(node_frame["compact_id"], labels):
+                    add_token(field, int(compact_id), label)
+            else:
+                for compact_id, value in zip(node_frame["compact_id"], column):
+                    add_token(field, int(compact_id), value)
+            continue
+
+        LOGGER.warning("Requested metadata field '%s' is unavailable and will be skipped.", field)
+
+    links = pd.DataFrame(records, columns=["u", "tag_key", "tag_kind", "tag_value"])
+    if not links.empty:
+        links = links.drop_duplicates(["u", "tag_key"]).sort_values(["tag_kind", "tag_key", "u"]).reset_index(drop=True)
+
+    summary = {
+        "enabled": bool(not links.empty),
+        "fields_requested": list(fields),
+        "fields_used": sorted(field_link_counts.keys()),
+        "num_links": int(len(links)),
+        "num_tags": int(links["tag_key"].nunique()) if not links.empty else 0,
+        "field_link_counts": {str(key): int(value) for key, value in sorted(field_link_counts.items())},
+        "field_tag_counts": {str(key): int(len(value)) for key, value in sorted(field_tag_values.items())},
+        "grid_km": float(grid_km),
+        "numeric_bins": int(numeric_bins),
+        "ft_top_k": int(ft_top_k),
+    }
+    return links, summary
+
+
 @dataclass
 class InputPaths:
     dataset: str
@@ -435,6 +678,10 @@ class PreparedData:
     centroid_y_index: int
     layer_map: dict[int, int]
     node_type_by_compact: Optional[np.ndarray]
+    active_compact_mask: np.ndarray
+    no_compact: bool
+    metadata_links: pd.DataFrame
+    metadata_summary: dict[str, Any]
     weight_column: Optional[str]
     duplicate_edge_count: int
     self_loop_count: int
@@ -816,18 +1063,39 @@ def prepare_data(args: argparse.Namespace) -> PreparedData:
         max_node_id,
     )
 
-    used_original_ids = np.sort(np.unique(edge_frame[["u", "i"]].to_numpy().ravel()).astype(np.int64))
-    original_to_compact = {int(node_id): index for index, node_id in enumerate(used_original_ids.tolist())}
-    LOGGER.debug(
-        "Compact node mapping | unique_nodes=%s | min_node_id=%s | max_node_id=%s",
-        len(used_original_ids),
-        int(used_original_ids.min()) if len(used_original_ids) else None,
-        int(used_original_ids.max()) if len(used_original_ids) else None,
-    )
+    active_original_ids = np.sort(np.unique(edge_frame[["u", "i"]].to_numpy().ravel()).astype(np.int64))
+    no_compact = bool(getattr(args, "no_compact", False))
+    if no_compact:
+        used_original_ids = np.arange(max_node_id + 1, dtype=np.int64)
+        original_to_compact = {int(node_id): int(node_id) for node_id in used_original_ids.tolist()}
+        active_compact_mask = np.zeros(len(used_original_ids), dtype=bool)
+        active_compact_mask[active_original_ids] = True
+        compact_edges = edge_frame.copy()
+        compact_features = node_features.copy()
+        LOGGER.debug(
+            "No-compaction mode | node_universe=%s | active_nodes=%s | inactive_nodes=%s | min_active_node_id=%s | max_active_node_id=%s",
+            len(used_original_ids),
+            int(active_compact_mask.sum()),
+            int(len(used_original_ids) - int(active_compact_mask.sum())),
+            int(active_original_ids.min()) if len(active_original_ids) else None,
+            int(active_original_ids.max()) if len(active_original_ids) else None,
+        )
+    else:
+        used_original_ids = active_original_ids
+        original_to_compact = {int(node_id): index for index, node_id in enumerate(used_original_ids.tolist())}
+        active_compact_mask = np.ones(len(used_original_ids), dtype=bool)
+        compact_edges = edge_frame.copy()
+        compact_edges["u"] = compact_edges["u"].map(original_to_compact).astype(np.int64)
+        compact_edges["i"] = compact_edges["i"].map(original_to_compact).astype(np.int64)
+        compact_features = np.zeros((len(used_original_ids) + 1, node_features.shape[1]), dtype=node_features.dtype)
+        compact_features[1:] = node_features[1:][used_original_ids]
+        LOGGER.debug(
+            "Compact node mapping | unique_nodes=%s | min_node_id=%s | max_node_id=%s",
+            len(used_original_ids),
+            int(used_original_ids.min()) if len(used_original_ids) else None,
+            int(used_original_ids.max()) if len(used_original_ids) else None,
+        )
 
-    compact_edges = edge_frame.copy()
-    compact_edges["u"] = compact_edges["u"].map(original_to_compact).astype(np.int64)
-    compact_edges["i"] = compact_edges["i"].map(original_to_compact).astype(np.int64)
     compact_edges = add_calendar_columns(
         compact_edges,
         ts_col="ts",
@@ -836,9 +1104,6 @@ def prepare_data(args: argparse.Namespace) -> PreparedData:
         ts_format=args.ts_format,
         holiday_country=args.holiday_country,
     )
-
-    compact_features = np.zeros((len(used_original_ids) + 1, node_features.shape[1]), dtype=node_features.dtype)
-    compact_features[1:] = node_features[1:][used_original_ids]
 
     layer_values = sorted(compact_edges["ts"].astype(np.int64).unique().tolist())
     layer_map = {int(ts): index for index, ts in enumerate(layer_values)}
@@ -860,20 +1125,38 @@ def prepare_data(args: argparse.Namespace) -> PreparedData:
     node_type_by_compact = np.zeros(len(used_original_ids), dtype=np.int32)
     node_map = node_map[node_map["node_id"].isin(used_original_ids)].copy()
     node_map["compact_id"] = node_map["node_id"].map(original_to_compact)
+    node_map = node_map[node_map["compact_id"].notna()].copy()
     is_region = node_map["type"].astype(str).str.lower().eq("region")
     node_type_by_compact[node_map.loc[is_region, "compact_id"].astype(int).to_numpy()] = 1
+
+    metadata_links, metadata_summary = _build_joint_metadata_links(
+        compact_to_original=used_original_ids,
+        node_features=compact_features,
+        node_feature_columns=feature_columns,
+        centroid_x_index=centroid_x_index,
+        centroid_y_index=centroid_y_index,
+        active_compact_mask=active_compact_mask,
+        node_map_csv=input_paths.node_map_csv,
+        args=args,
+    )
     LOGGER.debug(
-        "Loaded node types | mapped_rows=%s | region_nodes=%s",
+        "Loaded node types | mapped_rows=%s | region_nodes=%s | no_compact=%s | metadata_links=%s | metadata_tags=%s | metadata_fields=%s",
         len(node_map),
         int(is_region.sum()),
+        no_compact,
+        int(metadata_summary.get("num_links", 0)),
+        int(metadata_summary.get("num_tags", 0)),
+        metadata_summary.get("fields_used", []),
     )
 
     LOGGER.info(
-        "Prepared data in %s | edges=%s | unique nodes=%s | layers=%s",
+        "Prepared data in %s | edges=%s | unique nodes=%s | layers=%s | metadata_links=%s | metadata_tags=%s",
         _fmt_duration((pd.Timestamp.utcnow() - t0).total_seconds()),
         len(edge_frame),
         len(used_original_ids),
         len(layer_map),
+        int(metadata_summary.get("num_links", 0)),
+        int(metadata_summary.get("num_tags", 0)),
     )
 
     return PreparedData(
@@ -888,6 +1171,10 @@ def prepare_data(args: argparse.Namespace) -> PreparedData:
         centroid_y_index=centroid_y_index,
         layer_map=layer_map,
         node_type_by_compact=node_type_by_compact,
+        active_compact_mask=active_compact_mask,
+        no_compact=no_compact,
+        metadata_links=metadata_links,
+        metadata_summary=metadata_summary,
         weight_column=getattr(args, "weight_col", None),
         duplicate_edge_count=duplicate_edge_count,
         self_loop_count=self_loop_count,
@@ -895,43 +1182,12 @@ def prepare_data(args: argparse.Namespace) -> PreparedData:
 
 
 def _extract_node_scalars(prepared: PreparedData) -> dict[str, np.ndarray]:
-    features = prepared.node_features[1:]
-    columns = prepared.node_feature_columns
-
-    num_farms_index = _feature_index(columns, "num_farms")
-    if num_farms_index is None:
-        num_farms = np.ones(features.shape[0], dtype=float)
-    else:
-        num_farms = features[:, num_farms_index].astype(float)
-
-    animals_index = _feature_index(columns, "herd_giab23_pigs", "total_animals")
-    if animals_index is not None:
-        total_animals = features[:, animals_index].astype(float)
-    else:
-        animal_indices = [index for index, name in enumerate(columns) if name.startswith("total_diergroep_")]
-        total_animals = (
-            features[:, animal_indices].astype(float).sum(axis=1) if animal_indices else np.zeros(features.shape[0], dtype=float)
-        )
-
-    ft_indices = [index for index, name in enumerate(columns) if name.startswith("count_ft_")]
-    if ft_indices:
-        ft_matrix = features[:, ft_indices].astype(float)
-        ft_norm = np.linalg.norm(ft_matrix, axis=1)
-    else:
-        ft_matrix = np.zeros((features.shape[0], 0), dtype=float)
-        ft_norm = np.zeros(features.shape[0], dtype=float)
-
-    cx = features[:, prepared.centroid_x_index].astype(float)
-    cy = features[:, prepared.centroid_y_index].astype(float)
-
-    return {
-        "cx": cx,
-        "cy": cy,
-        "num_farms": num_farms,
-        "total_animals": total_animals,
-        "ft_matrix": ft_matrix,
-        "ft_norm": ft_norm,
-    }
+    return _extract_node_scalars_from_arrays(
+        node_features=prepared.node_features,
+        node_feature_columns=prepared.node_feature_columns,
+        centroid_x_index=prepared.centroid_x_index,
+        centroid_y_index=prepared.centroid_y_index,
+    )
 
 
 def build_layered_graph(prepared: PreparedData, directed: bool) -> Any:
@@ -939,36 +1195,86 @@ def build_layered_graph(prepared: PreparedData, directed: bool) -> Any:
 
     scalars = _extract_node_scalars(prepared)
     frame = prepared.compact_edges
+    metadata_links = prepared.metadata_links if isinstance(prepared.metadata_links, pd.DataFrame) else pd.DataFrame()
+    metadata_links = metadata_links.copy()
+    metadata_enabled = bool(not metadata_links.empty)
+    metadata_layer_id = int(len(prepared.layer_map)) if metadata_enabled else -1
+    tag_keys = sorted(metadata_links["tag_key"].drop_duplicates().tolist()) if metadata_enabled else []
+    data_vertex_count = len(prepared.compact_to_original)
+    tag_vertex_by_key = {key: data_vertex_count + index for index, key in enumerate(tag_keys)}
+    total_vertices = data_vertex_count + len(tag_keys)
+
     LOGGER.debug(
-        "Building layered graph | directed=%s | compact_nodes=%s | compact_edges=%s | node_type_labels=%s | ft_dimensions=%s",
+        "Building layered graph | directed=%s | data_nodes=%s | metadata_tags=%s | compact_edges=%s | active_nodes=%s | inactive_nodes=%s | node_type_labels=%s | ft_dimensions=%s | no_compact=%s | metadata_enabled=%s",
         directed,
-        len(prepared.compact_to_original),
+        data_vertex_count,
+        len(tag_keys),
         len(frame),
+        int(prepared.active_compact_mask.sum()),
+        int(len(prepared.active_compact_mask) - int(prepared.active_compact_mask.sum())),
         prepared.node_type_by_compact is not None,
         scalars["ft_matrix"].shape[1],
+        prepared.no_compact,
+        metadata_enabled,
     )
     graph = gt.Graph(directed=directed)
-    graph.add_vertex(len(prepared.compact_to_original))
+    graph.add_vertex(total_vertices)
 
     vertex_props = {
         "node_id": graph.new_vp("int"),
+        "active_in_window": graph.new_vp("int"),
         "cx": graph.new_vp("double"),
         "cy": graph.new_vp("double"),
         "num_farms": graph.new_vp("double"),
         "total_animals": graph.new_vp("double"),
+        "is_metadata_tag": graph.new_vp("int"),
+        "partition_role": graph.new_vp("int"),
+        "tag_label": graph.new_vp("string"),
+        "tag_kind": graph.new_vp("string"),
+        "tag_value": graph.new_vp("string"),
     }
     if prepared.node_type_by_compact is not None:
         vertex_props["type"] = graph.new_vp("int")
 
+    # Data vertices occupy the first block of indices and keep the compact data-node order.
     for index, node_id in enumerate(prepared.compact_to_original.tolist()):
         vertex = graph.vertex(index)
         vertex_props["node_id"][vertex] = int(node_id)
+        vertex_props["active_in_window"][vertex] = int(prepared.active_compact_mask[index])
         vertex_props["cx"][vertex] = float(scalars["cx"][index])
         vertex_props["cy"][vertex] = float(scalars["cy"][index])
         vertex_props["num_farms"][vertex] = float(scalars["num_farms"][index])
         vertex_props["total_animals"][vertex] = float(scalars["total_animals"][index])
+        vertex_props["is_metadata_tag"][vertex] = 0
+        role_value = int(prepared.node_type_by_compact[index]) if prepared.node_type_by_compact is not None else 0
+        vertex_props["partition_role"][vertex] = role_value
+        vertex_props["tag_label"][vertex] = ""
+        vertex_props["tag_kind"][vertex] = ""
+        vertex_props["tag_value"][vertex] = ""
         if "type" in vertex_props:
             vertex_props["type"][vertex] = int(prepared.node_type_by_compact[index])
+
+    # Metadata-tag vertices are appended after the data-node block.
+    tag_role_value = 2 if prepared.node_type_by_compact is not None else 1
+    for tag_key, vertex_index in tag_vertex_by_key.items():
+        vertex = graph.vertex(int(vertex_index))
+        try:
+            tag_kind, tag_value = str(tag_key).split("::", 1)
+        except ValueError:
+            tag_kind, tag_value = "metadata", str(tag_key)
+        vertex_props["node_id"][vertex] = int(-(int(vertex_index) - data_vertex_count + 1))
+        vertex_props["active_in_window"][vertex] = 0
+        vertex_props["cx"][vertex] = 0.0
+        vertex_props["cy"][vertex] = 0.0
+        vertex_props["num_farms"][vertex] = 0.0
+        vertex_props["total_animals"][vertex] = 0.0
+        vertex_props["is_metadata_tag"][vertex] = 1
+        vertex_props["partition_role"][vertex] = int(tag_role_value)
+        vertex_props["tag_label"][vertex] = str(tag_key)
+        vertex_props["tag_kind"][vertex] = str(tag_kind)
+        vertex_props["tag_value"][vertex] = str(tag_value)
+        if "type" in vertex_props:
+            vertex_props["type"][vertex] = -1
 
     for name, prop in vertex_props.items():
         graph.vp[name] = prop
@@ -978,6 +1284,7 @@ def build_layered_graph(prepared: PreparedData, directed: bool) -> Any:
     edge_mass = graph.new_ep("double")
     edge_anim = graph.new_ep("double")
     edge_ftcos = graph.new_ep("double")
+    edge_is_metadata = graph.new_ep("int")
     calendar_int = {name: graph.new_ep("int") for name in [f"dow_{index}" for index in range(7)] + ["holiday_nl"]}
     calendar_real = {name: graph.new_ep("double") for name in ["doy_sin", "doy_cos"]}
 
@@ -1019,6 +1326,7 @@ def build_layered_graph(prepared: PreparedData, directed: bool) -> Any:
     for edge_index, (u_value, v_value, ts_value) in enumerate(zip(u_array, i_array, ts_array)):
         edge = graph.add_edge(int(u_value), int(v_value))
         edge_layer[edge] = int(prepared.layer_map[int(ts_value)])
+        edge_is_metadata[edge] = 0
 
         dx = float(scalars["cx"][u_value] - scalars["cx"][v_value])
         dy = float(scalars["cy"][u_value] - scalars["cy"][v_value])
@@ -1053,10 +1361,42 @@ def build_layered_graph(prepared: PreparedData, directed: bool) -> Any:
             if edge_weight_int is not None:
                 edge_weight_int[edge] = int(round(weight_value))
 
+    if metadata_enabled:
+        def _set_metadata_edge_properties(edge: Any) -> None:
+            edge_layer[edge] = int(metadata_layer_id)
+            edge_is_metadata[edge] = 1
+            edge_dist[edge] = 0.0
+            edge_mass[edge] = 0.0
+            edge_anim[edge] = 0.0
+            edge_ftcos[edge] = 0.0
+            for prop in calendar_int.values():
+                prop[edge] = 0
+            for prop in calendar_real.values():
+                prop[edge] = 0.0
+            if edge_weight_raw is not None:
+                edge_weight_raw[edge] = 0.0
+            if edge_weight_log is not None:
+                edge_weight_log[edge] = 0.0
+            if edge_weight_log1p is not None:
+                edge_weight_log1p[edge] = 0.0
+            if edge_weight_int is not None:
+                edge_weight_int[edge] = 0
+
+        bidirectional_metadata = bool(getattr(prepared, "no_compact", False) or directed)
+        for row in metadata_links.itertuples(index=False):
+            data_vertex = int(row.u)
+            tag_vertex = int(tag_vertex_by_key[str(row.tag_key)])
+            edge = graph.add_edge(data_vertex, tag_vertex)
+            _set_metadata_edge_properties(edge)
+            if directed and bidirectional_metadata:
+                reverse_edge = graph.add_edge(tag_vertex, data_vertex)
+                _set_metadata_edge_properties(reverse_edge)
+
     graph.ep["layer"] = edge_layer
     graph.ep["dist_km"] = edge_dist
     graph.ep["mass_grav"] = edge_mass
     graph.ep["anim_grav"] = edge_anim
+    graph.ep["is_metadata"] = edge_is_metadata
     if include_ft_cosine:
         graph.ep["ft_cosine"] = edge_ftcos
     else:
@@ -1073,13 +1413,20 @@ def build_layered_graph(prepared: PreparedData, directed: bool) -> Any:
         graph.ep[WEIGHT_PROP_LOG1P] = edge_weight_log1p
     if edge_weight_int is not None:
         graph.ep[WEIGHT_PROP_INT] = edge_weight_int
-    graph.gp["num_layers"] = graph.new_gp("int", len(prepared.layer_map))
+    graph.gp["num_layers"] = graph.new_gp("int", len(prepared.layer_map) + (1 if metadata_enabled else 0))
+    graph.gp["num_trade_layers"] = graph.new_gp("int", len(prepared.layer_map))
+    graph.gp["metadata_layer_id"] = graph.new_gp("int", int(metadata_layer_id))
+    graph.gp["metadata_tag_count"] = graph.new_gp("int", int(len(tag_keys)))
+    graph.gp["no_compact"] = graph.new_gp("bool", bool(prepared.no_compact))
 
     LOGGER.info(
-        "Built layered graph | vertices=%s | edges=%s | layers=%s",
+        "Built layered graph | vertices=%s | data_vertices=%s | metadata_tags=%s | edges=%s | trade_layers=%s | metadata_layer=%s",
         graph.num_vertices(),
+        data_vertex_count,
+        len(tag_keys),
         graph.num_edges(),
         len(prepared.layer_map),
+        metadata_layer_id,
     )
     LOGGER.debug(
         "Graph properties | vertex_props=%s | edge_props=%s",
@@ -1122,6 +1469,8 @@ def _select_covariate_specs(
         return selected
 
     requested = list(dict.fromkeys(str(name) for name in requested_names))
+    if requested == ["none"]:
+        return []
     invalid = [name for name in requested if name not in ALL_EDGE_COVARIATES]
     if invalid:
         raise ValueError(
@@ -1272,6 +1621,38 @@ def _weight_generation_mode_name(args: argparse.Namespace) -> str:
     return str(getattr(args, "weight_generation_mode", "parametric")).strip().lower()
 
 
+def _pure_generative_weight_mode(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "weight_pure_generative", False))
+
+
+def _validate_weight_generation_configuration(
+    args: argparse.Namespace,
+    *,
+    has_weight_data: bool,
+) -> None:
+    weight_generation_mode = _weight_generation_mode_name(args)
+    weight_partition_policy = str(getattr(args, "weight_parametric_partition_policy", "fixed")).strip().lower()
+    pure_generative = _pure_generative_weight_mode(args)
+
+    if weight_partition_policy not in {"fixed", "refit_on_refresh"}:
+        raise ValueError(
+            "Unknown weight_parametric_partition_policy. Use 'fixed' or 'refit_on_refresh'."
+        )
+
+    if pure_generative and weight_partition_policy == "refit_on_refresh":
+        raise ValueError(
+            "weight_pure_generative=True is incompatible with "
+            "weight_parametric_partition_policy='refit_on_refresh' because that policy "
+            "reuses observed weighted edges during generation."
+        )
+
+    if pure_generative and has_weight_data and weight_generation_mode not in {"parametric", "model", "generative"}:
+        raise ValueError(
+            "weight_pure_generative=True requires weight_generation_mode in {'parametric', 'model', 'generative'} "
+            "so edge weights are generated only from fitted distributional models."
+        )
+
+
 def _fit_includes_edge_weight_covariate(args: argparse.Namespace) -> bool:
     return not bool(getattr(args, "exclude_weight_from_fit", False))
 
@@ -1290,6 +1671,8 @@ def _standalone_weight_model(prepared: PreparedData) -> Optional[dict[str, Any]]
 def fit_nested_sbm(
     graph: Any,
     covariate_specs: Iterable[CovariateSpec],
+    layered: bool,
+    allow_mixed_node_types: bool,
     deg_corr: bool,
     overlap: bool,
     verbose: bool,
@@ -1301,11 +1684,11 @@ def fit_nested_sbm(
 ) -> Any:
     gt = _require_graph_tool()
     covariate_specs = [spec for spec in covariate_specs if spec.graph_property in graph.ep]
-    if not covariate_specs:
-        raise ValueError("No valid covariates remain for fitting.")
     _log_covariate_specs("Starting nested SBM fit", covariate_specs)
     LOGGER.debug(
-        "Fit options | deg_corr=%s | overlap=%s | fit_verbose=%s | refine_multiflip_rounds=%s | refine_multiflip_niter=%s | anneal_niter=%s | anneal_beta_start=%s | anneal_beta_stop=%s",
+        "Fit options | layered=%s | allow_mixed_node_types=%s | deg_corr=%s | overlap=%s | fit_verbose=%s | refine_multiflip_rounds=%s | refine_multiflip_niter=%s | anneal_niter=%s | anneal_beta_start=%s | anneal_beta_stop=%s",
+        layered,
+        allow_mixed_node_types,
         deg_corr,
         overlap,
         verbose,
@@ -1318,7 +1701,14 @@ def fit_nested_sbm(
 
     rec_props = [graph.ep[spec.graph_property] for spec in covariate_specs]
     rec_types = [spec.rec_type for spec in covariate_specs]
-    clabel = graph.vp["type"] if "type" in graph.vp else None
+    if allow_mixed_node_types:
+        clabel = None
+    elif "partition_role" in graph.vp:
+        clabel = graph.vp["partition_role"]
+    elif "type" in graph.vp:
+        clabel = graph.vp["type"]
+    else:
+        clabel = None
 
     state = gt.minimize_nested_blockmodel_dl(
         graph,
@@ -1327,7 +1717,7 @@ def fit_nested_sbm(
             hentropy_args=dict(multigraph=False),
             state_args=dict(
                 ec=graph.ep["layer"],
-                layers=True,
+                layers=bool(layered),
                 recs=rec_props,
                 rec_types=rec_types,
                 deg_corr=deg_corr,
@@ -1369,6 +1759,8 @@ def _fit_with_weight_candidates(
         state = fit_nested_sbm(
             graph=graph,
             covariate_specs=base_covariate_specs,
+            layered=bool(getattr(args, "layered", True)),
+            allow_mixed_node_types=bool(getattr(args, "allow_mixed_node_types", False)),
             deg_corr=not args.no_deg_corr,
             overlap=bool(args.overlap),
             verbose=not args.fit_quiet,
@@ -1398,6 +1790,8 @@ def _fit_with_weight_candidates(
         state = fit_nested_sbm(
             graph=graph,
             covariate_specs=fit_specs,
+            layered=bool(getattr(args, "layered", True)),
+            allow_mixed_node_types=bool(getattr(args, "allow_mixed_node_types", False)),
             deg_corr=not args.no_deg_corr,
             overlap=bool(args.overlap),
             verbose=not args.fit_quiet,
@@ -1455,6 +1849,23 @@ def _fit_with_weight_candidates(
 
 def _base_state(nested_or_base: Any) -> Any:
     return nested_or_base.get_levels()[0] if hasattr(nested_or_base, "get_levels") else nested_or_base
+
+
+def _node_blocks_from_state(nested_or_base: Any) -> np.ndarray:
+    base = _base_state(nested_or_base)
+    vertex_count = int(base.g.num_vertices()) if hasattr(base, "g") else -1
+
+    if hasattr(nested_or_base, "get_bs"):
+        try:
+            block_levels = nested_or_base.get_bs()
+            if block_levels:
+                blocks = np.asarray(block_levels[0], dtype=np.int64).reshape(-1)
+                if vertex_count < 0 or blocks.size == vertex_count:
+                    return blocks
+        except Exception:
+            pass
+
+    return np.asarray(base.get_nonoverlap_blocks().a, dtype=np.int64)
 
 
 def _is_layered_base_type(base_type: Any) -> bool:
@@ -1541,10 +1952,19 @@ def _state_summary_text(nested_state: Any) -> str:
     try:
         base = _base_state(nested_state)
         levels = len(nested_state.get_levels()) if hasattr(nested_state, "get_levels") else 1
-        blocks = np.asarray(base.get_nonoverlap_blocks().a, dtype=np.int64)
+        if hasattr(base, "get_nonempty_B"):
+            try:
+                block_count = int(base.get_nonempty_B())
+            except Exception:
+                block_count = -1
+        else:
+            block_count = -1
+        if block_count < 0:
+            blocks = np.asarray(base.get_nonoverlap_blocks().a, dtype=np.int64)
+            block_count = int(np.unique(blocks).size)
         entropy = float(nested_state.entropy()) if hasattr(nested_state, "entropy") else float("nan")
         return (
-            f"levels={levels} | blocks={int(np.unique(blocks).size)} | "
+            f"levels={levels} | blocks={block_count} | "
             f"vertices={int(base.g.num_vertices())} | edges={int(base.g.num_edges())} | entropy={entropy:.6f}"
         )
     except Exception as exc:
@@ -1554,7 +1974,11 @@ def _state_summary_text(nested_state: Any) -> str:
 def attach_partition_maps(graph: Any, nested_state: Any) -> None:
     base = _base_state(nested_state)
     try:
-        graph.vp["sbm_b"] = graph.own_property(base.get_nonoverlap_blocks().copy())
+        blocks = _node_blocks_from_state(nested_state)
+        block_prop = graph.new_vp("int64_t")
+        for index in range(int(graph.num_vertices())):
+            block_prop[graph.vertex(index)] = int(blocks[index])
+        graph.vp["sbm_b"] = graph.own_property(block_prop)
     except Exception:
         pass
 
@@ -1604,9 +2028,15 @@ def extract_node_block_map(graph: Any) -> dict[int, int]:
 
     node_id_prop = graph.vp["node_id"]
     block_prop = graph.vp["sbm_b"]
+    metadata_prop = graph.vp["is_metadata_tag"] if "is_metadata_tag" in graph.vp else None
     mapping: dict[int, int] = {}
     for vertex in graph.vertices():
-        mapping[int(node_id_prop[vertex])] = int(block_prop[vertex])
+        if metadata_prop is not None and bool(metadata_prop[vertex]):
+            continue
+        node_id = int(node_id_prop[vertex])
+        if node_id < 0:
+            continue
+        mapping[node_id] = int(block_prop[vertex])
     return mapping
 
 
@@ -1630,6 +2060,7 @@ def write_node_attributes(
     frame = pd.DataFrame(
         {
             "node_id": prepared.compact_to_original.astype(np.int64),
+            "active_in_window": prepared.active_compact_mask.astype(np.int8),
             "x": scalars["cx"].astype(float),
             "y": scalars["cy"].astype(float),
             "num_farms": scalars["num_farms"].astype(float),
@@ -1770,7 +2201,8 @@ def _posterior_partition_state(
 
 
 
-WEIGHT_GENERATOR_PAYLOAD_FORMAT = "parametric_weight_generator_v1"
+WEIGHT_GENERATOR_PAYLOAD_FORMAT = "parametric_weight_generator_v2"
+WEIGHT_GENERATOR_PAYLOAD_FORMAT_LEGACY = "parametric_weight_generator_v1"
 
 
 def _canonical_weight_channel(
@@ -1785,6 +2217,34 @@ def _canonical_weight_channel(
     if not directed and src > dst:
         src, dst = dst, src
     return src, dst
+
+
+def _weight_channel_to_str(
+    channel: tuple[Optional[int], Optional[int]],
+) -> str:
+    src_type, dst_type = channel
+    return f"{'' if src_type is None else int(src_type)}|{'' if dst_type is None else int(dst_type)}"
+
+
+def _weight_channel_from_str(
+    text_value: str,
+) -> tuple[Optional[int], Optional[int]]:
+    parts = str(text_value).split("|")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid serialised weight-channel key: {text_value!r}")
+    return (
+        None if parts[0] == "" else int(parts[0]),
+        None if parts[1] == "" else int(parts[1]),
+    )
+
+
+def _weight_channel_label(
+    src_type: Optional[int],
+    dst_type: Optional[int],
+) -> str:
+    left = "*" if src_type is None else str(int(src_type))
+    right = "*" if dst_type is None else str(int(dst_type))
+    return f"{left}->{right}"
 
 
 def _canonical_weight_key(
@@ -2020,6 +2480,7 @@ def _fit_parametric_weight_generator_model(
     weight_model: dict,
     directed: bool,
     args: argparse.Namespace,
+    blocks: Optional[np.ndarray] = None,
 ) -> dict:
     weight_col = str(weight_model.get("output_column") or weight_model.get("input_column"))
     required = {"u", "i", "ts", weight_col}
@@ -2043,7 +2504,10 @@ def _fit_parametric_weight_generator_model(
     if node_id_prop is None:
         raise RuntimeError("Fitted graph is missing the vertex property 'node_id' required for weight fitting.")
     type_prop = base.g.vp["type"] if "type" in base.g.vp else None
-    blocks = np.asarray(base.get_nonoverlap_blocks().a, dtype=np.int64)
+    if blocks is None:
+        blocks = _node_blocks_from_state(base)
+    else:
+        blocks = np.asarray(blocks, dtype=np.int64)
 
     node_id_to_block: dict[int, int] = {}
     node_id_to_type: dict[int, int] = {}
@@ -2054,178 +2518,239 @@ def _fit_parametric_weight_generator_model(
         if type_prop is not None:
             node_id_to_type[node_id] = int(type_prop[vertex])
 
-    family_spec = _select_parametric_weight_family(
-        raw_weights,
-        requested=str(getattr(args, "weight_parametric_family", "auto")),
-    )
-
-    if family_spec["family"] == "lognormal":
-        if family_spec["transform"] == "log":
-            model_values = np.log(raw_weights)
-        else:
-            model_values = np.log1p(raw_weights)
-    else:
-        shift = int(family_spec["shift"])
-        model_values = np.round(raw_weights).astype(np.int64) - shift
-        if np.any(model_values < 0):
-            raise ValueError(
-                "The selected parametric count family produced negative shifted weights. "
-                "Check the observed support or choose a different family."
-            )
-        model_values = model_values.astype(float)
-
-    stats: dict[
-        tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]],
-        WeightCellStats,
-    ] = defaultdict(WeightCellStats)
-
-    for row, model_value in zip(frame.itertuples(index=False), model_values):
-        u_block = node_id_to_block.get(int(row.u))
-        v_block = node_id_to_block.get(int(row.i))
-        if u_block is None or v_block is None:
-            continue
-
+    rows = list(frame.itertuples(index=False))
+    channel_records: dict[
+        tuple[Optional[int], Optional[int]],
+        list[tuple[Any, float, Optional[int], Optional[int]]],
+    ] = defaultdict(list)
+    for row, raw_weight in zip(rows, raw_weights):
         src_type = node_id_to_type.get(int(row.u)) if node_id_to_type else None
         dst_type = node_id_to_type.get(int(row.i)) if node_id_to_type else None
-        for key in _weight_cell_keys(
-            int(row.ts),
-            int(u_block),
-            int(v_block),
-            src_type=src_type,
-            dst_type=dst_type,
-            directed=bool(directed),
-        ).values():
-            stats[key].update(float(model_value))
+        channel = _canonical_weight_channel(src_type, dst_type, bool(directed))
+        channel_records[channel].append((row, float(raw_weight), src_type, dst_type))
 
-    global_key = _canonical_weight_key(None, None, None, None, None, bool(directed))
-    if global_key not in stats or stats[global_key].n <= 0:
-        raise RuntimeError("Failed to accumulate global sufficient statistics for parametric weights.")
+    if not channel_records:
+        raise RuntimeError("Failed to assign any observed weighted edges to a weight channel.")
 
+    requested_family = str(getattr(args, "weight_parametric_family", "auto"))
     shrinkage = _parametric_weight_shrinkage(args)
-    fitted_params: dict[
-        tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]],
-        dict[str, Any],
-    ] = {}
-
     level_order = ["global", "channel", "layer", "block_pair", "layer_channel", "exact"]
-    for level in level_order:
-        level_keys = sorted(
-            [key for key in stats if _weight_key_level(key) == level],
-            key=_weight_key_to_str,
-        )
-        for key in level_keys:
-            cell_stats = stats[key]
-            parent_keys = _weight_parent_keys(key, bool(directed))
+    channel_models: dict[str, dict[str, Any]] = {}
+    aggregate_level_counts: Counter[str] = Counter()
 
-            mean_num = float(cell_stats.sum_x)
-            mean_den = float(cell_stats.n)
-            for parent_name, parent_key in parent_keys:
-                parent_params = fitted_params.get(parent_key)
-                if parent_params is None or int(parent_params.get("n", 0)) <= 0:
-                    continue
-                strength = min(float(shrinkage.get(parent_name, 0.0)), float(parent_params["n"]))
-                if strength <= 0.0:
-                    continue
-                mean_num += strength * float(parent_params["mean"])
-                mean_den += strength
-            mean_hat = mean_num / mean_den if mean_den > 0.0 else 0.0
+    for channel in sorted(channel_records, key=_weight_channel_to_str):
+        records = channel_records[channel]
+        channel_raw_weights = np.asarray([record[1] for record in records], dtype=float)
+        family_spec = _select_parametric_weight_family(channel_raw_weights, requested=requested_family)
 
-            param_record: dict[str, Any] = {
-                "level": level,
-                "n": int(cell_stats.n),
-                "mean": float(mean_hat),
-            }
-
-            if family_spec["family"] == "lognormal":
-                raw_var = None
-                if cell_stats.n > 0:
-                    raw_mean = float(cell_stats.sum_x / cell_stats.n)
-                    raw_var = float(cell_stats.sum_x2 / cell_stats.n - raw_mean * raw_mean)
-                    raw_var = max(raw_var, 1e-9)
-
-                var_num = 0.0
-                var_den = 0.0
-                if raw_var is not None and cell_stats.n > 1:
-                    own_weight = float(cell_stats.n - 1)
-                    var_num += own_weight * raw_var
-                    var_den += own_weight
-
-                for parent_name, parent_key in parent_keys:
-                    parent_params = fitted_params.get(parent_key)
-                    if parent_params is None or "variance" not in parent_params or int(parent_params.get("n", 0)) <= 0:
-                        continue
-                    strength = min(float(shrinkage.get(parent_name, 0.0)), float(parent_params["n"]))
-                    if strength <= 0.0:
-                        continue
-                    var_num += strength * float(parent_params["variance"])
-                    var_den += strength
-
-                if var_den <= 0.0:
-                    variance_hat = raw_var if raw_var is not None else 1.0
-                else:
-                    variance_hat = var_num / var_den
-                param_record["variance"] = float(max(variance_hat, 1e-9))
+        if family_spec["family"] == "lognormal":
+            if family_spec["transform"] == "log":
+                model_values = np.log(channel_raw_weights)
             else:
-                raw_alpha = _nb2_alpha_from_stats(cell_stats)
-                alpha_num = 0.0
-                alpha_den = 0.0
-                if raw_alpha is not None and cell_stats.n > 1:
-                    own_weight = float(cell_stats.n - 1)
-                    alpha_num += own_weight * float(raw_alpha)
-                    alpha_den += own_weight
+                model_values = np.log1p(channel_raw_weights)
+        else:
+            shift = int(family_spec["shift"])
+            model_values = np.round(channel_raw_weights).astype(np.int64) - shift
+            if np.any(model_values < 0):
+                raise ValueError(
+                    "The selected parametric count family produced negative shifted weights. "
+                    "Check the observed support or choose a different family."
+                )
+            model_values = model_values.astype(float)
 
+        stats: dict[
+            tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]],
+            WeightCellStats,
+        ] = defaultdict(WeightCellStats)
+
+        for (row, _, src_type, dst_type), model_value in zip(records, model_values):
+            u_block = node_id_to_block.get(int(row.u))
+            v_block = node_id_to_block.get(int(row.i))
+            if u_block is None or v_block is None:
+                continue
+
+            for key in _weight_cell_keys(
+                int(row.ts),
+                int(u_block),
+                int(v_block),
+                src_type=src_type,
+                dst_type=dst_type,
+                directed=bool(directed),
+            ).values():
+                stats[key].update(float(model_value))
+
+        global_key = _canonical_weight_key(None, None, None, None, None, bool(directed))
+        if global_key not in stats or stats[global_key].n <= 0:
+            raise RuntimeError(
+                "Failed to accumulate global sufficient statistics for parametric weights "
+                f"in channel {_weight_channel_label(*channel)}."
+            )
+
+        fitted_params: dict[
+            tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]],
+            dict[str, Any],
+        ] = {}
+        for level in level_order:
+            level_keys = sorted(
+                [key for key in stats if _weight_key_level(key) == level],
+                key=_weight_key_to_str,
+            )
+            for key in level_keys:
+                cell_stats = stats[key]
+                parent_keys = _weight_parent_keys(key, bool(directed))
+
+                mean_num = float(cell_stats.sum_x)
+                mean_den = float(cell_stats.n)
                 for parent_name, parent_key in parent_keys:
                     parent_params = fitted_params.get(parent_key)
-                    if parent_params is None or "alpha" not in parent_params or int(parent_params.get("n", 0)) <= 0:
+                    if parent_params is None or int(parent_params.get("n", 0)) <= 0:
                         continue
                     strength = min(float(shrinkage.get(parent_name, 0.0)), float(parent_params["n"]))
                     if strength <= 0.0:
                         continue
-                    alpha_num += strength * float(parent_params["alpha"])
-                    alpha_den += strength
+                    mean_num += strength * float(parent_params["mean"])
+                    mean_den += strength
+                mean_hat = mean_num / mean_den if mean_den > 0.0 else 0.0
 
-                alpha_hat = alpha_num / alpha_den if alpha_den > 0.0 else 0.0
-                param_record["alpha"] = float(max(alpha_hat, 0.0))
-                param_record["shift"] = int(family_spec["shift"])
+                param_record: dict[str, Any] = {
+                    "level": level,
+                    "n": int(cell_stats.n),
+                    "mean": float(mean_hat),
+                }
 
-            fitted_params[key] = param_record
+                if family_spec["family"] == "lognormal":
+                    raw_var = None
+                    if cell_stats.n > 0:
+                        raw_mean = float(cell_stats.sum_x / cell_stats.n)
+                        raw_var = float(cell_stats.sum_x2 / cell_stats.n - raw_mean * raw_mean)
+                        raw_var = max(raw_var, 1e-9)
 
-    serialised_cells = {
-        _weight_key_to_str(key): value
-        for key, value in sorted(fitted_params.items(), key=lambda item: _weight_key_to_str(item[0]))
+                    var_num = 0.0
+                    var_den = 0.0
+                    if raw_var is not None and cell_stats.n > 1:
+                        own_weight = float(cell_stats.n - 1)
+                        var_num += own_weight * raw_var
+                        var_den += own_weight
+
+                    for parent_name, parent_key in parent_keys:
+                        parent_params = fitted_params.get(parent_key)
+                        if parent_params is None or "variance" not in parent_params or int(parent_params.get("n", 0)) <= 0:
+                            continue
+                        strength = min(float(shrinkage.get(parent_name, 0.0)), float(parent_params["n"]))
+                        if strength <= 0.0:
+                            continue
+                        var_num += strength * float(parent_params["variance"])
+                        var_den += strength
+
+                    if var_den <= 0.0:
+                        variance_hat = raw_var if raw_var is not None else 1.0
+                    else:
+                        variance_hat = var_num / var_den
+                    param_record["variance"] = float(max(variance_hat, 1e-9))
+                else:
+                    raw_alpha = _nb2_alpha_from_stats(cell_stats)
+                    alpha_num = 0.0
+                    alpha_den = 0.0
+                    if raw_alpha is not None and cell_stats.n > 1:
+                        own_weight = float(cell_stats.n - 1)
+                        alpha_num += own_weight * float(raw_alpha)
+                        alpha_den += own_weight
+
+                    for parent_name, parent_key in parent_keys:
+                        parent_params = fitted_params.get(parent_key)
+                        if parent_params is None or "alpha" not in parent_params or int(parent_params.get("n", 0)) <= 0:
+                            continue
+                        strength = min(float(shrinkage.get(parent_name, 0.0)), float(parent_params["n"]))
+                        if strength <= 0.0:
+                            continue
+                        alpha_num += strength * float(parent_params["alpha"])
+                        alpha_den += strength
+
+                    alpha_hat = alpha_num / alpha_den if alpha_den > 0.0 else 0.0
+                    param_record["alpha"] = float(max(alpha_hat, 0.0))
+                    param_record["shift"] = int(family_spec["shift"])
+
+                fitted_params[key] = param_record
+
+        serialised_cells = {
+            _weight_key_to_str(key): value
+            for key, value in sorted(fitted_params.items(), key=lambda item: _weight_key_to_str(item[0]))
+        }
+        level_counts = Counter(value["level"] for value in serialised_cells.values())
+        aggregate_level_counts.update(level_counts)
+        channel_key = _weight_channel_to_str(channel)
+        channel_models[channel_key] = {
+            "channel": {
+                "src_type": None if channel[0] is None else int(channel[0]),
+                "dst_type": None if channel[1] is None else int(channel[1]),
+                "label": _weight_channel_label(channel[0], channel[1]),
+            },
+            "family": family_spec["family"],
+            "transform": family_spec["transform"],
+            "shift": int(family_spec["shift"]),
+            "support": family_spec["support"],
+            "fallback_order": ["exact", "block_pair", "layer_channel", "channel", "layer", "global"],
+            "cells": serialised_cells,
+            "summary": {
+                "channel_key": channel_key,
+                "channel_label": _weight_channel_label(channel[0], channel[1]),
+                "num_cells": int(len(serialised_cells)),
+                "edge_count": int(len(records)),
+                "weight_total": float(channel_raw_weights.sum()),
+                "level_counts": {str(level): int(count) for level, count in sorted(level_counts.items())},
+                "family": family_spec["family"],
+                "support": family_spec["support"],
+                "model_scale_summary": _format_numeric_summary(model_values),
+                "raw_weight_summary": _format_numeric_summary(channel_raw_weights),
+            },
+        }
+
+    if not channel_models:
+        raise RuntimeError("Parametric weight fitting produced no channel-specific models.")
+
+    sorted_channel_models = dict(sorted(channel_models.items(), key=lambda item: item[0]))
+    families_by_channel = {
+        channel_key: str(channel_model["family"])
+        for channel_key, channel_model in sorted_channel_models.items()
     }
-    level_counts = Counter(value["level"] for value in serialised_cells.values())
+    channel_summaries = {
+        channel_key: channel_model["summary"]
+        for channel_key, channel_model in sorted_channel_models.items()
+    }
+    only_channel_model = next(iter(sorted_channel_models.values())) if len(sorted_channel_models) == 1 else None
+    total_num_cells = int(sum(int(channel_model["summary"]["num_cells"]) for channel_model in sorted_channel_models.values()))
 
     model = {
         "format": WEIGHT_GENERATOR_PAYLOAD_FORMAT,
         "mode": "parametric",
         "output_column": weight_col,
         "directed": bool(directed),
-        "family": family_spec["family"],
-        "transform": family_spec["transform"],
-        "shift": int(family_spec["shift"]),
-        "support": family_spec["support"],
-        "fallback_order": ["exact", "block_pair", "layer_channel", "channel", "layer", "global"],
-        "cells": serialised_cells,
+        "family": str(only_channel_model["family"]) if only_channel_model is not None else "per_channel",
+        "transform": str(only_channel_model["transform"]) if only_channel_model is not None else "per_channel",
+        "shift": int(only_channel_model["shift"]) if only_channel_model is not None else 0,
+        "support": str(only_channel_model["support"]) if only_channel_model is not None else "per_channel",
+        "channel_models": sorted_channel_models,
         "node_blocks": {str(node_id): int(block_id) for node_id, block_id in sorted(node_id_to_block.items())},
         "node_types": {str(node_id): int(type_value) for node_id, type_value in sorted(node_id_to_type.items())},
         "shrinkage": {name: float(value) for name, value in shrinkage.items()},
         "reference_partition_source": "fitted_or_refreshed_state",
         "summary": {
-            "num_cells": int(len(serialised_cells)),
-            "level_counts": {str(level): int(count) for level, count in sorted(level_counts.items())},
+            "num_channels": int(len(sorted_channel_models)),
+            "num_cells": total_num_cells,
+            "level_counts": {str(level): int(count) for level, count in sorted(aggregate_level_counts.items())},
             "weight_column": weight_col,
-            "family": family_spec["family"],
-            "support": family_spec["support"],
-            "model_scale_summary": _format_numeric_summary(model_values),
+            "requested_family": requested_family,
+            "families_by_channel": families_by_channel,
+            "channel_summaries": channel_summaries,
             "raw_weight_summary": _format_numeric_summary(raw_weights),
         },
     }
     LOGGER.info(
-        "Fitted parametric weight generator | column=%s | family=%s | cells=%s",
+        "Fitted parametric weight generator | column=%s | channels=%s | families=%s | cells=%s",
         weight_col,
-        family_spec["family"],
-        len(serialised_cells),
+        len(sorted_channel_models),
+        families_by_channel,
+        total_num_cells,
     )
     LOGGER.debug("Parametric weight generator summary | %s", model["summary"])
     return model
@@ -2238,26 +2763,65 @@ class ParametricWeightSampler:
         directed: bool,
         rng: np.random.Generator,
     ) -> None:
-        if str(weight_generator_model.get("format")) != WEIGHT_GENERATOR_PAYLOAD_FORMAT:
+        payload_format = str(weight_generator_model.get("format"))
+        if payload_format not in {WEIGHT_GENERATOR_PAYLOAD_FORMAT, WEIGHT_GENERATOR_PAYLOAD_FORMAT_LEGACY}:
             raise ValueError(
                 "Unsupported parametric weight generator payload format: "
                 f"{weight_generator_model.get('format')!r}"
             )
         self.weight_col = str(weight_generator_model["output_column"])
-        self.family = str(weight_generator_model["family"])
-        self.transform = str(weight_generator_model.get("transform", "none"))
-        self.shift = int(weight_generator_model.get("shift", 0))
         self.directed = bool(directed)
         self.rng = rng
-        self.fallback_order = [str(value) for value in weight_generator_model.get("fallback_order", [])]
-        self.cells = {
-            _weight_key_from_str(key): value
-            for key, value in weight_generator_model.get("cells", {}).items()
-        }
+        self.payload_format = payload_format
+        self.channel_models = self._load_channel_models(weight_generator_model)
         self.resolution_counts: Counter[str] = Counter()
+
+    def _parse_channel_model(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "family": str(payload["family"]),
+            "transform": str(payload.get("transform", "none")),
+            "shift": int(payload.get("shift", 0)),
+            "fallback_order": [str(value) for value in payload.get("fallback_order", [])],
+            "cells": {
+                _weight_key_from_str(key): value
+                for key, value in payload.get("cells", {}).items()
+            },
+        }
+
+    def _load_channel_models(self, payload: dict[str, Any]) -> dict[tuple[Optional[int], Optional[int]], dict[str, Any]]:
+        channel_models_payload = payload.get("channel_models")
+        if isinstance(channel_models_payload, dict) and channel_models_payload:
+            parsed: dict[tuple[Optional[int], Optional[int]], dict[str, Any]] = {}
+            for channel_key, channel_payload in sorted(channel_models_payload.items(), key=lambda item: str(item[0])):
+                parsed[_weight_channel_from_str(str(channel_key))] = self._parse_channel_model(channel_payload)
+            return parsed
+        return {
+            _canonical_weight_channel(None, None, self.directed): self._parse_channel_model(payload),
+        }
+
+    def _resolve_channel_model(
+        self,
+        *,
+        src_type: Optional[int],
+        dst_type: Optional[int],
+    ) -> tuple[dict[str, Any], tuple[Optional[int], Optional[int]]]:
+        channel = _canonical_weight_channel(src_type, dst_type, self.directed)
+        params = self.channel_models.get(channel)
+        if params is not None:
+            return params, channel
+
+        default_channel = _canonical_weight_channel(None, None, self.directed)
+        if default_channel in self.channel_models and len(self.channel_models) == 1:
+            return self.channel_models[default_channel], channel
+
+        raise RuntimeError(
+            "Parametric weight generator is missing a fitted channel model for "
+            f"{_weight_channel_label(channel[0], channel[1])}."
+        )
 
     def _resolve_params(
         self,
+        channel_model: dict[str, Any],
         ts_value: int,
         r: int,
         s: int,
@@ -2273,18 +2837,18 @@ class ParametricWeightSampler:
             dst_type=dst_type,
             directed=self.directed,
         )
-        for label in self.fallback_order:
+        for label in channel_model["fallback_order"]:
             key = keys.get(label)
             if key is None:
                 continue
-            params = self.cells.get(key)
+            params = channel_model["cells"].get(key)
             if params is not None:
                 return params, label
 
         global_key = _canonical_weight_key(None, None, None, None, None, self.directed)
-        params = self.cells.get(global_key)
+        params = channel_model["cells"].get(global_key)
         if params is None:
-            raise RuntimeError("Parametric weight generator is missing the global fallback cell.")
+            raise RuntimeError("Parametric weight generator is missing the global cell for its resolved channel model.")
         return params, "global"
 
     def sample(
@@ -2299,31 +2863,58 @@ class ParametricWeightSampler:
         if not self.directed and r > s:
             r, s = s, r
         src_type, dst_type = _canonical_weight_channel(src_type, dst_type, self.directed)
+        channel_model, requested_channel = self._resolve_channel_model(src_type=src_type, dst_type=dst_type)
         params, resolution = self._resolve_params(
+            channel_model,
             int(ts_value),
             int(r),
             int(s),
             src_type=src_type,
             dst_type=dst_type,
         )
+        channel_key = _weight_channel_to_str(requested_channel)
         self.resolution_counts[resolution] += 1
+        self.resolution_counts[f"{channel_key}::{resolution}"] += 1
 
         mean_x = max(float(params.get("mean", 0.0)), 0.0)
-        if self.family in {"shifted-negbin", "negbin"}:
+        family = str(channel_model["family"])
+        transform = str(channel_model.get("transform", "none"))
+        shift = int(channel_model.get("shift", 0))
+        if family in {"shifted-negbin", "negbin"}:
             alpha = max(float(params.get("alpha", 0.0)), 0.0)
             sampled = _sample_nb2(self.rng, mean=mean_x, alpha=alpha)
-            return int(max(0, sampled + self.shift))
+            return int(max(0, sampled + shift))
 
-        if self.family == "lognormal":
+        if family == "lognormal":
             variance = max(float(params.get("variance", 1.0)), 1e-9)
             sampled_x = float(self.rng.normal(loc=mean_x, scale=math.sqrt(variance)))
-            if self.transform == "log":
+            if transform == "log":
                 return max(0.0, float(np.exp(sampled_x)))
-            if self.transform == "log1p":
+            if transform == "log1p":
                 return max(0.0, float(np.expm1(sampled_x)))
-            raise ValueError(f"Unsupported parametric transform: {self.transform!r}")
+            raise ValueError(f"Unsupported parametric transform: {transform!r}")
 
-        raise ValueError(f"Unsupported parametric weight family: {self.family!r}")
+        raise ValueError(f"Unsupported parametric weight family: {family!r}")
+
+
+def _stored_weight_reference_blocks(
+    base: Any,
+    blocks: np.ndarray,
+    node_id_prop: Any,
+    weight_generator_model: Optional[dict],
+) -> Optional[np.ndarray]:
+    if not weight_generator_model:
+        return None
+
+    node_blocks = weight_generator_model.get("node_blocks")
+    if not isinstance(node_blocks, dict) or not node_blocks:
+        return None
+
+    reference = np.asarray(blocks, dtype=np.int64).copy()
+    for index in range(int(base.g.num_vertices())):
+        node_id = int(node_id_prop[base.g.vertex(index)])
+        reference[index] = int(node_blocks.get(str(node_id), reference[index]))
+    return reference
 
 
 def _aligned_blocks_for_weight_generation(
@@ -2333,17 +2924,14 @@ def _aligned_blocks_for_weight_generation(
     node_id_prop: Any,
     weight_generator_model: Optional[dict],
 ) -> np.ndarray:
-    if not weight_generator_model:
+    reference = _stored_weight_reference_blocks(
+        base=base,
+        blocks=blocks,
+        node_id_prop=node_id_prop,
+        weight_generator_model=weight_generator_model,
+    )
+    if reference is None:
         return blocks
-
-    node_blocks = weight_generator_model.get("node_blocks")
-    if not isinstance(node_blocks, dict) or not node_blocks:
-        return blocks
-
-    reference = np.asarray(blocks, dtype=np.int64).copy()
-    for index in range(int(base.g.num_vertices())):
-        node_id = int(node_id_prop[base.g.vertex(index)])
-        reference[index] = int(node_blocks.get(str(node_id), reference[index]))
 
     try:
         aligned = np.asarray(gt.align_partition_labels(blocks, reference), dtype=np.int64)
@@ -2674,9 +3262,14 @@ def sample_synthetic_panel(
     gt = _require_graph_tool()
     gt.seed_rng(int(seed))
     weight_partition_policy = str(getattr(args, "weight_parametric_partition_policy", "fixed")).strip().lower()
+    pure_generative_weights = _pure_generative_weight_mode(args)
+    if pure_generative_weights and weight_partition_policy == "refit_on_refresh":
+        raise ValueError(
+            "weight_pure_generative=True is incompatible with weight_parametric_partition_policy='refit_on_refresh'."
+        )
     LOGGER.debug(
         "Sampling synthetic panel | output_dir=%s | directed=%s | seed=%s | layer_count=%s | "
-        "weight_model=%s | weight_generator=%s | weight_partition_policy=%s",
+        "weight_model=%s | weight_generator=%s | weight_partition_policy=%s | weight_pure_generative=%s",
         output_dir,
         directed,
         seed,
@@ -2684,6 +3277,7 @@ def sample_synthetic_panel(
         weight_model,
         None if weight_generator_model is None else weight_generator_model.get("summary"),
         weight_partition_policy,
+        pure_generative_weights,
     )
 
     sampled_state = _posterior_partition_state(nested_state, seed=seed, args=args)
@@ -2695,7 +3289,7 @@ def sample_synthetic_panel(
     if node_id_prop is None:
         raise RuntimeError("Fitted graph is missing the vertex property 'node_id'.")
 
-    blocks = np.asarray(base.get_nonoverlap_blocks().a, dtype=np.int64)
+    blocks = _node_blocks_from_state(sampled_state)
     active_weight_generator = weight_generator_model
     weight_generation_mode = "none"
 
@@ -2706,28 +3300,62 @@ def sample_synthetic_panel(
             weight_model=weight_model,
             directed=directed,
             args=args,
+            blocks=blocks,
         )
         weight_generation_mode = "parametric_refit"
     elif active_weight_generator is not None:
         weight_generation_mode = "parametric_fixed"
 
+    if pure_generative_weights and weight_model is not None and active_weight_generator is None:
+        raise ValueError(
+            "weight_pure_generative=True requires a fitted parametric weight generator. "
+            "Generation cannot proceed with empirical weight backoff."
+        )
+
     weight_blocks = blocks
     if active_weight_generator is not None and weight_partition_policy != "refit_on_refresh":
-        weight_blocks = _aligned_blocks_for_weight_generation(
-            gt=gt,
-            base=base,
-            blocks=blocks,
-            node_id_prop=node_id_prop,
-            weight_generator_model=active_weight_generator,
-        )
+        if pure_generative_weights:
+            stored_weight_blocks = _stored_weight_reference_blocks(
+                base=base,
+                blocks=blocks,
+                node_id_prop=node_id_prop,
+                weight_generator_model=active_weight_generator,
+            )
+            if stored_weight_blocks is None:
+                raise ValueError(
+                    "weight_pure_generative=True requires node_blocks in the saved parametric weight generator."
+                )
+            weight_blocks = stored_weight_blocks
+            LOGGER.debug(
+                "Using stored node blocks from the saved parametric weight generator | unique_blocks=%s",
+                int(np.unique(weight_blocks).size),
+            )
+        else:
+            weight_blocks = _aligned_blocks_for_weight_generation(
+                gt=gt,
+                base=base,
+                blocks=blocks,
+                node_id_prop=node_id_prop,
+                weight_generator_model=active_weight_generator,
+            )
 
     partition_records = []
     include_weight_blocks = active_weight_generator is not None and not np.array_equal(weight_blocks, blocks)
+    active_prop = base.g.vp["active_in_window"] if "active_in_window" in base.g.vp else None
+    metadata_prop = base.g.vp["is_metadata_tag"] if "is_metadata_tag" in base.g.vp else None
     for index in range(int(base.g.num_vertices())):
+        vertex = base.g.vertex(index)
+        if metadata_prop is not None and bool(metadata_prop[vertex]):
+            continue
+        node_id = int(node_id_prop[vertex])
+        if node_id < 0:
+            continue
         record = {
-            "node_id": int(node_id_prop[base.g.vertex(index)]),
+            "node_id": node_id,
             "block_id": int(blocks[index]),
         }
+        if active_prop is not None:
+            record["active_in_window"] = int(active_prop[vertex])
         if include_weight_blocks:
             record["weight_block_id"] = int(weight_blocks[index])
         partition_records.append(record)
@@ -2750,6 +3378,11 @@ def sample_synthetic_panel(
             rng=np.random.default_rng(int(seed)),
         )
     elif weight_model and observed_edges is not None:
+        if pure_generative_weights:
+            raise ValueError(
+                "weight_pure_generative=True forbids empirical weight backoff. "
+                "Fit and load a parametric weight generator instead."
+            )
         weight_col = str(weight_model.get("output_column") or weight_model.get("input_column"))
         node_id_to_base = {
             int(node_id_prop[base.g.vertex(index)]): int(index)
@@ -2902,14 +3535,19 @@ def sample_synthetic_panel(
             "weight_sampler_channel_aware": bool(type_prop is not None and weight_sampler is not None),
             "weight_generation_mode": weight_generation_mode,
             "weight_parametric_partition_policy": weight_partition_policy,
+            "weight_pure_generative": pure_generative_weights,
         },
     }
     if weight_col and weight_col in panel_frame.columns:
         payload["weight_column"] = weight_col
         payload["weight_total"] = float(panel_frame[weight_col].sum()) if len(panel_frame) else 0.0
     if active_weight_generator is not None:
-        payload["weight_generator_family"] = str(active_weight_generator.get("family"))
         payload["weight_generator_summary"] = _json_ready(active_weight_generator.get("summary", {}))
+        if active_weight_generator.get("family") is not None:
+            payload["weight_generator_family"] = str(active_weight_generator.get("family"))
+        families_by_channel = active_weight_generator.get("summary", {}).get("families_by_channel")
+        if isinstance(families_by_channel, dict) and families_by_channel:
+            payload["weight_generator_families_by_channel"] = _json_ready(families_by_channel)
     if rewire_summaries:
         payload["rewire_summaries"] = rewire_summaries
     if weight_sampler is not None and hasattr(weight_sampler, "resolution_counts"):
@@ -3032,9 +3670,14 @@ def write_fit_artifacts(
     input_summary = {
         "edge_count": int(len(prepared.original_edges)),
         "node_count": int(len(prepared.compact_to_original)),
+        "active_node_count": int(prepared.active_compact_mask.sum()),
+        "inactive_node_count": int(len(prepared.compact_to_original) - int(prepared.active_compact_mask.sum())),
         "layer_count": int(len(prepared.layer_map)),
         "duplicate_edge_count": int(prepared.duplicate_edge_count),
         "self_loop_count": int(prepared.self_loop_count),
+        "metadata_link_count": int(prepared.metadata_summary.get("num_links", 0)),
+        "metadata_tag_count": int(prepared.metadata_summary.get("num_tags", 0)),
+        "metadata_fields_used": list(prepared.metadata_summary.get("fields_used", [])),
     }
     if prepared.weight_column:
         input_summary["weight_column"] = prepared.weight_column
@@ -3055,6 +3698,15 @@ def write_fit_artifacts(
         "node_attributes_path": str(node_attributes_path),
         "node_map_csv": str(prepared.input_paths.node_map_csv),
         "directed": bool(args.directed),
+        "no_compact": bool(prepared.no_compact),
+        "node_universe_scope": "full_node_universe" if prepared.no_compact else "active_subgraph",
+        "metadata_model": {
+            "enabled": bool(prepared.metadata_summary.get("enabled")),
+            "implementation": "joint_data_metadata_multilayer",
+            "paper": "Hric-Peixoto-Fortunato-2016",
+            "metadata_layer_name": METADATA_LAYER_NAME,
+            "summary": _json_ready(prepared.metadata_summary),
+        },
         "ts_format": args.ts_format,
         "ts_unit": args.ts_unit,
         "tz": args.tz,
@@ -3077,9 +3729,13 @@ def write_fit_artifacts(
             else ("empirical_backoff" if weight_model is not None else None)
         ),
         "fit_options": {
+            "layered": bool(getattr(args, "layered", True)),
+            "allow_mixed_node_types": bool(getattr(args, "allow_mixed_node_types", False)),
             "deg_corr": not args.no_deg_corr,
             "overlap": bool(args.overlap),
             "exclude_weight_from_fit": bool(getattr(args, "exclude_weight_from_fit", False)),
+            "weight_pure_generative": _pure_generative_weight_mode(args),
+            "weight_parametric_partition_policy": str(getattr(args, "weight_parametric_partition_policy", "fixed")).strip().lower(),
             "refine_multiflip_rounds": int(args.refine_multiflip_rounds),
             "refine_multiflip_niter": int(args.refine_multiflip_niter),
             "anneal_niter": int(args.anneal_niter),
@@ -3128,10 +3784,27 @@ def update_manifest(run_dir: Path, **updates: Any) -> dict:
 def fit_command(args: argparse.Namespace) -> dict:
     LOGGER.debug("Starting fit command | args=%s", vars(args))
     prepared = prepare_data(args)
+    _validate_weight_generation_configuration(args, has_weight_data=bool(prepared.weight_column))
     graph = build_layered_graph(prepared, directed=bool(args.directed))
-    base_covariate_specs = _select_covariate_specs(_available_covariate_specs(graph), getattr(args, "fit_covariates", None))
+    joint_metadata_active = bool(prepared.metadata_summary.get("enabled"))
+    requested_fit_covariates = getattr(args, "fit_covariates", None)
+    if joint_metadata_active and requested_fit_covariates is None:
+        base_covariate_specs = []
+        LOGGER.info(
+            "Joint data-metadata model active: using topology-only fitting by default, matching Hric–Peixoto–Fortunato (2016). "
+            "Set fit_covariates explicitly to add trade-edge covariates on top of the metadata layer."
+        )
+    else:
+        base_covariate_specs = _select_covariate_specs(_available_covariate_specs(graph), requested_fit_covariates)
     weight_generation_mode = _weight_generation_mode_name(args)
-    if _fit_includes_edge_weight_covariate(args):
+    include_weight_in_fit = _fit_includes_edge_weight_covariate(args)
+    if joint_metadata_active and include_weight_in_fit:
+        LOGGER.warning(
+            "Joint data-metadata model active: excluding edge weights from SBM fitting because metadata-layer edges do not carry trade weights. "
+            "Weights will be handled only by the downstream generator."
+        )
+        include_weight_in_fit = False
+    if include_weight_in_fit:
         weight_candidates = _build_weight_candidates(prepared, graph, args)
     else:
         LOGGER.info("Edge weights are excluded from SBM fitting and will be handled by the weight generator.")
@@ -3170,6 +3843,11 @@ def fit_command(args: argparse.Namespace) -> dict:
             "'legacy' to keep the empirical backoff sampler."
         )
 
+    if _pure_generative_weight_mode(args) and prepared.weight_column and weight_generator_model is None:
+        raise ValueError(
+            "weight_pure_generative=True requires fitting and saving a parametric weight generator."
+        )
+
     manifest = write_fit_artifacts(
         prepared,
         graph,
@@ -3181,7 +3859,7 @@ def fit_command(args: argparse.Namespace) -> dict:
         weight_generator_model=weight_generator_model,
     )
     LOGGER.info(
-        "Fitted layered nested SBM in %s | run dir: %s",
+        "Fitted nested SBM in %s | run dir: %s",
         _fmt_duration((pd.Timestamp.utcnow() - t0).total_seconds()),
         manifest["run_dir"],
     )
@@ -3193,6 +3871,7 @@ def fit_command(args: argparse.Namespace) -> dict:
 def generate_command(args: argparse.Namespace) -> list[dict]:
     LOGGER.debug("Starting generate command | args=%s", vars(args))
     manifest = load_manifest(Path(args.run_dir))
+    _validate_weight_generation_configuration(args, has_weight_data=bool(manifest.get("weight_model")))
     gt = _require_graph_tool()
     graph = gt.load_graph(manifest["graph_path"])
     nested_state = load_state(Path(manifest["state_path"]))
@@ -3209,6 +3888,7 @@ def generate_command(args: argparse.Namespace) -> list[dict]:
     weight_generator_model = None
     observed_edges = None
     weight_partition_policy = str(getattr(args, "weight_parametric_partition_policy", "fixed")).strip().lower()
+    pure_generative_weights = _pure_generative_weight_mode(args)
 
     if manifest.get("weight_generator_path"):
         weight_generator_model = load_json(Path(manifest["weight_generator_path"]))
@@ -3218,8 +3898,19 @@ def generate_command(args: argparse.Namespace) -> list[dict]:
             None if weight_generator_model is None else weight_generator_model.get("summary"),
         )
 
-    if weight_model and (weight_generator_model is None or weight_partition_policy == "refit_on_refresh"):
-        observed_edges = pd.read_csv(manifest["filtered_input_edges_path"])
+    if pure_generative_weights and weight_model and weight_generator_model is None:
+        raise ValueError(
+            "weight_pure_generative=True requires a saved parametric weight generator in the fitted run artifacts."
+        )
+
+    if weight_model and not pure_generative_weights and (weight_generator_model is None or weight_partition_policy == "refit_on_refresh"):
+        filtered_input_edges_path = manifest.get("filtered_input_edges_path")
+        if not filtered_input_edges_path:
+            raise ValueError(
+                "Weighted generation requested observed edges for refitting or empirical sampling, but the run manifest "
+                "does not expose filtered_input_edges_path."
+            )
+        observed_edges = pd.read_csv(filtered_input_edges_path)
         _log_edge_frame_debug(
             "Observed edge frame for weighted generation",
             observed_edges,
