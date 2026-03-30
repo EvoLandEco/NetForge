@@ -27,7 +27,12 @@ Common flags:
 - `--date-start` and `--date-end` to select a calendar range
 - `--ts-start` and `--ts-end` to select an ordinal or Unix range
 - `--fit-covariates` to choose built-in edge covariates
+- `--joint-metadata-model` or `--no-joint-metadata-model` to include or skip metadata tag vertices
+- `--metadata-fields` to choose which metadata become tag nodes
+- `--metadata-numeric-bins`, `--metadata-grid-km`, and `--metadata-ft-top-k` to control tag construction
 - `--output-dir` to write the run somewhere other than the default run directory
+
+With the default fit settings, NetForge builds a joint data-metadata multilayer graph. Distinct metadata tokens become tag vertices in a layer named `__metadata__`.
 
 ## `netforge generate`
 

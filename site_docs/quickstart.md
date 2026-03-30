@@ -42,6 +42,13 @@ The example is designed to show three signals clearly:
 - longer routes exchange less weight
 - weekends and Dutch public holidays carry less activity
 
+The same files also feed the metadata layer used by the default fit:
+
+- `corop` becomes a region tag
+- `num_farms` and `total_animals` become quantile-bin tags
+- coordinates become centroid-grid tags
+- `count_ft_*` columns become farm-type token tags
+
 The basemap for geographic plots is stored at `examples/public/nl_corop.geojson`.
 
 ## Step 1: fit the model
@@ -54,9 +61,12 @@ netforge fit \
   --weight-col trade \
   --weight-model discrete-poisson \
   --weight-transform none \
+  --metadata-fields corop num_farms_bin total_animals_bin centroid_grid ft_tokens \
   --date-start 2019-12-16 \
   --date-end 2020-01-12
 ```
+
+This fit keeps the daily trade layers and adds a `__metadata__` layer made of data-to-tag edges. Use `--metadata-fields none` or `--no-joint-metadata-model` if you want a trade-only run.
 
 By default, the run directory is:
 

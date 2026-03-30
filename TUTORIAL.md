@@ -1,6 +1,6 @@
 # NetForge Tutorial
 
-This tutorial walks through the Dutch toy dataset builder and the file structure NetForge expects.
+This tutorial walks through the Dutch toy dataset builder, the metadata inputs it writes, and the file structure NetForge expects.
 
 Before running the pipeline, install `graph-tool` from the official project site: [graph-tool.skewed.de](https://graph-tool.skewed.de/doc). The platform-specific install guide is [graph-tool installation instructions](https://graph-tool.skewed.de/installation.html).
 
@@ -69,6 +69,12 @@ The node matrix must be a two-dimensional numeric array. Row `n` must match `nod
 - Node id `11` is stored in row `11`
 - With 12 nodes, the toy matrix has shape `(12, 8)`
 
+The toy schema also supplies the inputs used by the default metadata layer:
+
+- `num_farms` and `total_animals` for quantile-bin tags
+- `xco` and `yco` for centroid-grid tags
+- `count_ft_*` columns for farm-type token tags
+
 ### Node schema JSON
 
 The schema JSON must list the node feature columns in the exact order used by `node_features.npy`. It also needs either `xco` and `yco` or `centroid_x` and `centroid_y`.
@@ -100,6 +106,8 @@ node_id,node_label,type,ubn,corop,corop_name
 2,CR17_farm_3,Farm,TOYNL0002,CR17,Utrecht
 ```
 
+`type` marks the partition role of each data node. Fields such as `corop` can also be named in `--metadata-fields`. NetForge then creates one metadata tag vertex per token and links the matching data nodes to it in the `__metadata__` layer.
+
 For the NL map view, this repository keeps the basemap at [`examples/public/nl_corop.geojson`](examples/public/nl_corop.geojson). The bundled example looks for the basemap there.
 
 ## 3. See what the toy data encode
@@ -121,11 +129,18 @@ Each daily directed edge weight is drawn from a Poisson mean built from:
 
 `calendar_scale` is lower on weekends and lower again on the Dutch public holidays `2019-12-25`, `2019-12-26`, and `2020-01-01`.
 
-This gives the example three clear signals:
+This gives the example three clear trade signals:
 
 - larger farms exchange more weight
 - longer routes exchange less weight
 - weekends and holidays carry less total activity
+
+The same files also support the metadata layer used by the default fit:
+
+- `corop` becomes a region tag
+- `num_farms` and `total_animals` become quantile-bin tags
+- coordinates become centroid-grid tags
+- `count_ft_*` columns become farm-type token tags
 
 ## 4. Fit the model
 
@@ -139,9 +154,12 @@ netforge fit \
   --weight-col trade \
   --weight-model discrete-poisson \
   --weight-transform none \
+  --metadata-fields corop num_farms_bin total_animals_bin centroid_grid ft_tokens \
   --date-start 2019-12-16 \
   --date-end 2020-01-12
 ```
+
+This run fits the trade panel together with a metadata layer named `__metadata__`. Each distinct metadata token becomes its own tag vertex, and NetForge adds data-to-tag edges in that layer. Use `--metadata-fields none` or `--no-joint-metadata-model` to skip those vertices and fit the trade graph alone.
 
 By default this writes the run to:
 
@@ -185,5 +203,7 @@ To swap in a real dataset, keep the same contract:
 - store the node matrix in `node_features.npy`
 - store the feature order in `node_schema.json`
 - store node metadata in `node_map.csv`
+
+If you plan to use the joint metadata fit, make sure the files also carry the metadata you want to turn into tags.
 
 Start from the toy example and swap pieces one at a time.

@@ -50,6 +50,8 @@ The indexing rule is strict:
 
 If the dataset has `N` nodes, the matrix must have `N` rows. NetForge does not read padded node matrices.
 
+With the default metadata settings, NetForge also reads `num_farms`, `total_animals`, the coordinate pair, and any `count_ft_*` columns from this matrix to build metadata tag nodes.
+
 ## `node_schema.json`
 
 The schema file records the feature order used by `node_features.npy`.
@@ -90,6 +92,29 @@ node_id,node_label,type,ubn,corop,corop_name
 1,CR17_farm_2,Farm,TOYNL0001,CR17,Utrecht
 2,CR17_farm_3,Farm,TOYNL0002,CR17,Utrecht
 ```
+
+The `type` column marks the partition role of each data node. Extra metadata columns can also be named in `--metadata-fields` so NetForge can turn them into metadata tag vertices.
+
+## Metadata tag layer
+
+With the default fit settings, NetForge builds a joint data-metadata multilayer graph. It creates one metadata tag vertex per token and stores the data-to-tag edges in a layer named `__metadata__`.
+
+The default metadata fields are:
+
+- `corop`
+- `num_farms_bin`
+- `total_animals_bin`
+- `centroid_grid`
+- `ft_tokens`
+
+Those tags come from these inputs:
+
+- `corop` reads from `node_map.csv`
+- `num_farms_bin` and `total_animals_bin` read from numeric columns in `node_features.npy`
+- `centroid_grid` reads from `xco` and `yco` or `centroid_x` and `centroid_y`
+- `ft_tokens` reads from positive `count_ft_*` columns in `node_features.npy`
+
+Use `--metadata-fields` to choose a different set of metadata tags, `--metadata-fields none` to skip metadata tags while keeping the flag in the command, or `--no-joint-metadata-model` to fit the trade graph without the metadata layer.
 
 ## Timestamps
 
