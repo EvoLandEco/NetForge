@@ -57,9 +57,19 @@ SCENARIO_RANK_COLUMNS = [
     "farm_attack_rate_wasserstein",
     "farm_peak_prevalence_wasserstein",
     "farm_duration_wasserstein",
+    "region_reservoir_spatial_correlation_mean",
+    "farm_attack_probability_correlation",
 ]
-SCENARIO_RANK_ASCENDING = [False, False, True, True, True]
+SCENARIO_RANK_ASCENDING = [False, False, True, True, True, False, False]
 REGION_DAILY_METRICS = ("reservoir_pressure", "import_pressure", "export_pressure")
+HYBRID_CHANNEL_DAILY_METRICS = ("farm_hazard_ff", "farm_hazard_rf", "region_pressure_fr", "region_pressure_rr")
+TRAJECTORY_DISTANCE_METRICS = (
+    "farm_prevalence",
+    "farm_incidence",
+    "farm_cumulative_incidence",
+    "reservoir_total",
+    "reservoir_max",
+)
 REGION_SPATIAL_SUMMARY_COLUMNS = [
     "region_reservoir_spatial_correlation_mean",
     "region_import_spatial_correlation_mean",
@@ -215,6 +225,164 @@ def _wasserstein_distance_1d(observed: np.ndarray, synthetic: np.ndarray) -> flo
         xq = np.quantile(x, q)
         yq = np.quantile(y, q)
         return float(np.mean(np.abs(xq - yq)))
+
+
+def _energy_distance_1d(observed: np.ndarray, synthetic: np.ndarray) -> float:
+    x = np.asarray(observed, dtype=float)
+    y = np.asarray(synthetic, dtype=float)
+    x = x[np.isfinite(x)]
+    y = y[np.isfinite(y)]
+    if len(x) == 0 and len(y) == 0:
+        return 0.0
+    if len(x) == 0 or len(y) == 0:
+        return np.nan
+    cross = float(np.mean(np.abs(x[:, None] - y[None, :])))
+    within_x = float(np.mean(np.abs(x[:, None] - x[None, :]))) if len(x) > 1 else 0.0
+    within_y = float(np.mean(np.abs(y[:, None] - y[None, :]))) if len(y) > 1 else 0.0
+    return float(max(0.0, 2.0 * cross - within_x - within_y))
+
+
+def _safe_divide(numerator: float, denominator: float) -> float:
+    denom = float(denominator)
+    if not np.isfinite(denom) or abs(denom) <= 1e-12:
+        return np.nan
+    return float(numerator) / denom
+
+
+def _coerce_2d_finite_rows(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    if arr.ndim != 2:
+        arr = np.reshape(arr, (arr.shape[0], int(np.prod(arr.shape[1:]))))
+    finite_rows = np.all(np.isfinite(arr), axis=1)
+    return arr[finite_rows]
+
+
+def _ensemble_energy_distance(observed_samples: np.ndarray, synthetic_samples: np.ndarray) -> float:
+    x = _coerce_2d_finite_rows(np.asarray(observed_samples, dtype=float))
+    y = _coerce_2d_finite_rows(np.asarray(synthetic_samples, dtype=float))
+    if len(x) == 0 and len(y) == 0:
+        return 0.0
+    if len(x) == 0 or len(y) == 0:
+        return np.nan
+    cross = np.linalg.norm(x[:, None, :] - y[None, :, :], axis=2)
+    within_x = np.linalg.norm(x[:, None, :] - x[None, :, :], axis=2) if len(x) > 1 else np.zeros((1, 1), dtype=float)
+    within_y = np.linalg.norm(y[:, None, :] - y[None, :, :], axis=2) if len(y) > 1 else np.zeros((1, 1), dtype=float)
+    score = 2.0 * float(np.mean(cross)) - float(np.mean(within_x)) - float(np.mean(within_y))
+    return float(max(0.0, score))
+
+
+def _ensemble_variogram_distance(observed_samples: np.ndarray, synthetic_samples: np.ndarray, *, p: float = 1.0) -> float:
+    x = _coerce_2d_finite_rows(np.asarray(observed_samples, dtype=float))
+    y = _coerce_2d_finite_rows(np.asarray(synthetic_samples, dtype=float))
+    if len(x) == 0 and len(y) == 0:
+        return 0.0
+    if len(x) == 0 or len(y) == 0 or x.shape[1] != y.shape[1]:
+        return np.nan
+    dimension = int(x.shape[1])
+    if dimension <= 1:
+        return 0.0
+    xv = np.mean(np.abs(x[:, :, None] - x[:, None, :]) ** float(p), axis=0)
+    yv = np.mean(np.abs(y[:, :, None] - y[:, None, :]) ** float(p), axis=0)
+    upper = np.triu_indices(dimension, k=1)
+    diff = xv[upper] - yv[upper]
+    return float(np.sqrt(np.mean(np.square(diff)))) if len(diff) else 0.0
+
+
+def _best_lagged_correlation(
+    original_values: Iterable[float],
+    synthetic_values: Iterable[float],
+    *,
+    max_lag: int = 7,
+) -> dict[str, float]:
+    x = np.asarray(list(original_values), dtype=float)
+    y = np.asarray(list(synthetic_values), dtype=float)
+    if len(x) == 0 or len(y) == 0:
+        return {"best_lag_days": np.nan, "best_lag_correlation": np.nan}
+    best_lag = 0
+    best_corr = -np.inf
+    for lag in range(-int(max_lag), int(max_lag) + 1):
+        if lag < 0:
+            xs = x[-lag:]
+            ys = y[: len(y) + lag]
+        elif lag > 0:
+            xs = x[: len(x) - lag]
+            ys = y[lag:]
+        else:
+            xs = x
+            ys = y
+        if len(xs) < 2 or len(ys) < 2:
+            continue
+        corr = _safe_correlation(xs, ys)
+        if (corr > best_corr + 1e-12) or (abs(corr - best_corr) <= 1e-12 and abs(lag) < abs(best_lag)):
+            best_corr = corr
+            best_lag = lag
+    if not np.isfinite(best_corr):
+        return {"best_lag_days": np.nan, "best_lag_correlation": np.nan}
+    return {"best_lag_days": float(best_lag), "best_lag_correlation": float(best_corr)}
+
+
+def _top_fraction_overlap(
+    original_values: np.ndarray,
+    synthetic_values: np.ndarray,
+    *,
+    fraction: float = 0.10,
+    min_k: int = 10,
+) -> float:
+    original = np.asarray(original_values, dtype=float)
+    synthetic = np.asarray(synthetic_values, dtype=float)
+    if original.size == 0 or synthetic.size == 0 or original.size != synthetic.size:
+        return np.nan
+    size = min(int(original.size), max(int(min_k), int(math.ceil(float(fraction) * int(original.size)))))
+    if size <= 0:
+        return np.nan
+    original_rank = set(np.argsort(-original)[:size].tolist())
+    synthetic_rank = set(np.argsort(-synthetic)[:size].tolist())
+    return float(len(original_rank & synthetic_rank) / size)
+
+
+def _global_moran_i(values: np.ndarray, coords: np.ndarray, *, k: int = 8) -> float:
+    x = np.asarray(values, dtype=float)
+    xy = np.asarray(coords, dtype=float)
+    if xy.ndim != 2 or xy.shape[1] != 2:
+        return np.nan
+    valid = np.isfinite(x) & np.all(np.isfinite(xy), axis=1)
+    x = x[valid]
+    xy = xy[valid]
+    n = int(len(x))
+    if n < 3:
+        return np.nan
+    centered = x - float(np.mean(x))
+    denominator = float(np.sum(centered ** 2))
+    if denominator <= 1e-12:
+        return 0.0
+    neighbour_count = min(max(1, int(k)), n - 1)
+    try:
+        from scipy.spatial import cKDTree
+        tree = cKDTree(xy)
+        _, neighbour_idx = tree.query(xy, k=neighbour_count + 1)
+        neighbour_idx = np.asarray(neighbour_idx, dtype=int)
+        if neighbour_idx.ndim == 1:
+            neighbour_idx = neighbour_idx[:, None]
+        neighbours = neighbour_idx[:, 1:]
+    except Exception:
+        dist = np.sqrt(np.sum((xy[:, None, :] - xy[None, :, :]) ** 2, axis=2))
+        np.fill_diagonal(dist, np.inf)
+        neighbours = np.argsort(dist, axis=1)[:, :neighbour_count]
+    numerator = 0.0
+    total_weight = 0.0
+    for i in range(n):
+        neigh = np.asarray(neighbours[i], dtype=int)
+        neigh = neigh[(neigh >= 0) & (neigh < n) & (neigh != i)]
+        if len(neigh) == 0:
+            continue
+        weight = 1.0 / float(len(neigh))
+        numerator += float(np.sum(weight * centered[i] * centered[neigh]))
+        total_weight += weight * len(neigh)
+    if total_weight <= 0:
+        return np.nan
+    return float((n / total_weight) * (numerator / denominator))
 
 
 def _format_node_type_label(value: object) -> str:
@@ -948,7 +1116,7 @@ def _simulate_single_hybrid_outbreak(
     run_seed: int,
     initial_seed_nodes: np.ndarray,
     config: HybridSimulationConfig,
-) -> tuple[dict[str, float], dict[str, np.ndarray], dict[str, np.ndarray]]:
+) -> tuple[dict[str, float], dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
     rng = np.random.default_rng(int(run_seed))
     node_index = {int(node_id): idx for idx, node_id in enumerate(pack.node_universe)}
     initial_indices = np.asarray([node_index[int(node_id)] for node_id in initial_seed_nodes if int(node_id) in node_index], dtype=np.int64)
@@ -969,6 +1137,7 @@ def _simulate_single_hybrid_outbreak(
     state[initial_indices] = 2
     ever_infected_farm = np.zeros(N, dtype=bool)
     ever_infected_farm[initial_indices] = True
+    farm_first_infection_day = np.full(N, np.nan, dtype=float)
 
     reservoir_pressure = np.zeros(N, dtype=float)
     beta_ff = float(config.beta_ff)
@@ -993,6 +1162,10 @@ def _simulate_single_hybrid_outbreak(
     reservoir_total = np.zeros(T, dtype=float)
     reservoir_max = np.zeros(T, dtype=float)
     reservoir_positive_regions = np.zeros(T, dtype=float)
+    farm_hazard_ff = np.zeros(T, dtype=float)
+    farm_hazard_rf = np.zeros(T, dtype=float)
+    region_pressure_fr = np.zeros(T, dtype=float)
+    region_pressure_rr = np.zeros(T, dtype=float)
     region_reservoir = np.zeros((region_count, T), dtype=float)
     region_import_pressure = np.zeros((region_count, T), dtype=float)
     region_export_pressure = np.zeros((region_count, T), dtype=float)
@@ -1021,12 +1194,17 @@ def _simulate_single_hybrid_outbreak(
         farm_hazards = np.zeros(N, dtype=float)
         import_pressure_day = np.zeros(region_count, dtype=float)
         export_pressure_day = np.zeros(region_count, dtype=float)
+        ff_hazard_total = 0.0
+        rf_hazard_total = 0.0
+        fr_pressure_total = 0.0
+        rr_pressure_total = 0.0
 
         if len(src):
             ff_active = ff_mask & infectious_farms[src] & susceptible_farms[dst]
             if ff_active.any():
                 contrib = beta_ff * weight[ff_active] * farm_inf * farm_susc
                 farm_hazards += np.bincount(dst[ff_active], weights=contrib, minlength=N).astype(float)
+                ff_hazard_total = float(np.sum(contrib))
 
             if rf_mask.any():
                 effective_pressure = np.clip(reservoir_pressure[src[rf_mask]], a_min=0.0, a_max=reservoir_clip)
@@ -1037,6 +1215,7 @@ def _simulate_single_hybrid_outbreak(
                     active_src = src[rf_mask][susceptible_edges]
                     active_contrib = contrib[susceptible_edges]
                     farm_hazards += np.bincount(active_dst, weights=active_contrib, minlength=N).astype(float)
+                    rf_hazard_total = float(np.sum(active_contrib))
                     if region_count:
                         region_ids = region_index_by_node[active_src]
                         valid = region_ids >= 0
@@ -1062,6 +1241,7 @@ def _simulate_single_hybrid_outbreak(
                 contrib = beta_fr * weight[fr_active] * farm_inf
                 active_dst = dst[fr_active]
                 next_reservoir += np.bincount(active_dst, weights=contrib, minlength=N).astype(float)
+                fr_pressure_total = float(np.sum(contrib))
                 if region_count:
                     region_ids = region_index_by_node[active_dst]
                     valid = region_ids >= 0
@@ -1072,6 +1252,7 @@ def _simulate_single_hybrid_outbreak(
                 source_pressure = np.clip(reservoir_pressure[src[rr_mask]], a_min=0.0, a_max=reservoir_clip)
                 contrib = beta_rr * weight[rr_mask] * np.log1p(source_pressure)
                 next_reservoir += np.bincount(dst[rr_mask], weights=contrib, minlength=N).astype(float)
+                rr_pressure_total = float(np.sum(contrib))
 
         next_reservoir[~is_region] = 0.0
         reservoir_pressure = np.clip(next_reservoir, a_min=0.0, a_max=reservoir_clip)
@@ -1099,9 +1280,12 @@ def _simulate_single_hybrid_outbreak(
             raise ValueError(f"Unsupported model: {config.model}")
 
         state = next_state
-        ever_infected_farm |= newly_exposed
+        new_farm_infections = newly_exposed & is_farm
+        ever_infected_farm |= new_farm_infections
+        first_time_farms = new_farm_infections & ~np.isfinite(farm_first_infection_day)
+        farm_first_infection_day[first_time_farms] = float(day_index)
 
-        if first_new_farm_infection_day is None and bool(newly_exposed.any()):
+        if first_new_farm_infection_day is None and bool(new_farm_infections.any()):
             first_new_farm_infection_day = int(day_index)
 
         active_farm_disease = bool(np.any(((state == 1) | (state == 2)) & is_farm))
@@ -1111,12 +1295,16 @@ def _simulate_single_hybrid_outbreak(
                 break
 
         if day_index < T:
-            farm_incidence[day_index] = float(np.sum(newly_exposed & is_farm))
+            farm_incidence[day_index] = float(np.sum(new_farm_infections))
             farm_prevalence[day_index] = float(np.sum((state == 2) & is_farm))
             farm_cumulative_incidence[day_index] = (
                 float(farm_cumulative_incidence[day_index - 1]) + farm_incidence[day_index]
                 if day_index > 0 else farm_incidence[day_index]
             )
+            farm_hazard_ff[day_index] = float(ff_hazard_total)
+            farm_hazard_rf[day_index] = float(rf_hazard_total)
+            region_pressure_fr[day_index] = float(fr_pressure_total)
+            region_pressure_rr[day_index] = float(rr_pressure_total)
             region_pressures = reservoir_pressure[is_region]
             reservoir_total[day_index] = float(np.sum(region_pressures))
             reservoir_max[day_index] = float(np.max(region_pressures)) if len(region_pressures) else 0.0
@@ -1131,6 +1319,8 @@ def _simulate_single_hybrid_outbreak(
 
     peak_idx = int(np.argmax(farm_prevalence)) if len(farm_prevalence) else 0
     farm_count = max(int(np.sum(is_farm)), 1)
+    farm_hazard_total_auc = float(np.sum(farm_hazard_ff) + np.sum(farm_hazard_rf))
+    region_pressure_total_auc = float(np.sum(region_pressure_fr) + np.sum(region_pressure_rr))
     scalar = {
         "seed_count_farm": float(len(initial_indices)),
         "farm_attack_count": float(np.sum(ever_infected_farm & is_farm)),
@@ -1145,6 +1335,14 @@ def _simulate_single_hybrid_outbreak(
         "farm_prevalence_auc": float(np.sum(farm_prevalence)),
         "reservoir_total_auc": float(np.sum(reservoir_total)),
         "reservoir_max_peak": float(np.max(reservoir_max)) if len(reservoir_max) else 0.0,
+        "farm_hazard_ff_auc": float(np.sum(farm_hazard_ff)),
+        "farm_hazard_rf_auc": float(np.sum(farm_hazard_rf)),
+        "farm_hazard_total_auc": farm_hazard_total_auc,
+        "farm_hazard_rf_share": _safe_divide(float(np.sum(farm_hazard_rf)), farm_hazard_total_auc),
+        "region_pressure_fr_auc": float(np.sum(region_pressure_fr)),
+        "region_pressure_rr_auc": float(np.sum(region_pressure_rr)),
+        "region_pressure_total_auc": region_pressure_total_auc,
+        "region_pressure_rr_share": _safe_divide(float(np.sum(region_pressure_rr)), region_pressure_total_auc),
     }
     daily = {
         "farm_incidence": farm_incidence,
@@ -1153,13 +1351,22 @@ def _simulate_single_hybrid_outbreak(
         "reservoir_total": reservoir_total,
         "reservoir_max": reservoir_max,
         "reservoir_positive_regions": reservoir_positive_regions,
+        "farm_hazard_ff": farm_hazard_ff,
+        "farm_hazard_rf": farm_hazard_rf,
+        "region_pressure_fr": region_pressure_fr,
+        "region_pressure_rr": region_pressure_rr,
     }
     region_daily = {
         "reservoir_pressure": region_reservoir,
         "import_pressure": region_import_pressure,
         "export_pressure": region_export_pressure,
     }
-    return scalar, daily, region_daily
+    farm_daily = {
+        "farm_ever_infected": ever_infected_farm.astype(float),
+        "farm_first_infection_day": farm_first_infection_day.astype(float),
+    }
+    return scalar, daily, region_daily, farm_daily
+
 
 
 def _summarise_daily_arrays(
@@ -1242,6 +1449,180 @@ def _summarise_region_daily_arrays(
     return pd.DataFrame(rows)
 
 
+def _summarise_farm_node_arrays(
+    *,
+    pack: HybridPanelPack,
+    node_frame: Optional[pd.DataFrame],
+    ever_infected_matrix: np.ndarray,
+    first_infection_day_matrix: np.ndarray,
+    seed_matrix: np.ndarray,
+) -> pd.DataFrame:
+    farm_positions = np.flatnonzero(np.asarray(pack.is_farm, dtype=bool))
+    if len(farm_positions) == 0:
+        return pd.DataFrame(columns=[
+            "node_id", "ubn", "corop", "x", "y", "display_label",
+            "seed_probability", "ever_infected_probability", "network_generated_attack_probability",
+            "first_infection_day_mean", "first_infection_day_median",
+            "first_infection_day_q05", "first_infection_day_q95",
+        ])
+
+    ever = np.asarray(ever_infected_matrix, dtype=float)
+    first = np.asarray(first_infection_day_matrix, dtype=float)
+    seeds = np.asarray(seed_matrix, dtype=bool)
+    node_ids = np.asarray(pack.node_universe, dtype=np.int64)[farm_positions]
+
+    if node_frame is not None and not node_frame.empty and "node_id" in node_frame.columns:
+        lookup = node_frame.drop_duplicates(subset=["node_id"]).set_index("node_id", drop=False)
+    else:
+        lookup = pd.DataFrame(columns=["node_id", "ubn", "corop", "x", "y"])
+
+    rows: list[dict[str, object]] = []
+    for farm_index, node_id in enumerate(node_ids):
+        ever_values = np.asarray(ever[:, farm_index], dtype=bool)
+        first_values = np.asarray(first[:, farm_index], dtype=float)
+        seed_values = np.asarray(seeds[:, farm_index], dtype=bool)
+        nonseed_values = ~seed_values
+        network_infected = ever_values & nonseed_values
+        finite_first = first_values[np.isfinite(first_values) & network_infected]
+        if int(node_id) in getattr(lookup, 'index', []):
+            source = lookup.loc[int(node_id)]
+            ubn = source.get("ubn") if "ubn" in lookup.columns else np.nan
+            corop = _safe_corop_label(source.get("corop"), f"farm_{int(node_id)}") if "corop" in lookup.columns else f"farm_{int(node_id)}"
+            x_value = pd.to_numeric(pd.Series([source.get("x")]), errors="coerce").iloc[0] if "x" in lookup.columns else np.nan
+            y_value = pd.to_numeric(pd.Series([source.get("y")]), errors="coerce").iloc[0] if "y" in lookup.columns else np.nan
+        else:
+            ubn = np.nan
+            corop = f"farm_{int(node_id)}"
+            x_value = np.nan
+            y_value = np.nan
+        display_label = str(ubn) if not pd.isna(ubn) and str(ubn).strip() else f"farm_{int(node_id)}"
+        row = {
+            "node_id": int(node_id),
+            "ubn": ubn,
+            "corop": str(corop),
+            "x": np.nan if pd.isna(x_value) else float(x_value),
+            "y": np.nan if pd.isna(y_value) else float(y_value),
+            "display_label": display_label,
+            "seed_probability": float(np.mean(seed_values)) if len(seed_values) else np.nan,
+            "ever_infected_probability": float(np.mean(ever_values)) if len(ever_values) else np.nan,
+            "network_generated_attack_probability": float(np.mean(network_infected) / np.mean(nonseed_values)) if np.any(nonseed_values) else np.nan,
+        }
+        if len(finite_first):
+            row["first_infection_day_mean"] = float(np.mean(finite_first))
+            row["first_infection_day_median"] = float(np.median(finite_first))
+            row["first_infection_day_q05"] = float(np.quantile(finite_first, 0.05))
+            row["first_infection_day_q95"] = float(np.quantile(finite_first, 0.95))
+        else:
+            row["first_infection_day_mean"] = np.nan
+            row["first_infection_day_median"] = np.nan
+            row["first_infection_day_q05"] = np.nan
+            row["first_infection_day_q95"] = np.nan
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(["corop", "node_id"]).reset_index(drop=True)
+
+
+def _merge_farm_node_summaries(
+    observed_farm_summary: pd.DataFrame,
+    synthetic_farm_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    if observed_farm_summary.empty and synthetic_farm_summary.empty:
+        return pd.DataFrame(columns=["node_id", "ubn", "corop", "x", "y", "display_label"])
+    observed_prefixed = observed_farm_summary.rename(
+        columns={column: f"original_{column}" for column in observed_farm_summary.columns if column != "node_id"}
+    )
+    synthetic_prefixed = synthetic_farm_summary.rename(
+        columns={column: f"synthetic_{column}" for column in synthetic_farm_summary.columns if column != "node_id"}
+    )
+    merged = observed_prefixed.merge(synthetic_prefixed, on=["node_id"], how="outer").sort_values("node_id").reset_index(drop=True)
+    for meta in ["ubn", "corop", "x", "y", "display_label"]:
+        original_col = f"original_{meta}"
+        synthetic_col = f"synthetic_{meta}"
+        if original_col in merged.columns or synthetic_col in merged.columns:
+            original_series = merged[original_col] if original_col in merged.columns else pd.Series([np.nan] * len(merged), index=merged.index)
+            synthetic_series = merged[synthetic_col] if synthetic_col in merged.columns else pd.Series([np.nan] * len(merged), index=merged.index)
+            merged[meta] = original_series.where(original_series.notna(), synthetic_series)
+    for metric_name in ["network_generated_attack_probability", "ever_infected_probability", "first_infection_day_median", "first_infection_day_mean"]:
+        original_col = f"original_{metric_name}"
+        synthetic_col = f"synthetic_{metric_name}"
+        if original_col in merged.columns and synthetic_col in merged.columns:
+            merged[f"{metric_name}_delta"] = pd.to_numeric(merged[synthetic_col], errors="coerce") - pd.to_numeric(merged[original_col], errors="coerce")
+    return merged
+
+
+def _summarise_farm_corop_fit(farm_merged: pd.DataFrame) -> pd.DataFrame:
+    if farm_merged.empty or "corop" not in farm_merged.columns:
+        return pd.DataFrame(columns=[
+            "corop",
+            "original_network_generated_attack_probability",
+            "synthetic_network_generated_attack_probability",
+            "network_generated_attack_probability_delta",
+            "original_first_infection_day_median",
+            "synthetic_first_infection_day_median",
+            "first_infection_day_median_delta",
+            "farm_count",
+        ])
+    rows: list[dict[str, object]] = []
+    for corop, group in farm_merged.groupby("corop", dropna=False, sort=True):
+        original_attack = pd.to_numeric(group.get("original_network_generated_attack_probability", np.nan), errors="coerce")
+        synthetic_attack = pd.to_numeric(group.get("synthetic_network_generated_attack_probability", np.nan), errors="coerce")
+        original_first = pd.to_numeric(group.get("original_first_infection_day_median", np.nan), errors="coerce")
+        synthetic_first = pd.to_numeric(group.get("synthetic_first_infection_day_median", np.nan), errors="coerce")
+        rows.append({
+            "corop": str(corop),
+            "original_network_generated_attack_probability": float(original_attack.mean()) if original_attack.notna().any() else np.nan,
+            "synthetic_network_generated_attack_probability": float(synthetic_attack.mean()) if synthetic_attack.notna().any() else np.nan,
+            "network_generated_attack_probability_delta": float((synthetic_attack - original_attack).mean()) if original_attack.notna().any() and synthetic_attack.notna().any() else np.nan,
+            "original_first_infection_day_median": float(original_first.mean()) if original_first.notna().any() else np.nan,
+            "synthetic_first_infection_day_median": float(synthetic_first.mean()) if synthetic_first.notna().any() else np.nan,
+            "first_infection_day_median_delta": float((synthetic_first - original_first).mean()) if original_first.notna().any() and synthetic_first.notna().any() else np.nan,
+            "farm_count": int(len(group)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _summarise_trajectory_distribution_distances(
+    observed_daily_arrays: dict[str, np.ndarray],
+    synthetic_daily_arrays: dict[str, np.ndarray],
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for metric_name in TRAJECTORY_DISTANCE_METRICS:
+        observed = observed_daily_arrays.get(metric_name)
+        synthetic = synthetic_daily_arrays.get(metric_name)
+        if observed is None or synthetic is None:
+            continue
+        rows.append({
+            "metric": metric_name,
+            "trajectory_energy_distance": _ensemble_energy_distance(observed, synthetic),
+            "trajectory_variogram_distance": _ensemble_variogram_distance(observed, synthetic),
+            "time_steps": int(np.asarray(observed, dtype=float).shape[1]) if np.asarray(observed, dtype=float).ndim >= 2 else 1,
+        })
+    return pd.DataFrame(rows)
+
+
+def _summarise_region_field_distances(
+    *,
+    ts_values: tuple[int, ...],
+    observed_region_arrays: dict[str, np.ndarray],
+    synthetic_region_arrays: dict[str, np.ndarray],
+) -> pd.DataFrame:
+    if not observed_region_arrays or not synthetic_region_arrays:
+        return pd.DataFrame(columns=["day_index", "ts"])
+    rows: list[dict[str, object]] = []
+    for day_index, ts_value in enumerate(ts_values):
+        row: dict[str, object] = {"day_index": int(day_index), "ts": int(ts_value)}
+        for metric_name in REGION_DAILY_METRICS:
+            observed = observed_region_arrays.get(metric_name)
+            synthetic = synthetic_region_arrays.get(metric_name)
+            if observed is None or synthetic is None:
+                row[f"{metric_name}_energy_distance"] = np.nan
+                row[f"{metric_name}_variogram_distance"] = np.nan
+                continue
+            row[f"{metric_name}_energy_distance"] = _ensemble_energy_distance(observed[:, :, day_index], synthetic[:, :, day_index])
+            row[f"{metric_name}_variogram_distance"] = _ensemble_variogram_distance(observed[:, :, day_index], synthetic[:, :, day_index])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def simulate_panel(
     pack: HybridPanelPack,
     *,
@@ -1249,7 +1630,8 @@ def simulate_panel(
     initial_seed_sets: list[np.ndarray],
     config: HybridSimulationConfig,
     region_frame: Optional[pd.DataFrame] = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    node_frame: Optional[pd.DataFrame] = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
     LOGGER.debug(
         "Simulating panel | label=%s | model=%s | replicates=%s | snapshots=%s",
         pack.label,
@@ -1260,9 +1642,14 @@ def simulate_panel(
     scalar_rows = []
     daily_store: dict[str, list[np.ndarray]] = defaultdict(list)
     region_store: dict[str, list[np.ndarray]] = defaultdict(list)
+    farm_store: dict[str, list[np.ndarray]] = defaultdict(list)
+    farm_positions = np.flatnonzero(np.asarray(pack.is_farm, dtype=bool))
+    node_index = {int(node_id): idx for idx, node_id in enumerate(pack.node_universe)}
+    farm_index = {int(pack.node_universe[position]): idx for idx, position in enumerate(farm_positions)}
+    seed_store: list[np.ndarray] = []
     progress_stride = max(1, len(run_seeds) // 4)
     for replicate_index, (run_seed, seed_nodes) in enumerate(zip(run_seeds, initial_seed_sets)):
-        scalar, daily, region_daily = _simulate_single_hybrid_outbreak(
+        scalar, daily, region_daily, farm_daily = _simulate_single_hybrid_outbreak(
             pack,
             run_seed=int(run_seed),
             initial_seed_nodes=np.asarray(seed_nodes, dtype=np.int64),
@@ -1274,6 +1661,14 @@ def simulate_panel(
             daily_store[metric_name].append(np.asarray(values, dtype=float))
         for metric_name, values in region_daily.items():
             region_store[metric_name].append(np.asarray(values, dtype=float))
+        for metric_name, values in farm_daily.items():
+            farm_store[metric_name].append(np.asarray(values, dtype=float)[farm_positions])
+        seed_indicator = np.zeros(len(farm_positions), dtype=bool)
+        for node_id in np.asarray(seed_nodes, dtype=np.int64):
+            position = farm_index.get(int(node_id))
+            if position is not None:
+                seed_indicator[position] = True
+        seed_store.append(seed_indicator)
         if LOGGER.isEnabledFor(logging.DEBUG) and (
             replicate_index == 0
             or (replicate_index + 1) % progress_stride == 0
@@ -1292,7 +1687,26 @@ def simulate_panel(
         region_arrays = {metric_name: np.stack(value_list, axis=0) for metric_name, value_list in region_store.items()}
         region_daily_summary = _summarise_region_daily_arrays(ts_values=pack.ts_values, region_frame=region_frame, arrays=region_arrays)
     else:
+        region_arrays = {}
         region_daily_summary = pd.DataFrame(columns=["day_index", "ts", "region_order", "region_node_id", "corop", "x", "y", "display_label"])
+    if farm_store:
+        farm_ever = np.vstack(farm_store.get("farm_ever_infected", [])) if farm_store.get("farm_ever_infected") else np.empty((0, len(farm_positions)), dtype=float)
+        farm_first = np.vstack(farm_store.get("farm_first_infection_day", [])) if farm_store.get("farm_first_infection_day") else np.empty((0, len(farm_positions)), dtype=float)
+        seed_matrix = np.vstack(seed_store) if seed_store else np.empty((0, len(farm_positions)), dtype=bool)
+        farm_summary = _summarise_farm_node_arrays(
+            pack=pack,
+            node_frame=node_frame,
+            ever_infected_matrix=farm_ever,
+            first_infection_day_matrix=farm_first,
+            seed_matrix=seed_matrix,
+        )
+    else:
+        farm_summary = pd.DataFrame(columns=["node_id", "ubn", "corop", "x", "y", "display_label"])
+    diagnostics = {
+        "daily_arrays": daily_arrays,
+        "region_arrays": region_arrays,
+        "farm_summary": farm_summary,
+    }
     if LOGGER.isEnabledFor(logging.DEBUG) and not scalar_frame.empty:
         LOGGER.debug(
             "Simulation panel summary | label=%s | attack_rate_mean=%s | peak_prev_mean=%s | duration_mean=%s",
@@ -1301,7 +1715,7 @@ def simulate_panel(
             _metric_text(scalar_frame.get("farm_peak_prevalence", pd.Series(dtype=float)).mean()),
             _metric_text(scalar_frame.get("farm_duration_days", pd.Series(dtype=float)).mean()),
         )
-    return scalar_frame, daily_summary, region_daily_summary
+    return scalar_frame, daily_summary, region_daily_summary, diagnostics
 
 
 # Comparison and summary helpers
@@ -1448,6 +1862,61 @@ def _summarise_daily_interval_calibration(
         "mean_abs_exceedance": float(np.mean(exceedance)),
         "max_abs_exceedance": float(np.max(exceedance)) if len(exceedance) else np.nan,
         "mean_abs_delta_to_synthetic_center": float(np.mean(np.abs(obs - syn))),
+    }
+
+
+def _summarise_daily_mean_comparison(
+    per_snapshot: pd.DataFrame,
+    metric_name: str,
+) -> dict[str, object]:
+    observed_col = f"original_{metric_name}_mean"
+    synthetic_col = f"synthetic_{metric_name}_mean"
+
+    if observed_col not in per_snapshot.columns or synthetic_col not in per_snapshot.columns:
+        return {
+            "metric": metric_name,
+            "metric_type": "daily_mean",
+            "valid_count": 0,
+            "observed_curve_mean": np.nan,
+            "synthetic_curve_mean": np.nan,
+            "curve_correlation": np.nan,
+            "mean_delta": np.nan,
+            "mean_abs_delta": np.nan,
+            "rmse": np.nan,
+            "max_abs_delta": np.nan,
+        }
+
+    observed = pd.to_numeric(per_snapshot[observed_col], errors="coerce")
+    synthetic = pd.to_numeric(per_snapshot[synthetic_col], errors="coerce")
+    valid = observed.notna() & synthetic.notna()
+    if not bool(valid.any()):
+        return {
+            "metric": metric_name,
+            "metric_type": "daily_mean",
+            "valid_count": 0,
+            "observed_curve_mean": np.nan,
+            "synthetic_curve_mean": np.nan,
+            "curve_correlation": np.nan,
+            "mean_delta": np.nan,
+            "mean_abs_delta": np.nan,
+            "rmse": np.nan,
+            "max_abs_delta": np.nan,
+        }
+
+    obs = observed.loc[valid].to_numpy(dtype=float)
+    syn = synthetic.loc[valid].to_numpy(dtype=float)
+    delta = syn - obs
+    return {
+        "metric": metric_name,
+        "metric_type": "daily_mean",
+        "valid_count": int(len(obs)),
+        "observed_curve_mean": float(np.mean(obs)),
+        "synthetic_curve_mean": float(np.mean(syn)),
+        "curve_correlation": _safe_correlation(obs, syn),
+        "mean_delta": float(np.mean(delta)),
+        "mean_abs_delta": float(np.mean(np.abs(delta))),
+        "rmse": float(np.sqrt(np.mean(np.square(delta)))),
+        "max_abs_delta": float(np.max(np.abs(delta))) if len(delta) else np.nan,
     }
 
 
@@ -1974,7 +2443,7 @@ def _write_region_spatial_overview(
     if plt is None:
         return None
     ts_values = pd.to_numeric(region_spatial_per_snapshot["ts"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
+    fig, axes = plt.subplots(3, 2, figsize=(14.6, 12.2), constrained_layout=True)
     _style_figure(fig, axes)
     fig.suptitle(f"Regional spatial fit: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
     metric_specs = [
@@ -1982,53 +2451,32 @@ def _write_region_spatial_overview(
         ("import_pressure", "Import pressure"),
         ("export_pressure", "Export pressure"),
     ]
-    ax = axes[0, 0]
-    for metric_name, label in metric_specs:
-        col = f"{metric_name}_spatial_correlation"
-        if col in region_spatial_per_snapshot.columns:
-            ax.plot(ts_values, pd.to_numeric(region_spatial_per_snapshot[col], errors="coerce"), marker="o", linewidth=2.1, markersize=4.2, label=label)
-    ax.set_title("Daily spatial correlation across COROPs")
-    ax.set_xlabel("Timestamp")
-    ax.set_ylabel("Correlation")
-    ax.set_ylim(-0.05, 1.05)
-    _style_legend(ax.legend())
-
-    ax = axes[0, 1]
-    for metric_name, label in metric_specs:
-        col = f"{metric_name}_mean_abs_delta"
-        if col in region_spatial_per_snapshot.columns:
-            ax.plot(ts_values, pd.to_numeric(region_spatial_per_snapshot[col], errors="coerce"), marker="o", linewidth=2.1, markersize=4.2, label=label)
-    ax.set_title("Daily mean absolute delta across COROPs")
-    ax.set_xlabel("Timestamp")
-    ax.set_ylabel("Mean absolute delta")
-    _style_legend(ax.legend())
-
-    ax = axes[1, 0]
-    for metric_name, label in metric_specs:
-        col = f"{metric_name}_share_mae"
-        if col in region_spatial_per_snapshot.columns:
-            ax.plot(ts_values, pd.to_numeric(region_spatial_per_snapshot[col], errors="coerce"), marker="o", linewidth=2.1, markersize=4.2, label=label)
-    ax.set_title("Daily share-allocation MAE across COROPs")
-    ax.set_xlabel("Timestamp")
-    ax.set_ylabel("MAE on normalized shares")
-    _style_legend(ax.legend())
-
-    ax = axes[1, 1]
-    for metric_name, label in metric_specs:
-        col = f"{metric_name}_hotspot_overlap_top3"
-        if col in region_spatial_per_snapshot.columns:
-            ax.plot(ts_values, pd.to_numeric(region_spatial_per_snapshot[col], errors="coerce"), marker="o", linewidth=2.1, markersize=4.2, label=label)
-    ax.set_title("Daily top-3 hotspot overlap across COROPs")
-    ax.set_xlabel("Timestamp")
-    ax.set_ylabel("Overlap")
-    ax.set_ylim(-0.05, 1.05)
-    _style_legend(ax.legend())
-    for axis in axes.ravel():
+    panel_specs = [
+        ("spatial_correlation", "Daily spatial correlation across COROPs", "Correlation", (-0.05, 1.05)),
+        ("mean_abs_delta", "Daily mean absolute delta across COROPs", "Mean absolute delta", None),
+        ("share_mae", "Daily share-allocation MAE across COROPs", "MAE on normalized shares", None),
+        ("hotspot_overlap_top3", "Daily top-3 hotspot overlap across COROPs", "Overlap", (-0.05, 1.05)),
+        ("energy_distance", "Daily regional-field energy distance", "Energy distance", None),
+        ("variogram_distance", "Daily regional-field variogram distance", "Variogram distance", None),
+    ]
+    for ax, (suffix, title, ylabel, ylim) in zip(np.atleast_1d(axes).ravel(), panel_specs):
+        for metric_name, label in metric_specs:
+            col = f"{metric_name}_{suffix}"
+            if col in region_spatial_per_snapshot.columns:
+                ax.plot(ts_values, pd.to_numeric(region_spatial_per_snapshot[col], errors="coerce"), marker="o", linewidth=2.1, markersize=4.2, label=label)
+        ax.set_title(title)
+        ax.set_xlabel("Timestamp")
+        ax.set_ylabel(ylabel)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        _style_legend(ax.legend())
+    for axis in np.atleast_1d(axes).ravel():
         _set_timestamp_ticks(axis, ts_values, show_calendar_bands=False)
     output_path = Path(output_dir) / f"{sample_label}_region_spatial_overview.png"
     _save_figure(fig, output_path)
     plt.close(fig)
     return output_path
+
 
 
 def _compare_simulation_outputs(
@@ -2039,11 +2487,24 @@ def _compare_simulation_outputs(
     synthetic_daily: pd.DataFrame,
     synthetic_region_daily: pd.DataFrame,
     *,
+    observed_diagnostics: Optional[dict[str, object]] = None,
+    synthetic_diagnostics: Optional[dict[str, object]] = None,
     config: HybridSimulationConfig,
     sample_label: str,
     setting_label: str,
     sample_class: str,
 ) -> tuple[pd.DataFrame, dict[str, object], dict[str, pd.DataFrame]]:
+    observed_diagnostics = observed_diagnostics or {}
+    synthetic_diagnostics = synthetic_diagnostics or {}
+    observed_daily_arrays = dict(observed_diagnostics.get("daily_arrays") or {})
+    synthetic_daily_arrays = dict(synthetic_diagnostics.get("daily_arrays") or {})
+    observed_region_arrays = dict(observed_diagnostics.get("region_arrays") or {})
+    synthetic_region_arrays = dict(synthetic_diagnostics.get("region_arrays") or {})
+    observed_farm_summary_obj = observed_diagnostics.get("farm_summary")
+    synthetic_farm_summary_obj = synthetic_diagnostics.get("farm_summary")
+    observed_farm_summary = observed_farm_summary_obj.copy() if isinstance(observed_farm_summary_obj, pd.DataFrame) else pd.DataFrame()
+    synthetic_farm_summary = synthetic_farm_summary_obj.copy() if isinstance(synthetic_farm_summary_obj, pd.DataFrame) else pd.DataFrame()
+
     per_snapshot = _merge_daily_summaries(observed_daily, synthetic_daily)
     outcome_metrics = [
         "farm_attack_rate",
@@ -2057,6 +2518,12 @@ def _compare_simulation_outputs(
         "farm_prevalence_auc",
         "reservoir_total_auc",
         "reservoir_max_peak",
+        "farm_hazard_ff_auc",
+        "farm_hazard_rf_auc",
+        "farm_hazard_rf_share",
+        "region_pressure_fr_auc",
+        "region_pressure_rr_auc",
+        "region_pressure_rr_share",
     ]
     outcome_summary = _summarise_outcome_distribution_comparison(observed_scalar, synthetic_scalar, outcome_metrics)
 
@@ -2084,9 +2551,42 @@ def _compare_simulation_outputs(
         _frame_numeric_series(per_snapshot, "original_reservoir_positive_regions").fillna(0.0).to_numpy(dtype=float),
         _frame_numeric_series(per_snapshot, "synthetic_reservoir_positive_regions").fillna(0.0).to_numpy(dtype=float),
     ) if len(per_snapshot) else 0.0
+    farm_hazard_ff_corr = _safe_correlation(
+        _frame_numeric_series(per_snapshot, "original_farm_hazard_ff").fillna(0.0).to_numpy(dtype=float),
+        _frame_numeric_series(per_snapshot, "synthetic_farm_hazard_ff").fillna(0.0).to_numpy(dtype=float),
+    ) if len(per_snapshot) and "original_farm_hazard_ff" in per_snapshot.columns and "synthetic_farm_hazard_ff" in per_snapshot.columns else np.nan
+    farm_hazard_rf_corr = _safe_correlation(
+        _frame_numeric_series(per_snapshot, "original_farm_hazard_rf").fillna(0.0).to_numpy(dtype=float),
+        _frame_numeric_series(per_snapshot, "synthetic_farm_hazard_rf").fillna(0.0).to_numpy(dtype=float),
+    ) if len(per_snapshot) and "original_farm_hazard_rf" in per_snapshot.columns and "synthetic_farm_hazard_rf" in per_snapshot.columns else np.nan
+    region_pressure_fr_corr = _safe_correlation(
+        _frame_numeric_series(per_snapshot, "original_region_pressure_fr").fillna(0.0).to_numpy(dtype=float),
+        _frame_numeric_series(per_snapshot, "synthetic_region_pressure_fr").fillna(0.0).to_numpy(dtype=float),
+    ) if len(per_snapshot) and "original_region_pressure_fr" in per_snapshot.columns and "synthetic_region_pressure_fr" in per_snapshot.columns else np.nan
+    region_pressure_rr_corr = _safe_correlation(
+        _frame_numeric_series(per_snapshot, "original_region_pressure_rr").fillna(0.0).to_numpy(dtype=float),
+        _frame_numeric_series(per_snapshot, "synthetic_region_pressure_rr").fillna(0.0).to_numpy(dtype=float),
+    ) if len(per_snapshot) and "original_region_pressure_rr" in per_snapshot.columns and "synthetic_region_pressure_rr" in per_snapshot.columns else np.nan
+
+    lag_diagnostics = pd.DataFrame([
+        {"metric": "farm_prevalence", **_best_lagged_correlation(_frame_numeric_series(per_snapshot, "original_farm_prevalence").fillna(0.0), _frame_numeric_series(per_snapshot, "synthetic_farm_prevalence").fillna(0.0))},
+        {"metric": "farm_incidence", **_best_lagged_correlation(_frame_numeric_series(per_snapshot, "original_farm_incidence").fillna(0.0), _frame_numeric_series(per_snapshot, "synthetic_farm_incidence").fillna(0.0))},
+        {"metric": "reservoir_total", **_best_lagged_correlation(_frame_numeric_series(per_snapshot, "original_reservoir_total").fillna(0.0), _frame_numeric_series(per_snapshot, "synthetic_reservoir_total").fillna(0.0))},
+    ]) if len(per_snapshot) else pd.DataFrame(columns=["metric", "best_lag_days", "best_lag_correlation"])
 
     daily_calibration = pd.DataFrame([
         _summarise_daily_interval_calibration(per_snapshot, metric_name)
+        for metric_name in [
+            "farm_prevalence",
+            "farm_incidence",
+            "farm_cumulative_incidence",
+            "reservoir_total",
+            "reservoir_max",
+            "reservoir_positive_regions",
+        ]
+    ])
+    daily_mean_comparison = pd.DataFrame([
+        _summarise_daily_mean_comparison(per_snapshot, metric_name)
         for metric_name in [
             "farm_prevalence",
             "farm_incidence",
@@ -2110,11 +2610,72 @@ def _compare_simulation_outputs(
             "farm_prevalence_auc",
             "reservoir_total_auc",
             "reservoir_max_peak",
+            "farm_hazard_rf_share",
+            "region_pressure_rr_share",
         ]
     ])
 
+    trajectory_distribution_summary = _summarise_trajectory_distribution_distances(observed_daily_arrays, synthetic_daily_arrays)
+
     region_merged = _merge_region_daily_summaries(observed_region_daily, synthetic_region_daily)
     region_spatial_per_snapshot, region_temporal_summary = _summarise_region_spatial_fit(region_merged)
+    region_field_scores = _summarise_region_field_distances(
+        ts_values=tuple(per_snapshot["ts"].tolist()) if "ts" in per_snapshot.columns else tuple(),
+        observed_region_arrays=observed_region_arrays,
+        synthetic_region_arrays=synthetic_region_arrays,
+    )
+    if not region_field_scores.empty:
+        if region_spatial_per_snapshot.empty:
+            region_spatial_per_snapshot = region_field_scores.copy()
+        else:
+            region_spatial_per_snapshot = region_spatial_per_snapshot.merge(region_field_scores, on=["day_index", "ts"], how="outer")
+
+    farm_spatial_summary = _merge_farm_node_summaries(observed_farm_summary, synthetic_farm_summary)
+    farm_corop_summary = _summarise_farm_corop_fit(farm_spatial_summary)
+
+    farm_attack_probability_correlation = np.nan
+    farm_attack_probability_mae = np.nan
+    farm_attack_probability_wasserstein = np.nan
+    farm_attack_probability_top10_overlap = np.nan
+    farm_attack_probability_moran_original = np.nan
+    farm_attack_probability_moran_synthetic = np.nan
+    farm_attack_probability_moran_abs_delta = np.nan
+    farm_first_infection_day_correlation = np.nan
+    farm_first_infection_day_mae = np.nan
+    farm_corop_attack_probability_correlation = np.nan
+    farm_corop_attack_probability_mae = np.nan
+
+    if not farm_spatial_summary.empty:
+        original_attack = pd.to_numeric(farm_spatial_summary.get("original_network_generated_attack_probability", np.nan), errors="coerce")
+        synthetic_attack = pd.to_numeric(farm_spatial_summary.get("synthetic_network_generated_attack_probability", np.nan), errors="coerce")
+        valid_attack = original_attack.notna() & synthetic_attack.notna()
+        if bool(valid_attack.any()):
+            obs_attack = original_attack.loc[valid_attack].to_numpy(dtype=float)
+            syn_attack = synthetic_attack.loc[valid_attack].to_numpy(dtype=float)
+            farm_attack_probability_correlation = _safe_correlation(obs_attack, syn_attack)
+            farm_attack_probability_mae = float(np.mean(np.abs(syn_attack - obs_attack)))
+            farm_attack_probability_wasserstein = _wasserstein_distance_1d(obs_attack, syn_attack)
+            farm_attack_probability_top10_overlap = _top_fraction_overlap(obs_attack, syn_attack, fraction=0.10, min_k=10)
+            coords = farm_spatial_summary.loc[valid_attack, ["x", "y"]].to_numpy(dtype=float) if {"x", "y"}.issubset(farm_spatial_summary.columns) else np.empty((0, 2), dtype=float)
+            farm_attack_probability_moran_original = _global_moran_i(obs_attack, coords)
+            farm_attack_probability_moran_synthetic = _global_moran_i(syn_attack, coords)
+            if np.isfinite(farm_attack_probability_moran_original) and np.isfinite(farm_attack_probability_moran_synthetic):
+                farm_attack_probability_moran_abs_delta = float(abs(farm_attack_probability_moran_synthetic - farm_attack_probability_moran_original))
+        original_first = pd.to_numeric(farm_spatial_summary.get("original_first_infection_day_median", np.nan), errors="coerce")
+        synthetic_first = pd.to_numeric(farm_spatial_summary.get("synthetic_first_infection_day_median", np.nan), errors="coerce")
+        valid_first = original_first.notna() & synthetic_first.notna()
+        if bool(valid_first.any()):
+            obs_first = original_first.loc[valid_first].to_numpy(dtype=float)
+            syn_first = synthetic_first.loc[valid_first].to_numpy(dtype=float)
+            farm_first_infection_day_correlation = _safe_correlation(obs_first, syn_first)
+            farm_first_infection_day_mae = float(np.mean(np.abs(syn_first - obs_first)))
+    if not farm_corop_summary.empty:
+        original_corop_attack = pd.to_numeric(farm_corop_summary.get("original_network_generated_attack_probability", np.nan), errors="coerce")
+        synthetic_corop_attack = pd.to_numeric(farm_corop_summary.get("synthetic_network_generated_attack_probability", np.nan), errors="coerce")
+        valid_corop_attack = original_corop_attack.notna() & synthetic_corop_attack.notna()
+        if bool(valid_corop_attack.any()):
+            farm_corop_attack_probability_correlation = _safe_correlation(original_corop_attack.loc[valid_corop_attack], synthetic_corop_attack.loc[valid_corop_attack])
+            farm_corop_attack_probability_mae = float(np.mean(np.abs(synthetic_corop_attack.loc[valid_corop_attack] - original_corop_attack.loc[valid_corop_attack])))
 
     summary: dict[str, object] = {
         "sample_label": sample_label,
@@ -2131,11 +2692,19 @@ def _compare_simulation_outputs(
         "reservoir_total_curve_correlation": float(reservoir_total_corr),
         "reservoir_max_curve_correlation": float(reservoir_max_corr),
         "reservoir_positive_regions_curve_correlation": float(reservoir_positive_regions_corr),
+        "farm_hazard_ff_curve_correlation": float(farm_hazard_ff_corr) if pd.notna(farm_hazard_ff_corr) else np.nan,
+        "farm_hazard_rf_curve_correlation": float(farm_hazard_rf_corr) if pd.notna(farm_hazard_rf_corr) else np.nan,
+        "region_pressure_fr_curve_correlation": float(region_pressure_fr_corr) if pd.notna(region_pressure_fr_corr) else np.nan,
+        "region_pressure_rr_curve_correlation": float(region_pressure_rr_corr) if pd.notna(region_pressure_rr_corr) else np.nan,
         "mean_abs_farm_prevalence_delta": float(pd.to_numeric(per_snapshot.get("farm_prevalence_delta", np.nan), errors="coerce").abs().mean()) if "farm_prevalence_delta" in per_snapshot.columns else np.nan,
         "mean_abs_farm_incidence_delta": float(pd.to_numeric(per_snapshot.get("farm_incidence_delta", np.nan), errors="coerce").abs().mean()) if "farm_incidence_delta" in per_snapshot.columns else np.nan,
         "mean_abs_farm_cumulative_incidence_delta": float(pd.to_numeric(per_snapshot.get("farm_cumulative_incidence_delta", np.nan), errors="coerce").abs().mean()) if "farm_cumulative_incidence_delta" in per_snapshot.columns else np.nan,
         "mean_abs_reservoir_total_delta": float(pd.to_numeric(per_snapshot.get("reservoir_total_delta", np.nan), errors="coerce").abs().mean()) if "reservoir_total_delta" in per_snapshot.columns else np.nan,
         "mean_abs_reservoir_max_delta": float(pd.to_numeric(per_snapshot.get("reservoir_max_delta", np.nan), errors="coerce").abs().mean()) if "reservoir_max_delta" in per_snapshot.columns else np.nan,
+        "mean_abs_farm_hazard_ff_delta": float(pd.to_numeric(per_snapshot.get("farm_hazard_ff_delta", np.nan), errors="coerce").abs().mean()) if "farm_hazard_ff_delta" in per_snapshot.columns else np.nan,
+        "mean_abs_farm_hazard_rf_delta": float(pd.to_numeric(per_snapshot.get("farm_hazard_rf_delta", np.nan), errors="coerce").abs().mean()) if "farm_hazard_rf_delta" in per_snapshot.columns else np.nan,
+        "mean_abs_region_pressure_fr_delta": float(pd.to_numeric(per_snapshot.get("region_pressure_fr_delta", np.nan), errors="coerce").abs().mean()) if "region_pressure_fr_delta" in per_snapshot.columns else np.nan,
+        "mean_abs_region_pressure_rr_delta": float(pd.to_numeric(per_snapshot.get("region_pressure_rr_delta", np.nan), errors="coerce").abs().mean()) if "region_pressure_rr_delta" in per_snapshot.columns else np.nan,
         "farm_attack_rate_wasserstein": _metric_lookup(outcome_summary, "farm_attack_rate", "wasserstein_distance"),
         "farm_cumulative_incidence_wasserstein": _metric_lookup(outcome_summary, "farm_cumulative_incidence", "wasserstein_distance"),
         "farm_peak_prevalence_wasserstein": _metric_lookup(outcome_summary, "farm_peak_prevalence", "wasserstein_distance"),
@@ -2145,6 +2714,8 @@ def _compare_simulation_outputs(
         "farm_prevalence_auc_wasserstein": _metric_lookup(outcome_summary, "farm_prevalence_auc", "wasserstein_distance"),
         "reservoir_total_auc_wasserstein": _metric_lookup(outcome_summary, "reservoir_total_auc", "wasserstein_distance"),
         "reservoir_max_peak_wasserstein": _metric_lookup(outcome_summary, "reservoir_max_peak", "wasserstein_distance"),
+        "farm_hazard_rf_share_wasserstein": _metric_lookup(outcome_summary, "farm_hazard_rf_share", "wasserstein_distance"),
+        "region_pressure_rr_share_wasserstein": _metric_lookup(outcome_summary, "region_pressure_rr_share", "wasserstein_distance"),
         "observed_farm_attack_rate_mean": _metric_lookup(outcome_summary, "farm_attack_rate", "original_mean"),
         "synthetic_farm_attack_rate_mean": _metric_lookup(outcome_summary, "farm_attack_rate", "synthetic_mean"),
         "observed_farm_peak_prevalence_mean": _metric_lookup(outcome_summary, "farm_peak_prevalence", "original_mean"),
@@ -2155,6 +2726,18 @@ def _compare_simulation_outputs(
         "reservoir_total_interval_coverage": _calibration_lookup(daily_calibration, "reservoir_total", "interval_coverage"),
         "farm_prevalence_interval_width_mean": _calibration_lookup(daily_calibration, "farm_prevalence", "mean_interval_width"),
         "farm_incidence_interval_width_mean": _calibration_lookup(daily_calibration, "farm_incidence", "mean_interval_width"),
+        "farm_prevalence_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "farm_prevalence", "curve_correlation"),
+        "farm_incidence_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "farm_incidence", "curve_correlation"),
+        "farm_cumulative_incidence_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "farm_cumulative_incidence", "curve_correlation"),
+        "reservoir_total_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "reservoir_total", "curve_correlation"),
+        "reservoir_max_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "reservoir_max", "curve_correlation"),
+        "reservoir_positive_regions_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "reservoir_positive_regions", "curve_correlation"),
+        "farm_prevalence_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "farm_prevalence", "mean_abs_delta"),
+        "farm_incidence_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "farm_incidence", "mean_abs_delta"),
+        "farm_cumulative_incidence_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "farm_cumulative_incidence", "mean_abs_delta"),
+        "reservoir_total_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "reservoir_total", "mean_abs_delta"),
+        "reservoir_max_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "reservoir_max", "mean_abs_delta"),
+        "reservoir_positive_regions_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "reservoir_positive_regions", "mean_abs_delta"),
         "farm_attack_rate_observed_median_in_synthetic_90pct": _calibration_lookup(scalar_calibration, "farm_attack_rate", "observed_median_in_synthetic_90pct"),
         "farm_attack_rate_observed_median_tail_area": _calibration_lookup(scalar_calibration, "farm_attack_rate", "observed_median_tail_area"),
         "farm_attack_rate_synthetic_interval_width": _calibration_lookup(scalar_calibration, "farm_attack_rate", "synthetic_interval_width"),
@@ -2162,6 +2745,28 @@ def _compare_simulation_outputs(
         "farm_peak_prevalence_observed_median_tail_area": _calibration_lookup(scalar_calibration, "farm_peak_prevalence", "observed_median_tail_area"),
         "farm_duration_observed_median_in_synthetic_90pct": _calibration_lookup(scalar_calibration, "farm_duration_days", "observed_median_in_synthetic_90pct"),
         "farm_duration_observed_median_tail_area": _calibration_lookup(scalar_calibration, "farm_duration_days", "observed_median_tail_area"),
+        "farm_prevalence_best_lag_correlation": _calibration_lookup(lag_diagnostics, "farm_prevalence", "best_lag_correlation"),
+        "farm_prevalence_best_lag_days": _calibration_lookup(lag_diagnostics, "farm_prevalence", "best_lag_days"),
+        "farm_incidence_best_lag_correlation": _calibration_lookup(lag_diagnostics, "farm_incidence", "best_lag_correlation"),
+        "farm_incidence_best_lag_days": _calibration_lookup(lag_diagnostics, "farm_incidence", "best_lag_days"),
+        "reservoir_total_best_lag_correlation": _calibration_lookup(lag_diagnostics, "reservoir_total", "best_lag_correlation"),
+        "reservoir_total_best_lag_days": _calibration_lookup(lag_diagnostics, "reservoir_total", "best_lag_days"),
+        "farm_prevalence_trajectory_energy_distance": _metric_lookup(trajectory_distribution_summary, "farm_prevalence", "trajectory_energy_distance"),
+        "farm_incidence_trajectory_energy_distance": _metric_lookup(trajectory_distribution_summary, "farm_incidence", "trajectory_energy_distance"),
+        "farm_cumulative_incidence_trajectory_energy_distance": _metric_lookup(trajectory_distribution_summary, "farm_cumulative_incidence", "trajectory_energy_distance"),
+        "reservoir_total_trajectory_energy_distance": _metric_lookup(trajectory_distribution_summary, "reservoir_total", "trajectory_energy_distance"),
+        "reservoir_max_trajectory_energy_distance": _metric_lookup(trajectory_distribution_summary, "reservoir_max", "trajectory_energy_distance"),
+        "farm_attack_probability_correlation": farm_attack_probability_correlation,
+        "farm_attack_probability_mae": farm_attack_probability_mae,
+        "farm_attack_probability_wasserstein": farm_attack_probability_wasserstein,
+        "farm_attack_probability_top10_overlap": farm_attack_probability_top10_overlap,
+        "farm_attack_probability_moran_i_original": farm_attack_probability_moran_original,
+        "farm_attack_probability_moran_i_synthetic": farm_attack_probability_moran_synthetic,
+        "farm_attack_probability_moran_i_abs_delta": farm_attack_probability_moran_abs_delta,
+        "farm_first_infection_day_correlation": farm_first_infection_day_correlation,
+        "farm_first_infection_day_mae": farm_first_infection_day_mae,
+        "farm_corop_attack_probability_correlation": farm_corop_attack_probability_correlation,
+        "farm_corop_attack_probability_mae": farm_corop_attack_probability_mae,
     }
 
     if not region_spatial_per_snapshot.empty:
@@ -2172,6 +2777,12 @@ def _compare_simulation_outputs(
         summary["region_import_hotspot_overlap_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("import_pressure_hotspot_overlap_top3", np.nan), errors="coerce").dropna().mean())
         summary["region_export_hotspot_overlap_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("export_pressure_hotspot_overlap_top3", np.nan), errors="coerce").dropna().mean())
         summary["region_reservoir_share_mae_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("reservoir_pressure_share_mae", np.nan), errors="coerce").dropna().mean())
+        summary["region_reservoir_field_energy_distance_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("reservoir_pressure_energy_distance", np.nan), errors="coerce").dropna().mean()) if "reservoir_pressure_energy_distance" in region_spatial_per_snapshot.columns else np.nan
+        summary["region_import_field_energy_distance_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("import_pressure_energy_distance", np.nan), errors="coerce").dropna().mean()) if "import_pressure_energy_distance" in region_spatial_per_snapshot.columns else np.nan
+        summary["region_export_field_energy_distance_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("export_pressure_energy_distance", np.nan), errors="coerce").dropna().mean()) if "export_pressure_energy_distance" in region_spatial_per_snapshot.columns else np.nan
+        summary["region_reservoir_field_variogram_distance_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("reservoir_pressure_variogram_distance", np.nan), errors="coerce").dropna().mean()) if "reservoir_pressure_variogram_distance" in region_spatial_per_snapshot.columns else np.nan
+        summary["region_import_field_variogram_distance_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("import_pressure_variogram_distance", np.nan), errors="coerce").dropna().mean()) if "import_pressure_variogram_distance" in region_spatial_per_snapshot.columns else np.nan
+        summary["region_export_field_variogram_distance_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("export_pressure_variogram_distance", np.nan), errors="coerce").dropna().mean()) if "export_pressure_variogram_distance" in region_spatial_per_snapshot.columns else np.nan
     if not region_temporal_summary.empty:
         summary["region_reservoir_temporal_correlation_mean"] = float(pd.to_numeric(region_temporal_summary.get("reservoir_pressure_temporal_correlation", np.nan), errors="coerce").dropna().mean())
         summary["region_import_temporal_correlation_mean"] = float(pd.to_numeric(region_temporal_summary.get("import_pressure_temporal_correlation", np.nan), errors="coerce").dropna().mean())
@@ -2185,20 +2796,29 @@ def _compare_simulation_outputs(
         "synthetic_daily": synthetic_daily,
         "outcome_distribution_summary": outcome_summary,
         "daily_calibration": daily_calibration,
+        "daily_mean_comparison": daily_mean_comparison,
         "scalar_calibration": scalar_calibration,
+        "trajectory_distribution_summary": trajectory_distribution_summary,
+        "lag_diagnostics": lag_diagnostics,
         "observed_region_daily": observed_region_daily,
         "synthetic_region_daily": synthetic_region_daily,
         "region_spatial_per_snapshot": region_spatial_per_snapshot,
         "region_temporal_summary": region_temporal_summary,
+        "region_field_scores": region_field_scores,
+        "observed_farm_summary": observed_farm_summary,
+        "synthetic_farm_summary": synthetic_farm_summary,
+        "farm_spatial_summary": farm_spatial_summary,
+        "farm_corop_summary": farm_corop_summary,
     }
     LOGGER.info(
-        "Simulation comparison summary | sample=%s | prev_corr=%s | inc_corr=%s | attack_w1=%s | peak_w1=%s | duration_w1=%s | region_res_corr=%s",
+        "Simulation comparison summary | sample=%s | prev_corr=%s | inc_corr=%s | attack_w1=%s | peak_w1=%s | duration_w1=%s | farm_space_corr=%s | region_res_corr=%s",
         sample_label,
         _metric_text(summary.get("farm_prevalence_curve_correlation")),
         _metric_text(summary.get("farm_incidence_curve_correlation")),
         _metric_text(summary.get("farm_attack_rate_wasserstein")),
         _metric_text(summary.get("farm_peak_prevalence_wasserstein")),
         _metric_text(summary.get("farm_duration_wasserstein")),
+        _metric_text(summary.get("farm_attack_probability_correlation")),
         _metric_text(summary.get("region_reservoir_spatial_correlation_mean")),
     )
     return per_snapshot, summary, detailed
@@ -2212,11 +2832,19 @@ DETAIL_GROUP_KEYS: dict[str, list[str]] = {
     "observed_daily": ["day_index", "ts"],
     "synthetic_daily": ["day_index", "ts"],
     "daily_calibration": ["metric"],
+    "daily_mean_comparison": ["metric"],
     "scalar_calibration": ["metric"],
+    "trajectory_distribution_summary": ["metric"],
+    "lag_diagnostics": ["metric"],
     "observed_region_daily": ["day_index", "ts", "region_order", "region_node_id", "corop", "display_label"],
     "synthetic_region_daily": ["day_index", "ts", "region_order", "region_node_id", "corop", "display_label"],
     "region_spatial_per_snapshot": ["day_index", "ts"],
     "region_temporal_summary": ["region_node_id", "corop", "display_label"],
+    "region_field_scores": ["day_index", "ts"],
+    "observed_farm_summary": ["node_id"],
+    "synthetic_farm_summary": ["node_id"],
+    "farm_spatial_summary": ["node_id"],
+    "farm_corop_summary": ["corop"],
     "uncertainty_decomposition": ["metric"],
 }
 
@@ -2640,7 +3268,7 @@ def _write_curve_delta_plot(
     fig, axes = plt.subplots(2, 2, figsize=(13.2, 9.2), constrained_layout=True)
     axes_array = np.atleast_1d(axes).ravel()
     _style_figure(fig, axes_array)
-    fig.suptitle(f"Observed vs synthetic trajectory deltas: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
+    fig.suptitle(f"Observed vs synthetic median trajectory deltas: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
     x_values = per_snapshot["day_index"].to_numpy(dtype=float)
     for ax, (column, title) in zip(axes_array, metric_specs):
         values = _frame_numeric_series(per_snapshot, column).fillna(0.0).to_numpy(dtype=float)
@@ -2654,6 +3282,187 @@ def _write_curve_delta_plot(
         ax.set_xlabel("Day index")
         ax.set_ylabel("Synthetic - observed")
     output_path = output_dir / f"{sample_label}_delta.png"
+    _save_figure(fig, output_path)
+    plt.close(fig)
+    return output_path
+
+
+def _write_daily_mean_comparison_plot(
+    per_snapshot: pd.DataFrame,
+    summary: dict,
+    output_dir: Path,
+    sample_label: str,
+) -> Optional[Path]:
+    if per_snapshot.empty:
+        return None
+    metric_specs = [
+        ("farm_prevalence_mean", "Farm prevalence mean", "Infectious farms", "farm_prevalence_mean_curve_correlation"),
+        ("farm_incidence_mean", "Farm incidence mean", "Newly infected farms", "farm_incidence_mean_curve_correlation"),
+        ("farm_cumulative_incidence_mean", "Farm cumulative-incidence mean", "Cumulative infected farms", "farm_cumulative_incidence_mean_curve_correlation"),
+        ("reservoir_total_mean", "Reservoir total mean", "Reservoir pressure total", "reservoir_total_mean_curve_correlation"),
+        ("reservoir_max_mean", "Reservoir max mean", "Largest regional pressure", "reservoir_max_mean_curve_correlation"),
+        ("reservoir_positive_regions_mean", "Positive reservoir regions mean", "Regions above zero pressure", "reservoir_positive_regions_mean_curve_correlation"),
+    ]
+    available_specs = [
+        spec
+        for spec in metric_specs
+        if f"original_{spec[0]}" in per_snapshot.columns and f"synthetic_{spec[0]}" in per_snapshot.columns
+    ]
+    if not available_specs:
+        return None
+    plt = _load_matplotlib()
+    if plt is None:
+        return None
+    ncols = 2
+    nrows = int(math.ceil(len(available_specs) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14.6, max(5.2, 4.5 * nrows)), constrained_layout=True)
+    axes_array = np.atleast_1d(axes).ravel()
+    _style_figure(fig, axes_array)
+    fig.suptitle(f"Observed vs synthetic daily mean trajectories: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
+    for ax, (value_column, title, y_label, summary_key) in zip(axes_array, available_specs):
+        base_name = value_column[: -len("_mean")]
+        _plot_metric_panel(
+            ax,
+            per_snapshot=per_snapshot,
+            value_column=value_column,
+            title=title,
+            y_label=y_label,
+            summary_value=summary.get(summary_key),
+            lower_column=f"{base_name}_q05",
+            upper_column=f"{base_name}_q95",
+            observed_label="Observed mean",
+            synthetic_label="Synthetic mean",
+        )
+    for ax in axes_array[len(available_specs):]:
+        ax.axis("off")
+
+    output_path = output_dir / f"{sample_label}_daily_mean_compare.png"
+    _save_figure(fig, output_path)
+    plt.close(fig)
+    return output_path
+
+
+def _write_channel_diagnostics_plot(
+    per_snapshot: pd.DataFrame,
+    summary: dict,
+    output_dir: Path,
+    sample_label: str,
+) -> Optional[Path]:
+    if per_snapshot.empty:
+        return None
+    plt = _load_matplotlib()
+    if plt is None:
+        return None
+    fig, axes = plt.subplots(2, 2, figsize=(14.0, 9.4), constrained_layout=True)
+    _style_figure(fig, axes)
+    fig.suptitle(f"Hybrid-channel diagnostics: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
+    panel_specs = [
+        ("farm_hazard_ff", "Farm→Farm hazard", "Hazard mass", summary.get("farm_hazard_ff_curve_correlation")),
+        ("farm_hazard_rf", "Region→Farm hazard", "Hazard mass", summary.get("farm_hazard_rf_curve_correlation")),
+        ("region_pressure_fr", "Farm→Region seeding", "Pressure mass", summary.get("region_pressure_fr_curve_correlation")),
+        ("region_pressure_rr", "Region→Region diffusion", "Pressure mass", summary.get("region_pressure_rr_curve_correlation")),
+    ]
+    for ax, (value_column, title, ylabel, score) in zip(np.atleast_1d(axes).ravel(), panel_specs):
+        _plot_metric_panel(
+            ax,
+            per_snapshot=per_snapshot,
+            value_column=value_column,
+            title=title,
+            y_label=ylabel,
+            summary_value=score,
+            lower_column=f"{value_column}_q05",
+            upper_column=f"{value_column}_q95",
+        )
+    output_path = output_dir / f"{sample_label}_channel_diagnostics.png"
+    _save_figure(fig, output_path)
+    plt.close(fig)
+    return output_path
+
+
+def _write_farm_spatial_overview(
+    farm_spatial_summary: pd.DataFrame,
+    summary: dict,
+    output_dir: Path,
+    sample_label: str,
+) -> Optional[Path]:
+    if farm_spatial_summary.empty:
+        return None
+    plt = _load_matplotlib()
+    if plt is None:
+        return None
+    x = pd.to_numeric(farm_spatial_summary.get("x", np.nan), errors="coerce")
+    y = pd.to_numeric(farm_spatial_summary.get("y", np.nan), errors="coerce")
+    original = pd.to_numeric(farm_spatial_summary.get("original_network_generated_attack_probability", np.nan), errors="coerce")
+    synthetic = pd.to_numeric(farm_spatial_summary.get("synthetic_network_generated_attack_probability", np.nan), errors="coerce")
+    delta = pd.to_numeric(farm_spatial_summary.get("network_generated_attack_probability_delta", np.nan), errors="coerce")
+    valid_xy = x.notna() & y.notna()
+    if not bool(valid_xy.any()):
+        return None
+    x_values = x.loc[valid_xy].to_numpy(dtype=float)
+    y_values = y.loc[valid_xy].to_numpy(dtype=float)
+    original_values = original.loc[valid_xy].fillna(0.0).to_numpy(dtype=float)
+    synthetic_values = synthetic.loc[valid_xy].fillna(0.0).to_numpy(dtype=float)
+    delta_values = delta.loc[valid_xy].fillna(0.0).to_numpy(dtype=float)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14.4, 11.4), constrained_layout=True)
+    _style_figure(fig, axes)
+    fig.suptitle(f"Farm-level spatial validation: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
+    vmax = max(float(np.nanmax(original_values)) if len(original_values) else 0.0, float(np.nanmax(synthetic_values)) if len(synthetic_values) else 0.0, 1e-6)
+    delta_vmax = max(float(np.nanmax(np.abs(delta_values))) if len(delta_values) else 0.0, 1e-6)
+
+    ax = axes[0, 0]
+    observed_plot = ax.scatter(x_values, y_values, c=original_values, s=20, linewidths=0.0, cmap="viridis", vmin=0.0, vmax=vmax)
+    ax.set_title("Observed network-generated attack probability")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    fig.colorbar(observed_plot, ax=ax, fraction=0.046, pad=0.03)
+
+    ax = axes[0, 1]
+    synthetic_plot = ax.scatter(x_values, y_values, c=synthetic_values, s=20, linewidths=0.0, cmap="viridis", vmin=0.0, vmax=vmax)
+    ax.set_title("Synthetic network-generated attack probability")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    fig.colorbar(synthetic_plot, ax=ax, fraction=0.046, pad=0.03)
+
+    ax = axes[1, 0]
+    delta_plot = ax.scatter(x_values, y_values, c=delta_values, s=20, linewidths=0.0, cmap="coolwarm", vmin=-delta_vmax, vmax=delta_vmax)
+    ax.set_title("Synthetic minus observed attack probability")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    fig.colorbar(delta_plot, ax=ax, fraction=0.046, pad=0.03)
+
+    ax = axes[1, 1]
+    valid_scatter = np.isfinite(original_values) & np.isfinite(synthetic_values)
+    obs_scatter = original_values[valid_scatter]
+    syn_scatter = synthetic_values[valid_scatter]
+    if len(obs_scatter):
+        ax.scatter(obs_scatter, syn_scatter, s=16, alpha=0.55, color=PLOT_COLORS["accent"], edgecolors="none")
+        upper = max(float(np.max(obs_scatter)), float(np.max(syn_scatter)), 1e-6)
+        ax.plot([0.0, upper], [0.0, upper], linestyle="--", color=PLOT_COLORS["neutral"], linewidth=1.2)
+        ax.set_xlim(0.0, upper * 1.03)
+        ax.set_ylim(0.0, upper * 1.03)
+    ax.set_title("Farm-level parity")
+    ax.set_xlabel("Observed attack probability")
+    ax.set_ylabel("Synthetic attack probability")
+    annotation = "\n".join([
+        f"corr = {_metric_text(summary.get('farm_attack_probability_correlation'), digits=3)}",
+        f"MAE = {_metric_text(summary.get('farm_attack_probability_mae'), digits=3)}",
+        f"top-10% overlap = {_metric_text(summary.get('farm_attack_probability_top10_overlap'), digits=3)}",
+        f"|Δ Moran's I| = {_metric_text(summary.get('farm_attack_probability_moran_i_abs_delta'), digits=3)}",
+        f"first-day corr = {_metric_text(summary.get('farm_first_infection_day_correlation'), digits=3)}",
+    ])
+    ax.text(
+        0.03,
+        0.97,
+        annotation,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10.5,
+        color=PLOT_COLORS["text"],
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": PLOT_COLORS["grid_strong"], "alpha": 0.94},
+    )
+    output_path = output_dir / f"{sample_label}_farm_spatial_overview.png"
     _save_figure(fig, output_path)
     plt.close(fig)
     return output_path
@@ -2764,6 +3573,8 @@ def write_all_samples_overview(summary_rows: pd.DataFrame, output_dir: Path) -> 
     metrics = [
         ("farm_prevalence_curve_correlation", "Farm prevalence corr"),
         ("farm_incidence_curve_correlation", "Farm incidence corr"),
+        ("farm_attack_probability_correlation", "Farm risk corr"),
+        ("region_reservoir_spatial_correlation_mean", "Region spatial corr"),
         ("farm_attack_rate_wasserstein", "Farm attack-rate W1"),
         ("farm_peak_prevalence_wasserstein", "Farm peak-prev W1"),
         ("farm_peak_day_wasserstein", "Farm peak-day W1"),
@@ -2855,11 +3666,27 @@ def _simulation_figure_reading_notes(*, include_scenario_overview: bool = False)
             ),
             (
                 "Delta view",
-                "Delta curves are synthetic minus observed. Long runs above zero mean the synthetic process overshoots the observed panel, while long runs below zero mean it misses sustained activity.",
+                "Delta curves are synthetic minus observed medians. Long runs above zero mean the synthetic process overshoots the observed panel, while long runs below zero mean it misses sustained activity.",
+            ),
+            (
+                "Daily mean view",
+                "The daily mean figure shows the average trajectory across replicates. It is useful when the daily median stays at zero and hides timing or magnitude shifts that are still visible in the mean.",
             ),
             (
                 "Distribution and parity views",
                 "The distribution figure shows the full replicate spread for scalar endpoints such as attack rate, peak size, peak day, and duration. The parity figure condenses each endpoint to observed versus synthetic medians for fast scanning.",
+            ),
+            (
+                "Hybrid-channel diagnostics",
+                "These panels separate farm→farm, region→farm, farm→region, and region→region flow so you can see whether the hybrid coupling itself is preserved rather than only the final epidemic totals.",
+            ),
+            (
+                "Farm spatial view",
+                "This figure checks whether the same farms are consistently high-risk. Read the two maps with the parity panel and Moran's I delta together: good alignment means the synthetic network preserves both hotspot location and overall spatial clustering.",
+            ),
+            (
+                "Regional field distances",
+                "Energy distance summarizes daily mismatch of the whole regional field, while variogram distance is more sensitive to dependence and clustering structure across COROPs.",
             ),
         ]
     )
@@ -2886,12 +3713,24 @@ def _simulation_table_reading_notes(*, include_scenario_scorecard: bool = False)
                 "Coverage near 0.9 means the observed daily path usually sits inside the synthetic 90% band. Much lower values point to bias or bands that are too narrow, while values pinned near 1 can also mean the bands are too wide.",
             ),
             (
+                "Daily mean comparison",
+                "These columns compare the mean trajectory across replicates for each day. Correlation rewards matching timing and shape, while mean absolute delta shows the average size of the daily gap.",
+            ),
+            (
                 "Scalar in-band flags and tail area",
                 "An in-band value of 1 means the observed median falls inside the synthetic 90% interval. Tail area close to 1 means the observed median sits near the center of the synthetic distribution, while values near 0 mean it lands in the tails.",
             ),
             (
                 "Network uncertainty share",
                 "This splits predictive variance into between-panel network variation and within-panel epidemic randomness. Values near 1 mean panel-to-panel network differences dominate, while values near 0 mean epidemic stochasticity dominates.",
+            ),
+            (
+                "Energy and variogram distances",
+                "Lower is better. Energy distance measures ensemble-to-ensemble mismatch of whole trajectories or spatial fields. Variogram distance puts more emphasis on getting dependence and clustering structure right.",
+            ),
+            (
+                "Lag diagnostics and farm spatial metrics",
+                "Best-lag correlation tells you whether the synthetic epidemic is shape-correct but shifted in time. Farm-level attack-probability correlation, hotspot overlap, and Moran's I delta tell you whether the detailed spatial risk pattern is preserved.",
             ),
         ]
     )
@@ -2978,16 +3817,27 @@ def write_report(
     observed_scalar = detailed_outputs.get("observed_outcomes", pd.DataFrame())
     synthetic_scalar = detailed_outputs.get("synthetic_outcomes", pd.DataFrame())
     daily_calibration = detailed_outputs.get("daily_calibration", pd.DataFrame())
+    daily_mean_comparison = detailed_outputs.get("daily_mean_comparison", pd.DataFrame())
     scalar_calibration = detailed_outputs.get("scalar_calibration", pd.DataFrame())
     uncertainty_decomposition = detailed_outputs.get("uncertainty_decomposition", pd.DataFrame())
     observed_region_daily = detailed_outputs.get("observed_region_daily", pd.DataFrame())
     synthetic_region_daily = detailed_outputs.get("synthetic_region_daily", pd.DataFrame())
     region_spatial_per_snapshot = detailed_outputs.get("region_spatial_per_snapshot", pd.DataFrame())
     region_temporal_summary = detailed_outputs.get("region_temporal_summary", pd.DataFrame())
+    trajectory_distribution_summary = detailed_outputs.get("trajectory_distribution_summary", pd.DataFrame())
+    lag_diagnostics = detailed_outputs.get("lag_diagnostics", pd.DataFrame())
+    region_field_scores = detailed_outputs.get("region_field_scores", pd.DataFrame())
+    observed_farm_summary = detailed_outputs.get("observed_farm_summary", pd.DataFrame())
+    synthetic_farm_summary = detailed_outputs.get("synthetic_farm_summary", pd.DataFrame())
+    farm_spatial_summary = detailed_outputs.get("farm_spatial_summary", pd.DataFrame())
+    farm_corop_summary = detailed_outputs.get("farm_corop_summary", pd.DataFrame())
     dashboard_path = _write_sample_dashboard(per_snapshot, summary, outcome_summary, output_dir, sample_label)
     delta_path = _write_curve_delta_plot(per_snapshot, output_dir, sample_label)
+    daily_mean_path = _write_daily_mean_comparison_plot(per_snapshot, summary, output_dir, sample_label)
     distribution_path = _write_outcome_distribution_plot(observed_scalar, synthetic_scalar, outcome_summary, output_dir, sample_label)
     parity_path = _write_sample_parity_plot(outcome_summary, output_dir, sample_label)
+    channel_path = _write_channel_diagnostics_plot(per_snapshot, summary, output_dir, sample_label)
+    farm_spatial_path = _write_farm_spatial_overview(farm_spatial_summary, summary, output_dir, sample_label)
     region_spatial_path = _write_region_spatial_overview(region_spatial_per_snapshot, output_dir, sample_label)
 
     region_geo_html_path = None
@@ -3047,18 +3897,25 @@ def write_report(
             f"- Replicates per panel: {int(summary.get('num_replicates', 0))}",
             f"- Farm prevalence-curve correlation: {float(summary.get('farm_prevalence_curve_correlation', 0.0) or 0.0):.4f}",
             f"- Farm incidence-curve correlation: {float(summary.get('farm_incidence_curve_correlation', 0.0) or 0.0):.4f}",
+            f"- Farm prevalence mean-curve correlation: {float(summary.get('farm_prevalence_mean_curve_correlation', 0.0) or 0.0):.4f}",
+            f"- Farm incidence mean-curve correlation: {float(summary.get('farm_incidence_mean_curve_correlation', 0.0) or 0.0):.4f}",
             f"- Farm attack-rate Wasserstein distance: {float(summary.get('farm_attack_rate_wasserstein', 0.0) or 0.0):.4f}",
             f"- Farm peak-prevalence Wasserstein distance: {float(summary.get('farm_peak_prevalence_wasserstein', 0.0) or 0.0):.4f}",
             f"- Farm peak-day Wasserstein distance: {float(summary.get('farm_peak_day_wasserstein', 0.0) or 0.0):.4f}",
             f"- Farm duration Wasserstein distance: {float(summary.get('farm_duration_wasserstein', 0.0) or 0.0):.4f}",
             f"- Mean absolute farm-prevalence delta: {float(summary.get('mean_abs_farm_prevalence_delta', 0.0) or 0.0):.4f}",
             f"- Mean absolute farm-incidence delta: {float(summary.get('mean_abs_farm_incidence_delta', 0.0) or 0.0):.4f}",
+            f"- Mean absolute farm-prevalence daily-mean gap: {float(summary.get('farm_prevalence_mean_curve_mae', 0.0) or 0.0):.4f}",
+            f"- Mean absolute farm-incidence daily-mean gap: {float(summary.get('farm_incidence_mean_curve_mae', 0.0) or 0.0):.4f}",
             "",
             "## Secondary checks",
             "",
             f"- Farm cumulative-incidence correlation: {float(summary.get('farm_cumulative_incidence_curve_correlation', 0.0) or 0.0):.4f}",
+            f"- Farm cumulative-incidence mean-curve correlation: {float(summary.get('farm_cumulative_incidence_mean_curve_correlation', 0.0) or 0.0):.4f}",
             f"- Reservoir-total correlation: {float(summary.get('reservoir_total_curve_correlation', 0.0) or 0.0):.4f}",
+            f"- Reservoir-total mean-curve correlation: {float(summary.get('reservoir_total_mean_curve_correlation', 0.0) or 0.0):.4f}",
             f"- Reservoir-max correlation: {float(summary.get('reservoir_max_curve_correlation', 0.0) or 0.0):.4f}",
+            f"- Reservoir-max mean-curve correlation: {float(summary.get('reservoir_max_mean_curve_correlation', 0.0) or 0.0):.4f}",
             f"- Farm cumulative-incidence Wasserstein distance: {float(summary.get('farm_cumulative_incidence_wasserstein', 0.0) or 0.0):.4f}",
             f"- Farm prevalence AUC Wasserstein distance: {float(summary.get('farm_prevalence_auc_wasserstein', 0.0) or 0.0):.4f}",
             f"- Reservoir-total AUC Wasserstein distance: {float(summary.get('reservoir_total_auc_wasserstein', 0.0) or 0.0):.4f}",
@@ -3079,7 +3936,72 @@ def write_report(
             f"- Mean daily reservoir hotspot overlap (top 3 COROPs): {_metric_text(summary.get('region_reservoir_hotspot_overlap_mean'), digits=3)}",
             f"- Mean per-COROP reservoir temporal correlation: {_metric_text(summary.get('region_reservoir_temporal_correlation_mean'))}",
             f"- Mean per-COROP reservoir peak-day absolute shift: {_metric_text(summary.get('region_reservoir_peak_day_abs_delta_mean'))}",
+            f"- Mean regional-field energy distance (reservoir): {_metric_text(summary.get('region_reservoir_field_energy_distance_mean'))}",
+            f"- Mean regional-field variogram distance (reservoir): {_metric_text(summary.get('region_reservoir_field_variogram_distance_mean'))}",
         ])
+
+    if not farm_spatial_summary.empty:
+        lines.extend([
+            "",
+            "## Farm-level spatial validation",
+            "",
+            "These diagnostics check whether the synthetic network reproduces the farm-by-farm geographic pattern of network-generated infection risk rather than only the aggregate epidemic curve.",
+            "",
+            f"- Farm attack-probability correlation: {_metric_text(summary.get('farm_attack_probability_correlation'))}",
+            f"- Farm attack-probability MAE: {_metric_text(summary.get('farm_attack_probability_mae'))}",
+            f"- Farm attack-probability Wasserstein distance: {_metric_text(summary.get('farm_attack_probability_wasserstein'))}",
+            f"- Farm top-10% hotspot overlap: {_metric_text(summary.get('farm_attack_probability_top10_overlap'), digits=3)}",
+            f"- Farm Moran's I absolute delta: {_metric_text(summary.get('farm_attack_probability_moran_i_abs_delta'))}",
+            f"- Farm first-infection-day correlation: {_metric_text(summary.get('farm_first_infection_day_correlation'))}",
+            f"- COROP-mean farm attack-probability correlation: {_metric_text(summary.get('farm_corop_attack_probability_correlation'))}",
+        ])
+
+    if any(key in per_snapshot.columns for key in ["farm_hazard_ff_delta", "farm_hazard_rf_delta", "region_pressure_fr_delta", "region_pressure_rr_delta"]):
+        lines.extend([
+            "",
+            "## Hybrid-channel diagnostics",
+            "",
+            "These checks quantify whether the synthetic panel preserves how much hazard moves through the farm→farm, region→farm, farm→region, and region→region channels in the hybrid network.",
+            "",
+            f"- Farm→farm hazard correlation: {_metric_text(summary.get('farm_hazard_ff_curve_correlation'))}",
+            f"- Region→farm hazard correlation: {_metric_text(summary.get('farm_hazard_rf_curve_correlation'))}",
+            f"- Farm→region seeding correlation: {_metric_text(summary.get('region_pressure_fr_curve_correlation'))}",
+            f"- Region→region diffusion correlation: {_metric_text(summary.get('region_pressure_rr_curve_correlation'))}",
+            f"- Region→farm hazard-share Wasserstein distance: {_metric_text(summary.get('farm_hazard_rf_share_wasserstein'))}",
+            f"- Region→region pressure-share Wasserstein distance: {_metric_text(summary.get('region_pressure_rr_share_wasserstein'))}",
+        ])
+
+    if not trajectory_distribution_summary.empty or not lag_diagnostics.empty:
+        lines.extend([
+            "",
+            "## Distribution-level temporal diagnostics",
+            "",
+            "These metrics compare the full replicate distribution of trajectories rather than only their medians. Energy distance measures overall ensemble mismatch; the lag diagnostics show whether synthetic curves line up better after a small phase shift.",
+            "",
+            f"- Farm prevalence trajectory energy distance: {_metric_text(summary.get('farm_prevalence_trajectory_energy_distance'))}",
+            f"- Farm incidence trajectory energy distance: {_metric_text(summary.get('farm_incidence_trajectory_energy_distance'))}",
+            f"- Reservoir-total trajectory energy distance: {_metric_text(summary.get('reservoir_total_trajectory_energy_distance'))}",
+            f"- Best lagged farm-prevalence correlation: {_metric_text(summary.get('farm_prevalence_best_lag_correlation'))} at lag {_metric_text(summary.get('farm_prevalence_best_lag_days'), digits=0)} days",
+            f"- Best lagged reservoir-total correlation: {_metric_text(summary.get('reservoir_total_best_lag_correlation'))} at lag {_metric_text(summary.get('reservoir_total_best_lag_days'), digits=0)} days",
+        ])
+
+    if not daily_mean_comparison.empty:
+        lines.extend([
+            "",
+            "## Daily mean comparison",
+            "",
+            "These metrics compare the mean trajectory across replicates for each day. They are useful when daily medians stay flat for long stretches and hide smaller timing shifts.",
+            "",
+            "| Metric | Mean-curve corr | Mean abs daily gap | RMSE | Max abs daily gap |",
+            "|---|---:|---:|---:|---:|",
+        ])
+        for _, row in daily_mean_comparison.iterrows():
+            metric = str(row.get("metric", ""))
+            corr = _metric_text(row.get("curve_correlation"), digits=3)
+            mean_abs_delta = _metric_text(row.get("mean_abs_delta"), digits=3)
+            rmse = _metric_text(row.get("rmse"), digits=3)
+            max_abs_delta = _metric_text(row.get("max_abs_delta"), digits=3)
+            lines.append(f"| {metric} | {corr} | {mean_abs_delta} | {rmse} | {max_abs_delta} |")
 
     if not daily_calibration.empty or not scalar_calibration.empty:
         lines.extend([
@@ -3144,10 +4066,16 @@ def write_report(
         lines.append(f"- Dashboard PNG: `{Path(dashboard_path).name}`")
     if delta_path is not None:
         lines.append(f"- Delta PNG: `{Path(delta_path).name}`")
+    if daily_mean_path is not None:
+        lines.append(f"- Daily mean-comparison PNG: `{Path(daily_mean_path).name}`")
     if distribution_path is not None:
         lines.append(f"- Distribution PNG: `{Path(distribution_path).name}`")
     if parity_path is not None:
         lines.append(f"- Parity PNG: `{Path(parity_path).name}`")
+    if channel_path is not None:
+        lines.append(f"- Channel-diagnostics PNG: `{Path(channel_path).name}`")
+    if farm_spatial_path is not None:
+        lines.append(f"- Farm spatial-overview PNG: `{Path(farm_spatial_path).name}`")
     if region_spatial_path is not None:
         lines.append(f"- Regional spatial-overview PNG: `{Path(region_spatial_path).name}`")
     if region_geo_html_path is not None:
@@ -3165,10 +4093,16 @@ def write_report(
         payload["dashboard_png"] = str(dashboard_path)
     if delta_path is not None:
         payload["delta_png"] = str(delta_path)
+    if daily_mean_path is not None:
+        payload["daily_mean_png"] = str(daily_mean_path)
     if distribution_path is not None:
         payload["distribution_png"] = str(distribution_path)
     if parity_path is not None:
         payload["parity_png"] = str(parity_path)
+    if channel_path is not None:
+        payload["channel_png"] = str(channel_path)
+    if farm_spatial_path is not None:
+        payload["farm_spatial_png"] = str(farm_spatial_path)
     if region_spatial_path is not None:
         payload["region_spatial_png"] = str(region_spatial_path)
     if region_geo_html_path is not None:
@@ -3176,12 +4110,13 @@ def write_report(
         payload["region_geo_payload_js"] = str(region_geo_html_path.with_name(f"{region_geo_html_path.stem}_payload.js"))
     payload.update(detail_paths)
     LOGGER.debug(
-        "Simulation artifacts written | per_snapshot_csv=%s | summary_json=%s | report_md=%s | dashboard_png=%s | delta_png=%s | distribution_png=%s | parity_png=%s | region_spatial_png=%s | region_geo_html=%s",
+        "Simulation artifacts written | per_snapshot_csv=%s | summary_json=%s | report_md=%s | dashboard_png=%s | delta_png=%s | daily_mean_png=%s | distribution_png=%s | parity_png=%s | region_spatial_png=%s | region_geo_html=%s",
         csv_path,
         json_path,
         md_path,
         dashboard_path,
         delta_path,
+        daily_mean_path,
         distribution_path,
         parity_path,
         region_spatial_path,
@@ -3200,11 +4135,19 @@ def _summary_payload_to_row(label: str, payload: dict[str, object]) -> Optional[
         "reservoir_total_curve_correlation",
         "reservoir_max_curve_correlation",
         "reservoir_positive_regions_curve_correlation",
+        "farm_hazard_ff_curve_correlation",
+        "farm_hazard_rf_curve_correlation",
+        "region_pressure_fr_curve_correlation",
+        "region_pressure_rr_curve_correlation",
         "mean_abs_farm_prevalence_delta",
         "mean_abs_farm_incidence_delta",
         "mean_abs_farm_cumulative_incidence_delta",
         "mean_abs_reservoir_total_delta",
         "mean_abs_reservoir_max_delta",
+        "mean_abs_farm_hazard_ff_delta",
+        "mean_abs_farm_hazard_rf_delta",
+        "mean_abs_region_pressure_fr_delta",
+        "mean_abs_region_pressure_rr_delta",
         "farm_attack_rate_wasserstein",
         "farm_cumulative_incidence_wasserstein",
         "farm_peak_prevalence_wasserstein",
@@ -3214,18 +4157,54 @@ def _summary_payload_to_row(label: str, payload: dict[str, object]) -> Optional[
         "farm_prevalence_auc_wasserstein",
         "reservoir_total_auc_wasserstein",
         "reservoir_max_peak_wasserstein",
+        "farm_hazard_rf_share_wasserstein",
+        "region_pressure_rr_share_wasserstein",
         "farm_prevalence_interval_coverage",
         "farm_incidence_interval_coverage",
         "farm_cumulative_incidence_interval_coverage",
         "reservoir_total_interval_coverage",
         "farm_prevalence_interval_width_mean",
         "farm_incidence_interval_width_mean",
+        "farm_prevalence_mean_curve_correlation",
+        "farm_incidence_mean_curve_correlation",
+        "farm_cumulative_incidence_mean_curve_correlation",
+        "reservoir_total_mean_curve_correlation",
+        "reservoir_max_mean_curve_correlation",
+        "reservoir_positive_regions_mean_curve_correlation",
+        "farm_prevalence_mean_curve_mae",
+        "farm_incidence_mean_curve_mae",
+        "farm_cumulative_incidence_mean_curve_mae",
+        "reservoir_total_mean_curve_mae",
+        "reservoir_max_mean_curve_mae",
+        "reservoir_positive_regions_mean_curve_mae",
         "farm_attack_rate_observed_median_in_synthetic_90pct",
         "farm_attack_rate_observed_median_tail_area",
         "farm_peak_prevalence_observed_median_in_synthetic_90pct",
         "farm_peak_prevalence_observed_median_tail_area",
         "farm_duration_observed_median_in_synthetic_90pct",
         "farm_duration_observed_median_tail_area",
+        "farm_prevalence_best_lag_correlation",
+        "farm_prevalence_best_lag_days",
+        "farm_incidence_best_lag_correlation",
+        "farm_incidence_best_lag_days",
+        "reservoir_total_best_lag_correlation",
+        "reservoir_total_best_lag_days",
+        "farm_prevalence_trajectory_energy_distance",
+        "farm_incidence_trajectory_energy_distance",
+        "farm_cumulative_incidence_trajectory_energy_distance",
+        "reservoir_total_trajectory_energy_distance",
+        "reservoir_max_trajectory_energy_distance",
+        "farm_attack_probability_correlation",
+        "farm_attack_probability_mae",
+        "farm_attack_probability_wasserstein",
+        "farm_attack_probability_top10_overlap",
+        "farm_attack_probability_moran_i_original",
+        "farm_attack_probability_moran_i_synthetic",
+        "farm_attack_probability_moran_i_abs_delta",
+        "farm_first_infection_day_correlation",
+        "farm_first_infection_day_mae",
+        "farm_corop_attack_probability_correlation",
+        "farm_corop_attack_probability_mae",
         "farm_attack_rate_network_uncertainty_share",
         "farm_attack_rate_epidemic_stochasticity_share",
         "farm_attack_rate_observed_median_in_pooled_synthetic_90pct",
@@ -3257,6 +4236,12 @@ def _summary_payload_to_row(label: str, payload: dict[str, object]) -> Optional[
         "region_export_hotspot_overlap_mean",
         "region_reservoir_share_mae_mean",
         "region_reservoir_peak_day_abs_delta_mean",
+        "region_reservoir_field_energy_distance_mean",
+        "region_import_field_energy_distance_mean",
+        "region_export_field_energy_distance_mean",
+        "region_reservoir_field_variogram_distance_mean",
+        "region_import_field_variogram_distance_mean",
+        "region_export_field_variogram_distance_mean",
         "num_replicates",
         "posterior_num_runs",
     ]
@@ -3301,12 +4286,445 @@ def _load_sweep_summary_rows(simulation_dir: Path) -> pd.DataFrame:
     return summary_frame
 
 
+
+
+
+def _scenario_switch_items_from_summary_rows(
+    summary_rows: pd.DataFrame,
+    *,
+    scenario_root: Path,
+    current_report_path: Path,
+) -> list[dict[str, object]]:
+    if summary_rows.empty or "scenario_name" not in summary_rows.columns:
+        return []
+    scenario_root = Path(scenario_root).expanduser().resolve()
+    current_report_path = Path(current_report_path).expanduser().resolve()
+    start_dir = current_report_path.parent
+    items: list[dict[str, object]] = []
+    for _, row in summary_rows.iterrows():
+        scenario_name = str(row.get("scenario_name") or "").strip()
+        if not scenario_name:
+            continue
+        report_value = str(row.get("report_path") or "").strip()
+        if report_value:
+            report_path = Path(report_value).expanduser()
+            report_path = report_path if report_path.is_absolute() else (scenario_root / report_path)
+        else:
+            report_path = scenario_root / scenario_name / "scientific_validation_report.html"
+        report_path = report_path.resolve()
+        fallback_path = (scenario_root / scenario_name / "scientific_validation_report.html").resolve()
+        if not report_path.exists() and fallback_path.exists():
+            report_path = fallback_path
+        href = os.path.relpath(report_path, start=start_dir).replace(os.sep, "/")
+        item: dict[str, object] = {
+            "scenario_name": scenario_name,
+            "scenario_description": str(row.get("scenario_description") or "").strip(),
+            "model": str(row.get("model") or "").strip(),
+            "selected_setting_label": str(row.get("selected_setting_label") or row.get("selected_sample_label") or "").strip(),
+            "href": href,
+        }
+        for key in (
+            "farm_prevalence_curve_correlation",
+            "farm_incidence_curve_correlation",
+            "farm_attack_rate_wasserstein",
+            "farm_peak_prevalence_wasserstein",
+            "farm_duration_wasserstein",
+            "farm_attack_probability_correlation",
+            "region_reservoir_spatial_correlation_mean",
+            "farm_prevalence_interval_coverage",
+            "farm_attack_rate_network_uncertainty_share",
+        ):
+            if key in row.index:
+                value = pd.to_numeric(pd.Series([row.get(key)]), errors="coerce").iloc[0]
+                item[key] = None if pd.isna(value) else float(value)
+        items.append(item)
+    return items
+
+
+def _build_scenario_switch_payload(
+    summary_rows: pd.DataFrame,
+    *,
+    scenario_root: Path,
+    current_report_path: Path,
+    current_scenario_name: Optional[str] = None,
+    default_scenario_name: Optional[str] = None,
+    comparison_report_path: Optional[Path] = None,
+) -> Optional[dict[str, object]]:
+    items = _scenario_switch_items_from_summary_rows(
+        summary_rows,
+        scenario_root=Path(scenario_root),
+        current_report_path=Path(current_report_path),
+    )
+    if len(items) <= 1:
+        return None
+    scenario_names = [str(item.get("scenario_name")) for item in items]
+    current_name = str(current_scenario_name).strip() if current_scenario_name else ""
+    if current_name not in scenario_names:
+        inferred_name = Path(current_report_path).expanduser().resolve().parent.name
+        current_name = inferred_name if inferred_name in scenario_names else ""
+    default_name = str(default_scenario_name).strip() if default_scenario_name else ""
+    if default_name not in scenario_names:
+        default_name = current_name or scenario_names[0]
+    comparison_href = None
+    if comparison_report_path is None:
+        comparison_report_path = Path(scenario_root).expanduser().resolve() / "scientific_validation_report.html"
+    comparison_report_path = Path(comparison_report_path).expanduser().resolve()
+    if comparison_report_path != Path(current_report_path).expanduser().resolve():
+        comparison_href = os.path.relpath(comparison_report_path, start=Path(current_report_path).expanduser().resolve().parent).replace(os.sep, "/")
+    return {
+        "items": items,
+        "current_scenario_name": current_name or None,
+        "default_scenario_name": default_name,
+        "comparison_href": comparison_href,
+    }
+
+
+def _auto_discover_scenario_switch_payload(
+    *,
+    run_dir: Path,
+    simulation_dir: Path,
+    current_report_path: Path,
+) -> Optional[dict[str, object]]:
+    run_dir = Path(run_dir).expanduser().resolve()
+    simulation_dir = Path(simulation_dir).expanduser().resolve()
+    current_report_path = Path(current_report_path).expanduser().resolve()
+    manifest = _load_json_if_exists(run_dir / "manifest.json") or {}
+    candidate_roots: list[Path] = []
+    simulation_scenarios = manifest.get("simulation_scenarios") or {}
+    scenario_root_value = simulation_scenarios.get("output_dir")
+    if scenario_root_value:
+        candidate_roots.append(Path(str(scenario_root_value)).expanduser().resolve())
+    candidate_roots.extend([simulation_dir, simulation_dir.parent])
+    seen_roots: set[Path] = set()
+    for candidate_root in candidate_roots:
+        if candidate_root in seen_roots:
+            continue
+        seen_roots.add(candidate_root)
+        summary_csv = candidate_root / "scenario_summary.csv"
+        if not summary_csv.exists():
+            continue
+        try:
+            summary_rows = pd.read_csv(summary_csv)
+        except Exception:
+            continue
+        default_name = str(simulation_scenarios.get("best_scenario") or "").strip() or None
+        current_name = simulation_dir.name if "scenario_name" in summary_rows.columns and simulation_dir.name in summary_rows["scenario_name"].astype(str).tolist() else None
+        payload = _build_scenario_switch_payload(
+            summary_rows,
+            scenario_root=candidate_root,
+            current_report_path=current_report_path,
+            current_scenario_name=current_name,
+            default_scenario_name=default_name,
+            comparison_report_path=candidate_root / "scientific_validation_report.html",
+        )
+        if payload is not None:
+            return payload
+    return None
+
+
+def _scenario_navigation_css() -> str:
+    return """
+        .scenario-switch-card, .scenario-browser-card, .scenario-iframe-card {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 18px;
+          padding: 18px;
+          box-shadow: var(--shadow);
+        }
+        .scenario-switch-controls {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 12px;
+          align-items: end;
+          margin-top: 12px;
+        }
+        .scenario-select-label {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          color: var(--muted);
+          font-size: 13px;
+          min-width: min(320px, 100%);
+        }
+        .scenario-select {
+          min-width: min(320px, 100%);
+          padding: 10px 12px;
+          border-radius: 12px;
+          border: 1px solid var(--line);
+          background: #fbfdff;
+          color: var(--text);
+          font: inherit;
+        }
+        .scenario-link-button {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          padding: 10px 14px;
+          border-radius: 10px;
+          border: 1px solid rgba(42, 111, 187, 0.22);
+          background: var(--blue-soft);
+          color: var(--blue);
+          text-decoration: none;
+          font-weight: 700;
+          min-height: 42px;
+        }
+        .scenario-chip-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin-top: 14px;
+        }
+        .scenario-chip {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          padding: 8px 12px;
+          border-radius: 999px;
+          border: 1px solid var(--line);
+          background: #fbfdff;
+          color: var(--text);
+          text-decoration: none;
+          font-size: 13px;
+          font-weight: 600;
+          transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+        }
+        .scenario-chip:hover {
+          background: var(--blue-soft);
+          border-color: rgba(42, 111, 187, 0.24);
+        }
+        .scenario-chip.is-active {
+          background: var(--blue-soft);
+          border-color: rgba(42, 111, 187, 0.32);
+          color: var(--blue);
+        }
+        .scenario-current-summary {
+          margin: 14px 0 0;
+          color: var(--muted);
+          font-size: 13px;
+          line-height: 1.6;
+        }
+        .scenario-browser-grid {
+          display: grid;
+          gap: 16px;
+        }
+        .scenario-iframe-card {
+          padding: 12px;
+        }
+        .scenario-report-frame {
+          width: 100%;
+          height: 86vh;
+          min-height: 980px;
+          border: 1px solid var(--line);
+          border-radius: 14px;
+          background: #ffffff;
+        }
+        @media (max-width: 980px) {
+          .scenario-switch-controls {
+            flex-direction: column;
+            align-items: stretch;
+          }
+          .scenario-link-button {
+            width: 100%;
+          }
+          .scenario-report-frame {
+            height: 78vh;
+            min-height: 720px;
+          }
+        }
+    """
+
+
+def _scenario_summary_sentence(item: dict[str, object]) -> str:
+    segments: list[str] = []
+    model = str(item.get("model") or "").strip()
+    selected_setting = str(item.get("selected_setting_label") or "").strip()
+    description = str(item.get("scenario_description") or "").strip()
+    header_bits: list[str] = []
+    if model:
+        header_bits.append(f"Model {model}")
+    if selected_setting:
+        header_bits.append(f"Selected setting {selected_setting}")
+    if description:
+        header_bits.append(description.rstrip("."))
+    if header_bits:
+        segments.append(" · ".join(header_bits))
+    metric_bits: list[str] = []
+    for label, key in (
+        ("prev corr", "farm_prevalence_curve_correlation"),
+        ("inc corr", "farm_incidence_curve_correlation"),
+        ("attack W1", "farm_attack_rate_wasserstein"),
+        ("duration W1", "farm_duration_wasserstein"),
+        ("farm risk corr", "farm_attack_probability_correlation"),
+        ("region spatial corr", "region_reservoir_spatial_correlation_mean"),
+    ):
+        value = pd.to_numeric(pd.Series([item.get(key)]), errors="coerce").iloc[0]
+        if pd.notna(value):
+            metric_bits.append(f"{label} {float(value):.3f}")
+    if metric_bits:
+        segments.append(" · ".join(metric_bits))
+    return " — ".join(segments)
+
+
+def _render_scenario_navigation_section(payload: Optional[dict[str, object]]) -> str:
+    if not payload:
+        return ""
+    items = list(payload.get("items") or [])
+    if len(items) <= 1:
+        return ""
+    current_name = str(payload.get("current_scenario_name") or payload.get("default_scenario_name") or items[0].get("scenario_name"))
+    current_item = next((item for item in items if str(item.get("scenario_name")) == current_name), items[0])
+    options_html = "".join(
+        f"<option value='{html.escape(str(item.get('href') or ''))}'{' selected' if str(item.get('scenario_name')) == current_name else ''}>{html.escape(str(item.get('scenario_name') or ''))}</option>"
+        for item in items
+    )
+    chips_html = "".join(
+        f"<a class='scenario-chip{' is-active' if str(item.get('scenario_name')) == current_name else ''}' href='{html.escape(str(item.get('href') or ''))}'>{html.escape(str(item.get('scenario_name') or ''))}</a>"
+        for item in items
+    )
+    comparison_href = str(payload.get("comparison_href") or "").strip()
+    comparison_link_html = (
+        f"<a class='scenario-link-button' href='{html.escape(comparison_href)}'>Open scenario comparison report</a>"
+        if comparison_href else ""
+    )
+    summary_text = html.escape(_scenario_summary_sentence(current_item))
+    return (
+        "<section class='section' id='scenario-switch'>"
+        "<div class='scenario-switch-card'>"
+        "<h2>Scenario switch</h2>"
+        "<p class='subtitle'>This report is one member of a multi-scenario sweep. Use the switch below to jump to the full report for any scenario while keeping the same tables and visualizations.</p>"
+        "<div class='scenario-switch-controls'>"
+        "<label class='scenario-select-label' for='scenario_switch_select'>"
+        "<span>Scenario</span>"
+        f"<select id='scenario_switch_select' class='scenario-select' onchange='if(this.value) window.location.href=this.value'>{options_html}</select>"
+        "</label>"
+        f"{comparison_link_html}"
+        "</div>"
+        f"<div class='scenario-chip-row'>{chips_html}</div>"
+        f"<p class='scenario-current-summary'>{summary_text}</p>"
+        "</div>"
+        "</section>"
+    )
+
+
+def _render_scenario_browser_section(
+    payload: Optional[dict[str, object]],
+    *,
+    widget_id: str = "scenario_browser",
+) -> str:
+    if not payload:
+        return ""
+    items = list(payload.get("items") or [])
+    if len(items) <= 1:
+        return ""
+    default_name = str(payload.get("default_scenario_name") or items[0].get("scenario_name"))
+    default_item = next((item for item in items if str(item.get("scenario_name")) == default_name), items[0])
+    options_html = "".join(
+        f"<option value='{html.escape(str(item.get('scenario_name') or ''))}'{' selected' if str(item.get('scenario_name')) == default_name else ''}>{html.escape(str(item.get('scenario_name') or ''))}</option>"
+        for item in items
+    )
+    chips_html = "".join(
+        f"<a class='scenario-chip{' is-active' if str(item.get('scenario_name')) == default_name else ''}' href='{html.escape(str(item.get('href') or ''))}' data-scenario-browser-chip='{html.escape(str(item.get('scenario_name') or ''))}'>{html.escape(str(item.get('scenario_name') or ''))}</a>"
+        for item in items
+    )
+    summary_text = html.escape(_scenario_summary_sentence(default_item))
+    items_json = json.dumps(_json_ready(items), ensure_ascii=False).replace("</", "<\\/")
+    default_href = html.escape(str(default_item.get("href") or ""))
+    return (
+        "<section class='section' id='scenario-browser'>"
+        "<div class='scenario-browser-grid'>"
+        "<div class='scenario-browser-card'>"
+        "<h2>Scenario browser</h2>"
+        "<p class='subtitle'>Use this switch to load the full report for any scenario directly inside this page. Each scenario opens the same detailed tables and visualizations that are available in its standalone validation report.</p>"
+        "<div class='scenario-switch-controls'>"
+        f"<label class='scenario-select-label' for='{html.escape(widget_id)}_select'>"
+        "<span>Scenario</span>"
+        f"<select id='{html.escape(widget_id)}_select' class='scenario-select'>{options_html}</select>"
+        "</label>"
+        f"<a id='{html.escape(widget_id)}_open' class='scenario-link-button' href='{default_href}' target='_blank' rel='noopener'>Open selected scenario in a new tab</a>"
+        "</div>"
+        f"<div class='scenario-chip-row'>{chips_html}</div>"
+        f"<p id='{html.escape(widget_id)}_summary' class='scenario-current-summary'>{summary_text}</p>"
+        "</div>"
+        "<div class='scenario-iframe-card'>"
+        f"<iframe id='{html.escape(widget_id)}_frame' class='scenario-report-frame' src='{default_href}' title='Scenario validation report' loading='lazy'></iframe>"
+        "</div>"
+        f"<script type='application/json' id='{html.escape(widget_id)}_data'>{items_json}</script>"
+        "</div>"
+        "</section>"
+    )
+
+
+def _scenario_browser_script(widget_id: str = "scenario_browser") -> str:
+    escaped_widget_id = json.dumps(str(widget_id))
+    return """
+            (function() {
+              const widgetId = """ + escaped_widget_id + """;
+              const dataNode = document.getElementById(widgetId + "_data");
+              const select = document.getElementById(widgetId + "_select");
+              const frame = document.getElementById(widgetId + "_frame");
+              const openLink = document.getElementById(widgetId + "_open");
+              const summary = document.getElementById(widgetId + "_summary");
+              if (!dataNode || !select || !frame || !openLink || !summary) return;
+              let items = [];
+              try {
+                items = JSON.parse(dataNode.textContent || "[]");
+              } catch (error) {
+                return;
+              }
+              if (!Array.isArray(items) || !items.length) return;
+              const chips = Array.from(document.querySelectorAll("[data-scenario-browser-chip]"));
+              const formatItem = (item) => {
+                const parts = [];
+                if (item.model) parts.push(`Model ${item.model}`);
+                if (item.selected_setting_label) parts.push(`Selected setting ${item.selected_setting_label}`);
+                if (item.scenario_description) parts.push(String(item.scenario_description).replace(/\\.$/, ""));
+                const metrics = [];
+                const metricSpecs = [
+                  ["prev corr", "farm_prevalence_curve_correlation"],
+                  ["inc corr", "farm_incidence_curve_correlation"],
+                  ["attack W1", "farm_attack_rate_wasserstein"],
+                  ["duration W1", "farm_duration_wasserstein"],
+                  ["farm risk corr", "farm_attack_probability_correlation"],
+                  ["region spatial corr", "region_reservoir_spatial_correlation_mean"],
+                ];
+                metricSpecs.forEach(([label, key]) => {
+                  const value = Number(item[key]);
+                  if (Number.isFinite(value)) metrics.push(`${label} ${value.toFixed(3)}`);
+                });
+                return [parts.join(" · "), metrics.join(" · ")].filter(Boolean).join(" — ");
+              };
+              const activate = (scenarioName) => {
+                const nextItem = items.find((item) => String(item.scenario_name) === String(scenarioName)) || items[0];
+                if (!nextItem) return;
+                select.value = String(nextItem.scenario_name);
+                if (nextItem.href) {
+                  frame.src = String(nextItem.href);
+                  openLink.href = String(nextItem.href);
+                }
+                summary.textContent = formatItem(nextItem);
+                chips.forEach((chip) => {
+                  const active = chip.dataset.scenarioBrowserChip === String(nextItem.scenario_name);
+                  chip.classList.toggle("is-active", active);
+                });
+              };
+              select.addEventListener("change", () => activate(select.value));
+              chips.forEach((chip) => {
+                chip.addEventListener("click", (event) => {
+                  event.preventDefault();
+                  activate(chip.dataset.scenarioBrowserChip);
+                });
+              });
+              activate(select.value || String(items[0].scenario_name));
+            })();
+    """
+
 def write_scientific_validation_report(
     run_dir: Path,
     *,
     simulation_dir: Optional[Path] = None,
     output_path: Optional[Path] = None,
     title: Optional[str] = None,
+    scenario_switch_payload: Optional[dict[str, object]] = None,
 ) -> Path:
     run_dir = Path(run_dir).expanduser().resolve()
     simulation_dir = Path(simulation_dir).expanduser().resolve() if simulation_dir is not None else run_dir / "simulation"
@@ -3318,6 +4736,12 @@ def write_scientific_validation_report(
     title = title or f"{dataset_name} {directed_label}Hybrid Transmission Reality-check Report"
     output_path = Path(output_path) if output_path is not None else simulation_dir / "scientific_validation_report.html"
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    scenario_switch_payload = scenario_switch_payload or _auto_discover_scenario_switch_payload(
+        run_dir=run_dir,
+        simulation_dir=simulation_dir,
+        current_report_path=output_path,
+    )
+    scenario_navigation_html = _render_scenario_navigation_section(scenario_switch_payload)
 
     sample_labels = summary_rows["sample_label"].astype(str) if "sample_label" in summary_rows.columns else pd.Series([""] * len(summary_rows))
     posterior_runs_source = summary_rows["posterior_num_runs"] if "posterior_num_runs" in summary_rows.columns else pd.Series(1.0, index=summary_rows.index)
@@ -3335,22 +4759,106 @@ def write_scientific_validation_report(
     else:
         headline_rows = headline_source.reset_index(drop=True)
 
-    best_curve = headline_rows.sort_values(
-        ["farm_prevalence_curve_correlation", "farm_incidence_curve_correlation", "farm_attack_rate_wasserstein"],
-        ascending=[False, False, True],
-    ).iloc[0]
-    lowest_attack = headline_rows.sort_values(
-        ["farm_attack_rate_wasserstein", "farm_peak_prevalence_wasserstein", "farm_duration_wasserstein"],
-        ascending=[True, True, True],
-    ).iloc[0]
+    def slugify(value: object) -> str:
+        text_value = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
+        return text_value or "item"
 
-    def figure_tag(path: Optional[Path], caption: str) -> str:
+    def safe_best_row(frame: pd.DataFrame, sort_spec: list[tuple[str, bool]]) -> pd.Series:
+        if frame.empty:
+            raise ValueError("Cannot select a best row from an empty summary frame.")
+        available = [(column, ascending) for column, ascending in sort_spec if column in frame.columns]
+        if not available:
+            return frame.iloc[0]
+        ranked = frame.sort_values(
+            [column for column, _ in available],
+            ascending=[ascending for _, ascending in available],
+            na_position="last",
+        ).reset_index(drop=True)
+        return ranked.iloc[0]
+
+    def sort_frame_by_available(frame: pd.DataFrame, sort_spec: list[tuple[str, bool]]) -> pd.DataFrame:
+        if frame.empty:
+            return frame.copy()
+        available = [(column, ascending) for column, ascending in sort_spec if column in frame.columns]
+        if not available:
+            if "sample_label" in frame.columns:
+                return frame.sort_values("sample_label", na_position="last").reset_index(drop=True)
+            return frame.reset_index(drop=True)
+        return frame.sort_values(
+            [column for column, _ in available],
+            ascending=[ascending for _, ascending in available],
+            na_position="last",
+        ).reset_index(drop=True)
+
+    best_curve = safe_best_row(
+        headline_rows,
+        [
+            ("farm_prevalence_curve_correlation", False),
+            ("farm_incidence_curve_correlation", False),
+            ("farm_attack_rate_wasserstein", True),
+        ],
+    )
+    lowest_attack = safe_best_row(
+        headline_rows,
+        [
+            ("farm_attack_rate_wasserstein", True),
+            ("farm_peak_prevalence_wasserstein", True),
+            ("farm_duration_wasserstein", True),
+        ],
+    )
+    best_farm_spatial = safe_best_row(
+        headline_rows,
+        [
+            ("farm_attack_probability_correlation", False),
+            ("farm_attack_probability_mae", True),
+            ("farm_attack_probability_top10_overlap", False),
+        ],
+    )
+    best_regional = safe_best_row(
+        headline_rows,
+        [
+            ("region_reservoir_spatial_correlation_mean", False),
+            ("region_reservoir_temporal_correlation_mean", False),
+            ("region_reservoir_field_energy_distance_mean", True),
+        ],
+    )
+
+    def figure_tag(path: Optional[Path], caption: str, *, title_text: Optional[str] = None) -> str:
         if path is None or not Path(path).exists():
             return ""
+        heading_html = f"<h3>{html.escape(title_text)}</h3>" if title_text else ""
+        filename = html.escape(Path(path).name)
+        overlay_title = html.escape(title_text or caption)
+        overlay_caption = html.escape(caption)
         return (
             "<figure class='figure-card'>"
-            f"<div class='figure-frame'><img src='{html.escape(Path(path).name)}' alt='{html.escape(caption)}'></div>"
-            f"<figcaption>{html.escape(caption)}</figcaption>"
+            f"{heading_html}"
+            "<div class='figure-frame'>"
+            f"<button type='button' class='figure-popout-button' data-image-src='{filename}' data-image-title='{overlay_title}' data-image-caption='{overlay_caption}' aria-label='Open full-size figure'>"
+            f"<img class='report-zoomable-image' src='{filename}' alt='{overlay_caption}' loading='lazy' decoding='async'>"
+            "</button>"
+            "</div>"
+            f"<figcaption>{overlay_caption}</figcaption>"
+            "</figure>"
+        )
+
+    def link_figure_card(
+        path: Optional[Path],
+        title_text: str,
+        description: str,
+        *,
+        link_label: str = "Open interactive viewer",
+    ) -> str:
+        if path is None or not Path(path).exists():
+            return ""
+        filename = html.escape(Path(path).name)
+        return (
+            "<figure class='figure-card link-card'>"
+            "<div class='link-card-inner'>"
+            f"<h3>{html.escape(title_text)}</h3>"
+            f"<p class='table-note'>{html.escape(description)}</p>"
+            f"<p class='card-link'><a href='{filename}' target='_blank' rel='noopener'>{html.escape(link_label)}</a></p>"
+            "</div>"
             "</figure>"
         )
 
@@ -3358,8 +4866,8 @@ def write_scientific_validation_report(
         if path is None or not Path(path).exists():
             return ""
         filename = html.escape(Path(path).name)
-        text = html.escape(label)
-        return f"<li><a href='{filename}' target='_blank' rel='noopener'>{text}</a></li>"
+        text_value = html.escape(label)
+        return f"<li><a href='{filename}' target='_blank' rel='noopener'>{text_value}</a></li>"
 
     def artifact_path(sample_label: object, suffix: str, extension: str = "png") -> Optional[Path]:
         candidate = simulation_dir / f"{sample_label}_{suffix}.{extension}"
@@ -3374,15 +4882,20 @@ def write_scientific_validation_report(
         for column in display_frame.columns:
             numeric = pd.to_numeric(display_frame[column], errors="coerce")
             if numeric.notna().any():
-                display_frame[column] = [f"{float(value):.4f}" if pd.notna(value) else "" for value in numeric]
+                finite = numeric.dropna().to_numpy(dtype=float)
+                if len(finite) and np.all(np.isclose(finite, np.round(finite))):
+                    display_frame[column] = [str(int(round(float(value)))) if pd.notna(value) else "" for value in numeric]
+                else:
+                    display_frame[column] = [f"{float(value):.4f}" if pd.notna(value) else "" for value in numeric]
         return display_frame.to_html(index=False, classes=["report-table"], border=0, escape=False)
 
     def table_card_from_csv(
         path: Optional[Path],
-        title: str,
+        title_text: str,
         *,
         note: Optional[str] = None,
         max_rows: Optional[int] = None,
+        transform=None,
     ) -> str:
         if path is None or not Path(path).exists():
             return ""
@@ -3390,6 +4903,11 @@ def write_scientific_validation_report(
             frame = pd.read_csv(path)
         except Exception:
             return ""
+        if transform is not None:
+            try:
+                frame = transform(frame)
+            except Exception:
+                pass
         table_html = render_dataframe_table(frame, max_rows=max_rows)
         if not table_html:
             return ""
@@ -3402,7 +4920,7 @@ def write_scientific_validation_report(
             )
         return (
             "<div class='table-card'>"
-            f"<h3>{html.escape(title)}</h3>"
+            f"<h3>{html.escape(title_text)}</h3>"
             f"{note_html}"
             "<div class='table-wrap'>"
             f"{table_html}"
@@ -3415,18 +4933,38 @@ def write_scientific_validation_report(
         table_html: str,
         *,
         note: Optional[str] = None,
+        title_text: Optional[str] = None,
     ) -> str:
         if not table_html:
             return ""
         note_html = f"<p class='table-note'>{html.escape(note)}</p>" if note else ""
+        title_html = f"<h3>{html.escape(title_text)}</h3>" if title_text else ""
         return (
             "<div class='table-card'>"
+            f"{title_html}"
             f"{note_html}"
             "<div class='table-wrap'>"
             f"{table_html}"
             "</div>"
             "</div>"
         )
+
+    def kv_table_card(title_text: str, entries: list[tuple[str, str]], *, note: Optional[str] = None) -> str:
+        clean_entries = [(str(label), str(value)) for label, value in entries if str(value).strip() and str(value).strip().lower() != "n/a"]
+        if not clean_entries:
+            return ""
+        rows_html = "".join(
+            f"<tr><th>{html.escape(label)}</th><td>{html.escape(value)}</td></tr>"
+            for label, value in clean_entries
+        )
+        return table_card_from_html(
+            "<table class='report-table compact-table'><tbody>" + rows_html + "</tbody></table>",
+            note=note,
+            title_text=title_text,
+        )
+
+    def status_icon(present: bool) -> str:
+        return "<span class='status-ok'>✓</span>" if present else "<span class='status-missing'>—</span>"
 
     def fmt_from_row(row: pd.Series, key: str, digits: int = 3) -> str:
         if key not in row.index:
@@ -3436,18 +4974,169 @@ def write_scientific_validation_report(
             return "n/a"
         return f"{float(value):.{digits}f}"
 
+    def row_mean_text(frame: pd.DataFrame, columns: list[str]) -> str:
+        available = [column for column in columns if column in frame.columns]
+        if not available:
+            return "n/a"
+        numeric = frame[available].apply(pd.to_numeric, errors="coerce")
+        means = numeric.mean(axis=1, skipna=True).dropna()
+        if means.empty:
+            return "n/a"
+        return f"{float(means.median()):.3f}"
+
+    def section_id_for_sample(sample_label: object) -> str:
+        return f"setting-{slugify(sample_label)}"
+
+    def transform_farm_spatial(frame: pd.DataFrame) -> pd.DataFrame:
+        working = frame.copy()
+        if "network_generated_attack_probability_delta" in working.columns:
+            delta_series = pd.to_numeric(working["network_generated_attack_probability_delta"], errors="coerce")
+            working["_abs_delta"] = delta_series.abs()
+            working = working.sort_values("_abs_delta", ascending=False, na_position="last")
+        keep_columns = [
+            "node_id",
+            "ubn",
+            "corop",
+            "x",
+            "y",
+            "original_network_generated_attack_probability",
+            "synthetic_network_generated_attack_probability",
+            "network_generated_attack_probability_delta",
+            "original_first_infection_day_median",
+            "synthetic_first_infection_day_median",
+            "first_infection_day_median_delta",
+        ]
+        keep_columns = [column for column in keep_columns if column in working.columns]
+        if keep_columns:
+            working = working[keep_columns]
+        return working.drop(columns=["_abs_delta"], errors="ignore").reset_index(drop=True)
+
+    def transform_farm_corop(frame: pd.DataFrame) -> pd.DataFrame:
+        working = frame.copy()
+        if {"original_network_generated_attack_probability", "synthetic_network_generated_attack_probability"}.issubset(working.columns):
+            original = pd.to_numeric(working["original_network_generated_attack_probability"], errors="coerce")
+            synthetic = pd.to_numeric(working["synthetic_network_generated_attack_probability"], errors="coerce")
+            working["_abs_delta"] = (synthetic - original).abs()
+            working = working.sort_values(["_abs_delta", "original_network_generated_attack_probability"], ascending=[False, False], na_position="last")
+        return working.drop(columns=["_abs_delta"], errors="ignore").reset_index(drop=True)
+
+    def transform_region_field(frame: pd.DataFrame) -> pd.DataFrame:
+        working = frame.copy()
+        keep_columns = [
+            "day_index",
+            "ts",
+            "reservoir_pressure_energy_distance",
+            "import_pressure_energy_distance",
+            "export_pressure_energy_distance",
+            "reservoir_pressure_variogram_distance",
+            "import_pressure_variogram_distance",
+            "export_pressure_variogram_distance",
+        ]
+        keep_columns = [column for column in keep_columns if column in working.columns]
+        if keep_columns:
+            working = working[keep_columns]
+        sort_columns = [column for column in ["day_index", "ts"] if column in working.columns]
+        if sort_columns:
+            working = working.sort_values(sort_columns)
+        return working.reset_index(drop=True)
+
+    def transform_region_temporal(frame: pd.DataFrame) -> pd.DataFrame:
+        working = frame.copy()
+        sort_columns = []
+        ascending = []
+        if "reservoir_pressure_temporal_correlation" in working.columns:
+            sort_columns.append("reservoir_pressure_temporal_correlation")
+            ascending.append(False)
+        if "import_pressure_temporal_correlation" in working.columns:
+            sort_columns.append("import_pressure_temporal_correlation")
+            ascending.append(False)
+        if sort_columns:
+            working = working.sort_values(sort_columns, ascending=ascending, na_position="last")
+        keep_columns = [
+            "region_node_id",
+            "corop",
+            "display_label",
+            "reservoir_pressure_temporal_correlation",
+            "import_pressure_temporal_correlation",
+            "export_pressure_temporal_correlation",
+            "reservoir_pressure_peak_day_abs_delta",
+            "import_pressure_peak_day_abs_delta",
+            "export_pressure_peak_day_abs_delta",
+        ]
+        keep_columns = [column for column in keep_columns if column in working.columns]
+        if keep_columns:
+            working = working[keep_columns]
+        return working.reset_index(drop=True)
+
+    def coverage_matrix_html(frame: pd.DataFrame) -> tuple[str, Optional[float]]:
+        if frame.empty:
+            return "", None
+        expected_assets = [
+            ("dashboard", "Dashboard", "png"),
+            ("delta", "Delta", "png"),
+            ("daily_mean_compare", "Daily mean fig", "png"),
+            ("distribution", "Distribution fig", "png"),
+            ("parity", "Parity", "png"),
+            ("channel_diagnostics", "Channel", "png"),
+            ("farm_spatial_overview", "Farm spatial fig", "png"),
+            ("region_spatial_overview", "Region spatial fig", "png"),
+            ("region_geo_compare", "Interactive map", "html"),
+            ("outcome_distribution_summary", "Outcome table", "csv"),
+            ("trajectory_distribution_summary", "Trajectory table", "csv"),
+            ("daily_mean_comparison", "Daily mean table", "csv"),
+            ("daily_calibration", "Daily calib", "csv"),
+            ("scalar_calibration", "Scalar calib", "csv"),
+            ("uncertainty_decomposition", "Uncertainty", "csv"),
+            ("lag_diagnostics", "Lag table", "csv"),
+            ("farm_spatial_summary", "Farm spatial table", "csv"),
+            ("farm_corop_summary", "Farm COROP table", "csv"),
+            ("region_field_scores", "Region field table", "csv"),
+            ("region_temporal_summary", "Region temporal table", "csv"),
+        ]
+        headers = "".join(f"<th>{html.escape(label)}</th>" for _, label, _ in expected_assets)
+        body_rows = []
+        completeness_values: list[float] = []
+        for _, row in frame.iterrows():
+            sample_label = str(row.get("sample_label", ""))
+            cells = [f"<td>{html.escape(sample_label)}</td>"]
+            present_count = 0
+            for suffix, _, extension in expected_assets:
+                present = artifact_path(sample_label, suffix, extension) is not None
+                present_count += int(present)
+                cells.append(f"<td class='status-cell'>{status_icon(present)}</td>")
+            completeness = float(present_count / max(len(expected_assets), 1))
+            completeness_values.append(completeness)
+            cells.append(f"<td>{completeness * 100.0:.0f}%</td>")
+            body_rows.append("<tr>" + "".join(cells) + "</tr>")
+        table_html = (
+            "<table class='report-table coverage-table'>"
+            "<thead><tr><th>Setting</th>"
+            + headers
+            + "<th>Completeness</th></tr></thead>"
+            + "<tbody>"
+            + "".join(body_rows)
+            + "</tbody></table>"
+        )
+        median_completeness = float(np.median(completeness_values)) if completeness_values else None
+        return table_html, median_completeness
+
     def setting_visual_section(row: pd.Series, role_label: str) -> str:
         sample_label = str(row["sample_label"])
+        section_id = section_id_for_sample(sample_label)
         dashboard_path = artifact_path(sample_label, "dashboard")
         delta_path = artifact_path(sample_label, "delta")
+        daily_mean_path = artifact_path(sample_label, "daily_mean_compare")
         distribution_path = artifact_path(sample_label, "distribution")
         parity_path = artifact_path(sample_label, "parity")
+        channel_path = artifact_path(sample_label, "channel_diagnostics")
+        farm_spatial_path = artifact_path(sample_label, "farm_spatial_overview")
         region_spatial_path = artifact_path(sample_label, "region_spatial_overview")
         region_geo_path = artifact_path(sample_label, "region_geo_compare", extension="html")
         report_md_path = artifact_path(sample_label, "report", extension="md")
         summary_json_path = artifact_path(sample_label, "summary", extension="json")
         per_snapshot_csv_path = artifact_path(sample_label, "per_snapshot", extension="csv")
         outcome_distribution_csv_path = artifact_path(sample_label, "outcome_distribution_summary", extension="csv")
+        daily_mean_comparison_path = artifact_path(sample_label, "daily_mean_comparison", extension="csv")
         daily_calibration_path = artifact_path(sample_label, "daily_calibration", extension="csv")
         scalar_calibration_path = artifact_path(sample_label, "scalar_calibration", extension="csv")
         uncertainty_decomposition_path = artifact_path(sample_label, "uncertainty_decomposition", extension="csv")
@@ -3459,12 +5148,27 @@ def write_scientific_validation_report(
         synthetic_region_daily_path = artifact_path(sample_label, "synthetic_region_daily", extension="csv")
         region_spatial_csv_path = artifact_path(sample_label, "region_spatial_per_snapshot", extension="csv")
         region_temporal_csv_path = artifact_path(sample_label, "region_temporal_summary", extension="csv")
+        trajectory_distribution_csv_path = artifact_path(sample_label, "trajectory_distribution_summary", extension="csv")
+        lag_diagnostics_path = artifact_path(sample_label, "lag_diagnostics", extension="csv")
+        region_field_scores_path = artifact_path(sample_label, "region_field_scores", extension="csv")
+        observed_farm_summary_path = artifact_path(sample_label, "observed_farm_summary", extension="csv")
+        synthetic_farm_summary_path = artifact_path(sample_label, "synthetic_farm_summary", extension="csv")
+        farm_spatial_csv_path = artifact_path(sample_label, "farm_spatial_summary", extension="csv")
+        farm_corop_csv_path = artifact_path(sample_label, "farm_corop_summary", extension="csv")
         figures = [
-            figure_tag(dashboard_path, f"{sample_label} trajectory dashboard"),
-            figure_tag(delta_path, f"{sample_label} trajectory deltas"),
-            figure_tag(distribution_path, f"{sample_label} replicate outcome distributions"),
-            figure_tag(parity_path, f"{sample_label} median parity checks"),
-            figure_tag(region_spatial_path, f"{sample_label} regional spatial-fit overview"),
+            figure_tag(dashboard_path, f"{sample_label} trajectory dashboard", title_text="Trajectory dashboard"),
+            figure_tag(delta_path, f"{sample_label} trajectory median deltas", title_text="Trajectory median deltas"),
+            figure_tag(daily_mean_path, f"{sample_label} daily mean trajectories", title_text="Daily mean trajectories"),
+            figure_tag(distribution_path, f"{sample_label} replicate outcome distributions", title_text="Replicate outcome distributions"),
+            figure_tag(parity_path, f"{sample_label} median parity checks", title_text="Median parity checks"),
+            figure_tag(channel_path, f"{sample_label} hybrid-channel diagnostics", title_text="Hybrid-channel diagnostics"),
+            figure_tag(farm_spatial_path, f"{sample_label} farm-level spatial validation", title_text="Farm-level spatial validation"),
+            figure_tag(region_spatial_path, f"{sample_label} regional spatial-fit overview", title_text="Regional spatial-fit overview"),
+            link_figure_card(
+                region_geo_path,
+                "Interactive COROP viewer",
+                "Open the linked HTML viewer for day-by-day observed, synthetic, and delta maps of reservoir, import, and export pressure.",
+            ),
         ]
         figures_html = "".join(fig for fig in figures if fig)
         artifact_specs = [
@@ -3472,6 +5176,7 @@ def write_scientific_validation_report(
             (summary_json_path, "Summary JSON"),
             (per_snapshot_csv_path, "Per-day summary CSV"),
             (outcome_distribution_csv_path, "Outcome distribution summary CSV"),
+            (daily_mean_comparison_path, "Daily mean-comparison CSV"),
             (daily_calibration_path, "Daily calibration CSV"),
             (scalar_calibration_path, "Scalar calibration CSV"),
             (uncertainty_decomposition_path, "Uncertainty decomposition CSV"),
@@ -3479,14 +5184,21 @@ def write_scientific_validation_report(
             (synthetic_daily_path, "Synthetic daily CSV"),
             (observed_outcomes_path, "Observed outcomes CSV"),
             (synthetic_outcomes_path, "Synthetic outcomes CSV"),
-            (region_geo_path, "Interactive COROP geo comparison"),
+            (trajectory_distribution_csv_path, "Trajectory-distribution summary CSV"),
+            (lag_diagnostics_path, "Lag diagnostics CSV"),
+            (observed_farm_summary_path, "Observed farm summary CSV"),
+            (synthetic_farm_summary_path, "Synthetic farm summary CSV"),
+            (farm_spatial_csv_path, "Farm spatial summary CSV"),
+            (farm_corop_csv_path, "Farm COROP summary CSV"),
             (region_spatial_csv_path, "Regional spatial-fit summary CSV"),
             (region_temporal_csv_path, "Regional temporal-fit summary CSV"),
+            (region_field_scores_path, "Regional field-score CSV"),
             (observed_region_daily_path, "Observed regional daily CSV"),
             (synthetic_region_daily_path, "Synthetic regional daily CSV"),
+            (region_geo_path, "Interactive COROP geo comparison"),
         ]
-        regional_link_items = [artifact_link(path, label) for path, label in artifact_specs]
-        regional_links = "".join(link for link in regional_link_items if link)
+        artifact_items = [artifact_link(path, label) for path, label in artifact_specs]
+        regional_links = "".join(item for item in artifact_items if item)
         if not figures_html and not regional_links:
             return ""
         regional_links_html = ""
@@ -3499,13 +5211,57 @@ def write_scientific_validation_report(
                 + "</ul>"
                 "</div>"
             )
+
+        pill_entries = [
+            f"Prev corr {fmt_from_row(row, 'farm_prevalence_curve_correlation')}",
+            f"Prev mean corr {fmt_from_row(row, 'farm_prevalence_mean_curve_correlation')}",
+            f"Attack W1 {fmt_from_row(row, 'farm_attack_rate_wasserstein')}",
+            f"Farm risk corr {fmt_from_row(row, 'farm_attack_probability_correlation')}",
+            f"Region spatial corr {fmt_from_row(row, 'region_reservoir_spatial_correlation_mean')}",
+        ]
+        metric_pills_html = "".join(f"<span class='metric-pill'>{html.escape(entry)}</span>" for entry in pill_entries if "n/a" not in entry)
+
+        channel_summary_entries = [
+            ("Farm→Farm hazard correlation", fmt_from_row(row, "farm_hazard_ff_curve_correlation")),
+            ("Region→Farm hazard correlation", fmt_from_row(row, "farm_hazard_rf_curve_correlation")),
+            ("Farm→Region pressure correlation", fmt_from_row(row, "region_pressure_fr_curve_correlation")),
+            ("Region→Region pressure correlation", fmt_from_row(row, "region_pressure_rr_curve_correlation")),
+            ("Region→Farm share Wasserstein", fmt_from_row(row, "farm_hazard_rf_share_wasserstein")),
+            ("Region→Region share Wasserstein", fmt_from_row(row, "region_pressure_rr_share_wasserstein")),
+        ]
+        spatial_summary_entries = [
+            ("Farm attack-probability correlation", fmt_from_row(row, "farm_attack_probability_correlation")),
+            ("Farm attack-probability MAE", fmt_from_row(row, "farm_attack_probability_mae")),
+            ("Farm hotspot overlap (top 10%)", fmt_from_row(row, "farm_attack_probability_top10_overlap")),
+            ("Farm Moran's I absolute delta", fmt_from_row(row, "farm_attack_probability_moran_i_abs_delta")),
+            ("Farm first-infection-day correlation", fmt_from_row(row, "farm_first_infection_day_correlation")),
+            ("COROP farm-risk correlation", fmt_from_row(row, "farm_corop_attack_probability_correlation")),
+            ("Reservoir field energy distance", fmt_from_row(row, "region_reservoir_field_energy_distance_mean")),
+            ("Reservoir field variogram distance", fmt_from_row(row, "region_reservoir_field_variogram_distance_mean")),
+        ]
+
         detail_tables = "".join(
-            table
-            for table in [
+            card
+            for card in [
+                kv_table_card(
+                    "Hybrid-channel summary",
+                    channel_summary_entries,
+                    note="These row-level metrics summarize whether the synthetic network preserves the relative contribution of the four hybrid transmission channels, not just the final epidemic totals.",
+                ),
+                kv_table_card(
+                    "Spatial and field summary",
+                    spatial_summary_entries,
+                    note="These row-level metrics summarize detailed farm-space agreement and the regional field-distance diagnostics that are otherwise easy to miss in the figure gallery.",
+                ),
                 table_card_from_csv(
                     outcome_distribution_csv_path,
                     "Outcome distribution summary",
                     note="Observed and synthetic scalar endpoints compared with Wasserstein distance and median location.",
+                ),
+                table_card_from_csv(
+                    daily_mean_comparison_path,
+                    "Daily mean comparison",
+                    note="Mean trajectory comparison across days for the main epidemic metrics.",
                 ),
                 table_card_from_csv(
                     daily_calibration_path,
@@ -3523,43 +5279,82 @@ def write_scientific_validation_report(
                     note="Between-panel network uncertainty separated from within-panel epidemic stochasticity.",
                 ),
                 table_card_from_csv(
+                    trajectory_distribution_csv_path,
+                    "Trajectory distribution distances",
+                    note="Energy and variogram distances for full replicate trajectory ensembles.",
+                ),
+                table_card_from_csv(
+                    lag_diagnostics_path,
+                    "Lag diagnostics",
+                    note="Best-lag correlations show whether the synthetic epidemic is shape-correct but phase-shifted.",
+                ),
+                table_card_from_csv(
+                    farm_spatial_csv_path,
+                    "Farm spatial summary",
+                    note="Farm-level network-generated attack probabilities and first-infection timing, sorted to surface the largest mismatches first.",
+                    max_rows=30,
+                    transform=transform_farm_spatial,
+                ),
+                table_card_from_csv(
+                    farm_corop_csv_path,
+                    "Farm risk by COROP",
+                    note="Farm-level network-generated attack probabilities aggregated to the COROP resolution.",
+                    max_rows=20,
+                    transform=transform_farm_corop,
+                ),
+                table_card_from_csv(
+                    region_field_scores_path,
+                    "Regional field distances",
+                    note="Daily energy and variogram distances for the reservoir, import, and export COROP fields.",
+                    max_rows=35,
+                    transform=transform_region_field,
+                ),
+                table_card_from_csv(
                     region_temporal_csv_path,
                     "Regional temporal fit",
                     note="Per-COROP temporal fit summary through time for reservoir, import, and export pressure.",
                     max_rows=40,
+                    transform=transform_region_temporal,
                 ),
             ]
-            if table
+            if card
         )
         return (
-            "<section class='section'>"
+            f"<section class='section gallery-section' id='{html.escape(section_id)}'>"
             + _render_section_heading(
                 f"{role_label}: {sample_label}",
-                control_id=f"{re.sub(r'[^a-z0-9]+', '_', sample_label.lower()).strip('_')}_visual_explain",
+                control_id=f"{slugify(sample_label)}_visual_explain",
                 explain_text=_simulation_notes_text(_simulation_figure_reading_notes()),
                 button_label="How to read this figure",
             )
             + f"<p class='subtitle'>Farm prevalence corr {fmt_from_row(row, 'farm_prevalence_curve_correlation')}, "
             + f"attack-rate W1 {fmt_from_row(row, 'farm_attack_rate_wasserstein')}, "
             + f"duration W1 {fmt_from_row(row, 'farm_duration_wasserstein')}, "
-            + f"regional reservoir spatial corr {fmt_from_row(row, 'region_reservoir_spatial_correlation_mean')}. "
-            + "These figures show temporal fit, posterior spread, and region-level spatial agreement.</p>"
+            + f"regional reservoir spatial corr {fmt_from_row(row, 'region_reservoir_spatial_correlation_mean')}, "
+            + f"farm risk corr {fmt_from_row(row, 'farm_attack_probability_correlation')}. "
+            + "These figures and tables surface temporal fit, hybrid-channel behavior, detailed farm-space agreement, and region-level spatial agreement in one place.</p>"
+            + (f"<div class='metric-pill-row'>{metric_pills_html}</div>" if metric_pills_html else "")
             + regional_links_html
             + "<div class='figure-grid figure-grid-two'>"
             + f"{figures_html}"
             + "</div>"
             + ("<div class='detail-stack'>" + detail_tables + "</div>" if detail_tables else "")
+            + "<p class='back-link'><a href='#top'>Back to top</a></p>"
             + "</section>"
         )
 
     def row_role_label(row: pd.Series) -> str:
         sample_label = str(row.get("sample_label", ""))
-        posterior_runs = pd.to_numeric(pd.Series([row.get("posterior_num_runs", 1)]), errors="coerce").fillna(1).iloc[0]
+        posterior_runs_local = pd.to_numeric(pd.Series([row.get("posterior_num_runs", 1)]), errors="coerce").fillna(1).iloc[0]
         if sample_label == str(best_curve["sample_label"]):
             return "Best curve fit"
+        if sample_label == str(best_farm_spatial["sample_label"]):
+            return "Best farm-space fit"
+        if sample_label == str(best_regional["sample_label"]):
+            return "Best regional fit"
         if sample_label == str(lowest_attack["sample_label"]):
             return "Lowest attack distance"
-        if float(posterior_runs) > 1 or "__sample_" not in sample_label:
+        if float(posterior_runs_local) > 1 or "__sample_" not in sample_label:
             return "Posterior aggregate"
         return "Run detail"
 
@@ -3567,9 +5362,11 @@ def write_scientific_validation_report(
         ordered = frame.copy()
         prevalence = pd.to_numeric(ordered.get("farm_prevalence_curve_correlation", np.nan), errors="coerce").fillna(-np.inf)
         attack = pd.to_numeric(ordered.get("farm_attack_rate_wasserstein", np.nan), errors="coerce").fillna(np.inf)
-        posterior_runs_source = ordered["posterior_num_runs"] if "posterior_num_runs" in ordered.columns else pd.Series(1.0, index=ordered.index)
-        posterior_runs = pd.to_numeric(posterior_runs_source, errors="coerce").fillna(1.0)
-        ordered["_gallery_is_aggregate"] = ((posterior_runs > 1.0) | ~ordered["sample_label"].astype(str).str.contains("__sample_", regex=False)).astype(int)
+        posterior_runs_local = pd.to_numeric(
+            ordered["posterior_num_runs"] if "posterior_num_runs" in ordered.columns else pd.Series(1.0, index=ordered.index),
+            errors="coerce",
+        ).fillna(1.0)
+        ordered["_gallery_is_aggregate"] = ((posterior_runs_local > 1.0) | ~ordered["sample_label"].astype(str).str.contains("__sample_", regex=False)).astype(int)
         ordered["_gallery_prevalence"] = prevalence
         ordered["_gallery_attack"] = attack
         ordered = ordered.sort_values(
@@ -3587,16 +5384,31 @@ def write_scientific_validation_report(
             return "n/a"
         return f"{float(values.median()):.3f}"
 
+    coverage_table_html, median_completeness_value = coverage_matrix_html(gallery_rows(headline_source))
     median_prevalence_coverage = column_median(headline_rows, "farm_prevalence_interval_coverage")
     median_attack_network_share = column_median(headline_rows, "farm_attack_rate_network_uncertainty_share")
     median_region_reservoir_spatial = column_median(headline_rows, "region_reservoir_spatial_correlation_mean")
+    median_farm_spatial_corr = column_median(headline_rows, "farm_attack_probability_correlation")
+    median_hybrid_corr = row_mean_text(
+        headline_rows,
+        [
+            "farm_hazard_ff_curve_correlation",
+            "farm_hazard_rf_curve_correlation",
+            "region_pressure_fr_curve_correlation",
+            "region_pressure_rr_curve_correlation",
+        ],
+    )
+    median_completeness = f"{median_completeness_value * 100.0:.0f}%" if median_completeness_value is not None else "n/a"
 
     selected_columns = [
         ("sample_label", "Setting"),
         ("farm_prevalence_curve_correlation", "Farm prevalence corr"),
         ("farm_incidence_curve_correlation", "Farm incidence corr"),
+        ("farm_prevalence_mean_curve_correlation", "Farm prevalence mean corr"),
+        ("farm_incidence_mean_curve_correlation", "Farm incidence mean corr"),
         ("farm_cumulative_incidence_curve_correlation", "Cum. incidence corr"),
         ("reservoir_total_curve_correlation", "Reservoir corr"),
+        ("farm_attack_probability_correlation", "Farm risk corr"),
         ("region_reservoir_spatial_correlation_mean", "Region reservoir spatial corr"),
         ("region_reservoir_temporal_correlation_mean", "Region reservoir temporal corr"),
         ("farm_attack_rate_wasserstein", "Farm attack-rate W1"),
@@ -3608,9 +5420,13 @@ def write_scientific_validation_report(
     available_columns = [(key, label) for key, label in selected_columns if key in summary_rows.columns or key == "sample_label"]
     table_header = "".join(f"<th>{html.escape(label)}</th>" for _, label in available_columns)
     table_rows = []
-    for _, row in headline_rows.sort_values(
-        ["farm_prevalence_curve_correlation", "farm_attack_rate_wasserstein"],
-        ascending=[False, True],
+    for _, row in sort_frame_by_available(
+        headline_rows,
+        [
+            ("farm_prevalence_curve_correlation", False),
+            ("farm_attack_probability_correlation", False),
+            ("farm_attack_rate_wasserstein", True),
+        ],
     ).head(12).iterrows():
         cells = []
         for key, _ in available_columns:
@@ -3619,6 +5435,66 @@ def write_scientific_validation_report(
             else:
                 cells.append(f"<td>{fmt_from_row(row, key)}</td>")
         table_rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    hybrid_columns = [
+        ("sample_label", "Setting"),
+        ("farm_hazard_ff_curve_correlation", "F→F corr"),
+        ("farm_hazard_rf_curve_correlation", "R→F corr"),
+        ("region_pressure_fr_curve_correlation", "F→R corr"),
+        ("region_pressure_rr_curve_correlation", "R→R corr"),
+        ("farm_hazard_rf_share_wasserstein", "R→F share W1"),
+        ("region_pressure_rr_share_wasserstein", "R→R share W1"),
+    ]
+    available_hybrid = [(key, label) for key, label in hybrid_columns if key in summary_rows.columns or key == "sample_label"]
+    hybrid_rows = []
+    if len(available_hybrid) > 1:
+        hybrid_sorted = sort_frame_by_available(
+            headline_rows,
+            [
+                ("farm_hazard_ff_curve_correlation", False),
+                ("farm_hazard_rf_curve_correlation", False),
+                ("region_pressure_fr_curve_correlation", False),
+                ("region_pressure_rr_curve_correlation", False),
+            ],
+        ).head(12)
+        for _, row in hybrid_sorted.iterrows():
+            cells = []
+            for key, _ in available_hybrid:
+                if key == "sample_label":
+                    cells.append(f"<td>{html.escape(str(row.get(key)))}</td>")
+                else:
+                    cells.append(f"<td>{fmt_from_row(row, key)}</td>")
+            hybrid_rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    farm_space_columns = [
+        ("sample_label", "Setting"),
+        ("farm_attack_probability_correlation", "Farm risk corr"),
+        ("farm_attack_probability_mae", "Farm risk MAE"),
+        ("farm_attack_probability_top10_overlap", "Farm hotspot overlap"),
+        ("farm_attack_probability_moran_i_abs_delta", "Farm Moran Δ"),
+        ("farm_corop_attack_probability_correlation", "COROP farm-risk corr"),
+        ("farm_first_infection_day_correlation", "First-infection corr"),
+    ]
+    available_farm_space = [(key, label) for key, label in farm_space_columns if key in summary_rows.columns or key == "sample_label"]
+    farm_space_rows = []
+    if len(available_farm_space) > 1:
+        farm_space_sorted = sort_frame_by_available(
+            headline_rows,
+            [
+                ("farm_attack_probability_correlation", False),
+                ("farm_attack_probability_top10_overlap", False),
+                ("farm_corop_attack_probability_correlation", False),
+                ("farm_attack_probability_mae", True),
+            ],
+        ).head(12)
+        for _, row in farm_space_sorted.iterrows():
+            cells = []
+            for key, _ in available_farm_space:
+                if key == "sample_label":
+                    cells.append(f"<td>{html.escape(str(row.get(key)))}</td>")
+                else:
+                    cells.append(f"<td>{fmt_from_row(row, key)}</td>")
+            farm_space_rows.append("<tr>" + "".join(cells) + "</tr>")
 
     uncertainty_columns = [
         ("sample_label", "Setting"),
@@ -3633,13 +5509,13 @@ def write_scientific_validation_report(
     uncertainty_header = "".join(f"<th>{html.escape(label)}</th>" for _, label in available_uncertainty)
     uncertainty_rows = []
     if len(available_uncertainty) > 1:
-        for _, row in headline_rows.sort_values(
+        for _, row in sort_frame_by_available(
+            headline_rows,
             [
-                "farm_prevalence_interval_coverage" if "farm_prevalence_interval_coverage" in headline_rows.columns else "farm_prevalence_curve_correlation",
-                "farm_attack_rate_network_uncertainty_share" if "farm_attack_rate_network_uncertainty_share" in headline_rows.columns else "farm_attack_rate_wasserstein",
+                ("farm_prevalence_interval_coverage", False),
+                ("farm_attack_rate_network_uncertainty_share", False),
+                ("farm_attack_rate_wasserstein", True),
             ],
-            ascending=[False, False],
-            na_position="last",
         ).head(12).iterrows():
             cells = []
             for key, _ in available_uncertainty:
@@ -3658,22 +5534,21 @@ def write_scientific_validation_report(
         ("region_import_temporal_correlation_mean", "Import temporal corr"),
         ("region_export_temporal_correlation_mean", "Export temporal corr"),
         ("region_reservoir_hotspot_overlap_mean", "Reservoir hotspot overlap"),
+        ("region_reservoir_field_energy_distance_mean", "Reservoir field ED"),
+        ("region_reservoir_field_variogram_distance_mean", "Reservoir field VD"),
     ]
     available_regional = [(key, label) for key, label in regional_columns if key in summary_rows.columns or key == "sample_label"]
     regional_header = "".join(f"<th>{html.escape(label)}</th>" for _, label in available_regional)
     regional_rows = []
     if len(available_regional) > 1:
-        regional_sort_keys = [key for key in [
-            "region_reservoir_spatial_correlation_mean",
-            "region_reservoir_temporal_correlation_mean",
-            "region_import_spatial_correlation_mean",
-        ] if key in headline_rows.columns]
-        if not regional_sort_keys:
-            regional_sort_keys = ["sample_label"]
-        regional_sorted = headline_rows.sort_values(
-            regional_sort_keys,
-            ascending=[False] * len(regional_sort_keys),
-            na_position="last",
+        regional_sorted = sort_frame_by_available(
+            headline_rows,
+            [
+                ("region_reservoir_spatial_correlation_mean", False),
+                ("region_reservoir_temporal_correlation_mean", False),
+                ("region_import_spatial_correlation_mean", False),
+                ("region_reservoir_field_energy_distance_mean", True),
+            ],
         ).head(12)
         for _, row in regional_sorted.iterrows():
             cells = []
@@ -3684,27 +5559,52 @@ def write_scientific_validation_report(
                     cells.append(f"<td>{fmt_from_row(row, key)}</td>")
             regional_rows.append("<tr>" + "".join(cells) + "</tr>")
 
-    best_curve_row = (
-        f"<tr><td>Best curve fit</td><td>{html.escape(str(best_curve['sample_label']))}</td>"
-        f"<td>{fmt_from_row(best_curve, 'farm_prevalence_curve_correlation')}</td>"
-        f"<td>{fmt_from_row(best_curve, 'farm_incidence_curve_correlation')}</td>"
-        f"<td>{fmt_from_row(best_curve, 'farm_cumulative_incidence_curve_correlation')}</td>"
-        f"<td>{fmt_from_row(best_curve, 'reservoir_total_curve_correlation')}</td>"
-        f"<td>{fmt_from_row(best_curve, 'farm_attack_rate_wasserstein')}</td>"
-        f"<td>{fmt_from_row(best_curve, 'farm_peak_prevalence_wasserstein')}</td>"
-        f"<td>{fmt_from_row(best_curve, 'farm_duration_wasserstein')}</td>"
-        f"<td>{fmt_from_row(best_curve, 'farm_prevalence_interval_coverage')}</td></tr>"
+    headline_rows_html = []
+    headline_specs = [
+        ("Best curve fit", best_curve),
+        ("Best farm-space fit", best_farm_spatial),
+        ("Best regional fit", best_regional),
+        ("Lowest attack distance", lowest_attack),
+    ]
+    for role, row in headline_specs:
+        headline_rows_html.append(
+            "<tr>"
+            + f"<td>{html.escape(role)}</td>"
+            + f"<td>{html.escape(str(row.get('sample_label')))}</td>"
+            + f"<td>{fmt_from_row(row, 'farm_prevalence_curve_correlation')}</td>"
+            + f"<td>{fmt_from_row(row, 'farm_attack_probability_correlation')}</td>"
+            + f"<td>{fmt_from_row(row, 'region_reservoir_spatial_correlation_mean')}</td>"
+            + f"<td>{fmt_from_row(row, 'farm_hazard_rf_curve_correlation')}</td>"
+            + f"<td>{fmt_from_row(row, 'farm_attack_rate_wasserstein')}</td>"
+            + f"<td>{fmt_from_row(row, 'farm_duration_wasserstein')}</td>"
+            + f"<td>{fmt_from_row(row, 'region_reservoir_field_energy_distance_mean')}</td>"
+            + f"<td>{fmt_from_row(row, 'farm_prevalence_interval_coverage')}</td>"
+            + "</tr>"
+        )
+
+    top_jump_links = [
+        ("overview", "Overview"),
+        ("report-coverage", "Report coverage"),
+        ("selected-settings", "Selected settings"),
+        ("hybrid-channel-fit", "Hybrid channels"),
+        ("farm-space-fit", "Farm-space fit"),
+        ("uncertainty-calibration", "Uncertainty"),
+        ("regional-fit-summary", "Regional fit"),
+        ("headline-comparisons", "Headline comparisons"),
+        ("full-baseline-gallery", "Gallery"),
+    ]
+    jumpbar_html = "".join(
+        f"<a class='jump-chip' href='#{html.escape(anchor)}'>{html.escape(label)}</a>"
+        for anchor, label in top_jump_links
     )
-    lowest_attack_row = (
-        f"<tr><td>Lowest attack distance</td><td>{html.escape(str(lowest_attack['sample_label']))}</td>"
-        f"<td>{fmt_from_row(lowest_attack, 'farm_prevalence_curve_correlation')}</td>"
-        f"<td>{fmt_from_row(lowest_attack, 'farm_incidence_curve_correlation')}</td>"
-        f"<td>{fmt_from_row(lowest_attack, 'farm_cumulative_incidence_curve_correlation')}</td>"
-        f"<td>{fmt_from_row(lowest_attack, 'reservoir_total_curve_correlation')}</td>"
-        f"<td>{fmt_from_row(lowest_attack, 'farm_attack_rate_wasserstein')}</td>"
-        f"<td>{fmt_from_row(lowest_attack, 'farm_peak_prevalence_wasserstein')}</td>"
-        f"<td>{fmt_from_row(lowest_attack, 'farm_duration_wasserstein')}</td>"
-        f"<td>{fmt_from_row(lowest_attack, 'farm_prevalence_interval_coverage')}</td></tr>"
+    setting_jumpbar_html = "".join(
+        f"<a class='jump-chip jump-chip-soft' href='#{html.escape(section_id_for_sample(row.get('sample_label')))}'>{html.escape(_setting_display_payload(str(row.get('sample_label')))['short_label'])}</a>"
+        for _, row in gallery_rows(summary_rows).iterrows()
+    )
+
+    gallery_sections = "".join(
+        setting_visual_section(row, row_role_label(row))
+        for _, row in gallery_rows(summary_rows).iterrows()
     )
 
     html_parts = [
@@ -3723,44 +5623,367 @@ def write_scientific_validation_report(
           --text: #22313f;
           --muted: #5f6f7f;
           --line: #dce3ea;
+          --line-strong: #c8d4e0;
           --blue: #2a6fbb;
+          --blue-soft: #edf4fb;
+          --shadow: 0 10px 28px rgba(34, 49, 63, 0.06);
         }
         * { box-sizing: border-box; }
-        body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background: var(--bg); color: var(--text); }
-        .page { max-width: 1200px; margin: 0 auto; padding: 28px 20px 56px; }
-        .hero { margin-bottom: 22px; }
-        .eyebrow { color: var(--blue); text-transform: uppercase; letter-spacing: 0.14em; font-weight: 700; font-size: 12px; margin-bottom: 10px; }
-        h1 { margin: 0 0 8px; font-size: 31px; }
-        .subtitle { color: var(--muted); max-width: 900px; line-height: 1.55; }
-        .summary-grid { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 14px; margin-top: 18px; }
-        .summary-card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 16px 18px; }
-        .summary-card h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; }
-        .metric-value { font-size: 34px; font-weight: 700; line-height: 1; }
-        .section { margin-top: 24px; }
-        .section-heading { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
+        html { scroll-behavior: smooth; }
+        body {
+          font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+          margin: 0;
+          background: linear-gradient(180deg, #f6f8fb 0%, #eef3f8 100%);
+          color: var(--text);
+        }
+        a { color: var(--blue); }
+        .page { max-width: 1480px; margin: 0 auto; padding: 28px 20px 64px; }
+        .hero { margin-bottom: 24px; }
+        .eyebrow {
+          color: var(--blue);
+          text-transform: uppercase;
+          letter-spacing: 0.14em;
+          font-weight: 700;
+          font-size: 12px;
+          margin-bottom: 10px;
+        }
+        h1 { margin: 0 0 8px; font-size: clamp(28px, 4vw, 34px); }
+        .subtitle { color: var(--muted); max-width: 1040px; line-height: 1.6; }
+        .summary-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+          gap: 14px;
+          margin-top: 18px;
+        }
+        .summary-card {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 16px;
+          padding: 16px 18px;
+          box-shadow: var(--shadow);
+          min-width: 0;
+        }
+        .summary-card h3 {
+          margin: 0 0 6px;
+          font-size: 12px;
+          color: var(--muted);
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+        }
+        .metric-value {
+          font-size: clamp(22px, 3vw, 34px);
+          font-weight: 700;
+          line-height: 1.05;
+          overflow-wrap: anywhere;
+        }
+        .jumpbar {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin-top: 16px;
+        }
+        .jump-chip {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+          padding: 8px 12px;
+          border-radius: 999px;
+          border: 1px solid rgba(42, 111, 187, 0.18);
+          background: #ffffff;
+          color: var(--blue);
+          text-decoration: none;
+          font-size: 13px;
+          font-weight: 600;
+          box-shadow: 0 6px 14px rgba(42, 111, 187, 0.06);
+        }
+        .jump-chip:hover { background: var(--blue-soft); }
+        .jump-chip-soft {
+          background: #fbfdff;
+          color: var(--text);
+          border-color: var(--line);
+        }
+        .section { margin-top: 26px; scroll-margin-top: 18px; }
+        .gallery-section { padding-top: 4px; }
+        .section-heading {
+          display: flex;
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 10px;
+          margin-bottom: 12px;
+        }
         .section-heading h2 { margin: 0; }
-        .figure-grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
-        .figure-grid-two { grid-template-columns: 1fr 1fr; }
+        .figure-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+          gap: 16px;
+        }
+        .figure-grid-two { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
         .summary-card, .figure-card, .artifact-card, .table-card { min-width: 0; }
         .figure-grid > *, .detail-stack > * { min-width: 0; }
-        .figure-card { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 18px; }
+        .figure-card {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          border-radius: 18px;
+          padding: 18px;
+          box-shadow: var(--shadow);
+        }
+        .figure-card h3 { margin: 0 0 10px; font-size: 16px; }
         .figure-frame { min-width: 0; overflow: hidden; padding: 10px; border-radius: 14px; background: linear-gradient(180deg, #f7fafc 0%, #eef4f8 100%); border: 1px solid var(--line); }
-        .figure-card img { width: 100%; max-width: 100%; height: auto; border-radius: 12px; display: block; background: var(--panel-soft); }
-        .figure-card figcaption { margin-top: 10px; color: var(--muted); font-size: 13px; }
-        .report-table { width: 100%; min-width: 100%; border-collapse: separate; border-spacing: 0; background: var(--panel); font-size: 14px; }
-        .report-table th, .report-table td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; font-size: 14px; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
-        .report-table th { background: #eef4f8; font-weight: 700; }
+        .figure-card img {
+          width: 100%;
+          max-width: 100%;
+          height: auto;
+          border-radius: 12px;
+          display: block;
+          background: var(--panel-soft);
+        }
+        .figure-popout-button {
+          width: 100%;
+          padding: 0;
+          border: 0;
+          background: transparent;
+          cursor: zoom-in;
+        }
+        .figure-popout-button:focus-visible {
+          outline: 2px solid var(--blue);
+          outline-offset: 4px;
+          border-radius: 16px;
+        }
+        .figure-popout-button img { transition: transform 140ms ease; }
+        .figure-popout-button:hover img { transform: scale(1.01); }
+        .figure-card figcaption { margin-top: 10px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+        .link-card .link-card-inner {
+          min-height: 100%;
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+        }
+        .card-link { margin: 14px 0 0; }
+        .card-link a {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          padding: 10px 14px;
+          border-radius: 10px;
+          border: 1px solid rgba(42, 111, 187, 0.22);
+          background: var(--blue-soft);
+          text-decoration: none;
+          font-weight: 700;
+        }
+        .report-table {
+          width: 100%;
+          min-width: 100%;
+          border-collapse: separate;
+          border-spacing: 0;
+          background: var(--panel);
+          font-size: 14px;
+        }
+        .report-table th, .report-table td {
+          padding: 10px 12px;
+          border-bottom: 1px solid var(--line);
+          text-align: left;
+          font-size: 14px;
+          white-space: normal;
+          overflow-wrap: anywhere;
+          word-break: break-word;
+          vertical-align: top;
+        }
+        .dataframe.report-table {
+          width: max-content;
+          min-width: 100%;
+        }
+        .dataframe.report-table th, .dataframe.report-table td {
+          white-space: nowrap;
+          overflow-wrap: normal;
+          word-break: normal;
+        }
+        .report-table thead th {
+          background: #eef4f8;
+          font-weight: 700;
+          position: sticky;
+          top: 0;
+          z-index: 2;
+        }
+        .report-table tbody tr:nth-child(even) td { background: #fbfdff; }
         .report-table tr:last-child td { border-bottom: 0; }
-        .table-wrap { max-width: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 16px; background: var(--panel-soft); -webkit-overflow-scrolling: touch; }
-        .artifact-card { margin-bottom: 16px; padding: 14px 16px; border-radius: 16px; border: 1px solid var(--line); background: var(--panel); }
+        .compact-table th { width: 64%; background: #f7fafc; position: static; }
+        .compact-table th, .compact-table td {
+          white-space: normal;
+          overflow-wrap: anywhere;
+          word-break: break-word;
+        }
+        .status-cell { text-align: center; }
+        .status-ok {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 24px;
+          min-height: 24px;
+          border-radius: 999px;
+          background: #e7f6ee;
+          color: #1f8a4c;
+          font-weight: 800;
+        }
+        .status-missing {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 24px;
+          min-height: 24px;
+          border-radius: 999px;
+          background: #fff1f0;
+          color: #c4483a;
+          font-weight: 800;
+        }
+        .table-wrap { max-width: 100%; overflow: auto; max-height: 560px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel-soft); -webkit-overflow-scrolling: touch; }
+        .artifact-card {
+          margin-bottom: 16px;
+          padding: 14px 16px;
+          border-radius: 16px;
+          border: 1px solid var(--line);
+          background: var(--panel);
+          box-shadow: var(--shadow);
+        }
         .artifact-card h3 { margin: 0 0 10px; font-size: 14px; }
-        .artifact-list { margin: 0; padding-left: 18px; color: var(--muted); }
-        .artifact-list li { margin: 6px 0; }
+        .artifact-list {
+          margin: 0;
+          padding-left: 18px;
+          color: var(--muted);
+          column-width: 240px;
+          column-gap: 18px;
+        }
+        .artifact-list li { margin: 6px 0; break-inside: avoid; }
         .detail-stack { display: grid; gap: 16px; margin-top: 16px; }
-        .table-card { padding: 16px 18px; border-radius: 18px; border: 1px solid var(--line); background: var(--panel); }
+        .table-card {
+          padding: 16px 18px;
+          border-radius: 18px;
+          border: 1px solid var(--line);
+          background: var(--panel);
+          box-shadow: var(--shadow);
+        }
         .table-card h3 { margin: 0 0 10px; font-size: 16px; }
-        .table-note { margin: 0 0 12px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+        .table-note { margin: 0 0 12px; color: var(--muted); font-size: 13px; line-height: 1.55; }
         .gallery-stack { display: grid; gap: 22px; }
+        .metric-pill-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin: 14px 0 14px;
+        }
+        .metric-pill {
+          padding: 7px 10px;
+          border-radius: 999px;
+          background: #eef4f8;
+          color: var(--text);
+          font-size: 13px;
+          font-weight: 600;
+        }
+        .figure-overlay[hidden] { display: none; }
+        .figure-overlay {
+          position: fixed;
+          inset: 0;
+          z-index: 1000;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 20px;
+        }
+        .figure-overlay-backdrop {
+          position: absolute;
+          inset: 0;
+          background: rgba(17, 25, 33, 0.78);
+          backdrop-filter: blur(3px);
+        }
+        .figure-overlay-panel {
+          position: relative;
+          z-index: 1;
+          width: min(1240px, 100%);
+          max-height: calc(100vh - 40px);
+          display: grid;
+          grid-template-rows: auto minmax(0, 1fr) auto;
+          gap: 12px;
+          padding: 18px;
+          border-radius: 20px;
+          border: 1px solid rgba(220, 227, 234, 0.45);
+          background: rgba(247, 250, 252, 0.98);
+          box-shadow: 0 24px 60px rgba(17, 25, 33, 0.28);
+        }
+        .figure-overlay-toolbar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          flex-wrap: wrap;
+        }
+        .figure-overlay-title {
+          font-size: 16px;
+          font-weight: 700;
+          color: var(--text);
+        }
+        .figure-overlay-actions {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .overlay-button {
+          appearance: none;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 42px;
+          min-height: 38px;
+          padding: 8px 12px;
+          border-radius: 10px;
+          border: 1px solid rgba(42, 111, 187, 0.18);
+          background: #ffffff;
+          color: var(--text);
+          text-decoration: none;
+          font: inherit;
+          font-size: 14px;
+          font-weight: 700;
+          cursor: pointer;
+        }
+        .overlay-button:hover { background: var(--blue-soft); }
+        .overlay-button-primary {
+          background: var(--blue-soft);
+          color: var(--blue);
+        }
+        .figure-overlay-stage {
+          min-height: 0;
+          overflow: auto;
+          border-radius: 16px;
+          border: 1px solid var(--line);
+          background: linear-gradient(180deg, #f7fafc 0%, #eef4f8 100%);
+          display: flex;
+          align-items: flex-start;
+          justify-content: center;
+          padding: 18px;
+        }
+        .figure-overlay-stage img {
+          display: block;
+          max-width: 100%;
+          height: auto;
+          transform-origin: top center;
+          transition: transform 120ms ease;
+          box-shadow: 0 14px 36px rgba(34, 49, 63, 0.16);
+          border-radius: 12px;
+          background: #ffffff;
+        }
+        .figure-overlay-caption {
+          margin: 0;
+          color: var(--muted);
+          font-size: 13px;
+          line-height: 1.55;
+        }
+        body.overlay-open { overflow: hidden; }
+        .back-link { margin: 14px 0 0; }
+        .back-link a {
+          text-decoration: none;
+          font-size: 13px;
+          font-weight: 600;
+        }
         .explain-widget { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
         .explain-button {
           appearance: none;
@@ -3782,7 +6005,9 @@ def write_scientific_validation_report(
           box-shadow: 0 10px 20px rgba(42,111,187,0.12);
           border-color: rgba(42,111,187,0.36);
         }
-        .explain-button[aria-expanded="true"] { background: linear-gradient(180deg, #edf4f9 0%, #e2edf6 100%); }
+        .explain-button[aria-expanded="true"] {
+          background: linear-gradient(180deg, #edf4f9 0%, #e2edf6 100%);
+        }
         .explain-panel {
           width: 100%;
           padding: 12px 14px;
@@ -3795,18 +6020,29 @@ def write_scientific_validation_report(
         }
         .explain-panel p { margin: 0; color: var(--muted); }
         .muted { color: var(--muted); }
-        @media (max-width: 1180px) { .summary-grid { grid-template-columns: 1fr 1fr; } }
-        @media (max-width: 980px) { .figure-grid-two { grid-template-columns: 1fr; } }
-        @media (max-width: 640px) { .summary-grid { grid-template-columns: 1fr; } }
+        @media (max-width: 980px) {
+          .figure-grid-two { grid-template-columns: 1fr; }
+          .artifact-list { column-width: auto; }
+        }
+        @media (max-width: 640px) {
+          .page { padding-left: 14px; padding-right: 14px; }
+          .jump-chip { width: 100%; justify-content: flex-start; }
+          .metric-pill-row { gap: 8px; }
+          .figure-overlay { padding: 12px; }
+          .figure-overlay-panel { max-height: calc(100vh - 24px); padding: 14px; }
+          .figure-overlay-stage { padding: 12px; }
+          .overlay-button { flex: 1 1 auto; }
+        }
         """,
+        _scenario_navigation_css(),
         "</style>",
         "</head>",
         "<body>",
-        "<main class='page'>",
+        "<main class='page' id='top'>",
         "<section class='hero'>",
         "<div class='eyebrow'>Hybrid transmission validation</div>",
         f"<h1>{html.escape(title)}</h1>",
-        "<p class='subtitle'>This report compares farm-focused epidemic outcomes on the observed temporal panel with outcomes on synthetic panels drawn from the fitted temporal block model. It reports fit metrics, posterior-predictive coverage, and, when repeated panels are available, the share of variance attributable to between-panel network differences.</p>",
+        "<p class='subtitle'>This report compares farm-focused epidemic outcomes on the observed temporal panel with outcomes on synthetic panels drawn from the fitted temporal block model. In addition to the aggregate epidemic trajectories, it now surfaces hybrid-channel diagnostics, detailed farm-space risk agreement, regional spatial and temporal fit, and a coverage matrix that checks whether the expected figures and key tables are actually present in the final report bundle.</p>",
         "<div class='summary-grid'>",
         "<div class='summary-card'><h3>Settings</h3><div class='metric-value'>" + str(int(len(headline_rows))) + "</div></div>",
         "<div class='summary-card'><h3>Run details</h3><div class='metric-value'>" + str(int(len(detail_rows))) + "</div></div>",
@@ -3814,21 +6050,47 @@ def write_scientific_validation_report(
         "<div class='summary-card'><h3>Lowest farm attack-rate W1</h3><div class='metric-value'>" + f"{float(pd.to_numeric(headline_rows['farm_attack_rate_wasserstein'], errors='coerce').min()):.3f}" + "</div></div>",
         "<div class='summary-card'><h3>Median prev. coverage</h3><div class='metric-value'>" + html.escape(median_prevalence_coverage) + "</div></div>",
         "<div class='summary-card'><h3>Median region spatial corr</h3><div class='metric-value'>" + html.escape(median_region_reservoir_spatial) + "</div></div>",
-        "<div class='summary-card'><h3>Median attack network share</h3><div class='metric-value'>" + html.escape(median_attack_network_share) + "</div></div>",
+        "<div class='summary-card'><h3>Median farm risk corr</h3><div class='metric-value'>" + html.escape(median_farm_spatial_corr) + "</div></div>",
+        "<div class='summary-card'><h3>Median hybrid channel corr</h3><div class='metric-value'>" + html.escape(median_hybrid_corr) + "</div></div>",
+        "<div class='summary-card'><h3>Median report completeness</h3><div class='metric-value'>" + html.escape(median_completeness) + "</div></div>",
+        "</div>",
+        "<div class='jumpbar'>",
+        jumpbar_html,
+        "</div>",
+        "<div class='jumpbar'>",
+        setting_jumpbar_html,
         "</div>",
         "</section>",
-        "<section class='section'>",
+        scenario_navigation_html,
+        "<section class='section' id='overview'>",
         _render_section_heading(
             "Overview",
             control_id="overview_section_explain",
-            explain_text="This figure ranks settings on the main transmission-fit metrics. Correlations are higher-is-better, while Wasserstein distances are lower-is-better. Use it as the first pass before opening the per-setting dashboards.",
+            explain_text="This figure ranks settings on the main transmission-fit metrics across farm curves, farm-space risk, and regional-space agreement. Correlations are higher-is-better, while Wasserstein and field distances are lower-is-better. Use it as the first pass before opening the per-setting dashboards.",
             button_label="How to read this figure",
         ),
         "<div class='figure-grid'>",
-        figure_tag(overview_path, "Across-setting overview of farm-focused transmission validation metrics. Correlations are higher-is-better; Wasserstein distances are lower-is-better."),
+        figure_tag(overview_path, "Across-setting overview of temporal, farm-space, and region-space transmission validation metrics. Correlations are higher-is-better; Wasserstein distances are lower-is-better.", title_text="Across-setting overview"),
         "</div>",
         "</section>",
-        "<section class='section'>",
+    ]
+
+    if coverage_table_html:
+        html_parts.extend([
+            "<section class='section' id='report-coverage'>",
+            _render_section_heading(
+                "Report coverage matrix",
+                control_id="report_coverage_explain",
+                explain_text="This table is a completeness check for the report bundle itself. A row is stronger when it has all core figures plus the key tables that support the new hybrid-channel, farm-space, and regional-field diagnostics.",
+                button_label="How to read this table",
+            ),
+            "<p class='subtitle'>This matrix checks whether each setting-level report actually contains the expected visualizations and key detail tables. It helps catch cases where a metric was computed but never surfaced in the final HTML or linked artifact bundle.</p>",
+            table_card_from_html(coverage_table_html),
+            "</section>",
+        ])
+
+    html_parts.extend([
+        "<section class='section' id='selected-settings'>",
         _render_section_heading(
             "Selected settings",
             control_id="selected_settings_explain",
@@ -3843,27 +6105,53 @@ def write_scientific_validation_report(
             + "</tbody></table>"
         ),
         "</section>",
-        "<section class='section'>",
-        _render_section_heading(
-            "Headline comparisons",
-            control_id="headline_comparisons_explain",
-            explain_text="These rows are the quick shortlist. Compare them by reading across each metric family rather than focusing on one number. Higher correlations and coverage are better, while lower Wasserstein distances mean tighter endpoint agreement.",
-            button_label="How to read this table",
-        ),
-        table_card_from_html(
-            "<table class='report-table'>"
-            + "<thead><tr><th>Role</th><th>Setting</th><th>Farm prevalence corr</th><th>Farm incidence corr</th><th>Cum. incidence corr</th><th>Reservoir corr</th><th>Farm attack-rate W1</th><th>Farm peak-prev W1</th><th>Farm duration W1</th><th>Prev. 90% coverage</th></tr></thead>"
-            + "<tbody>"
-            + best_curve_row
-            + lowest_attack_row
-            + "</tbody></table>"
-        ),
-        "</section>",
-    ]
+    ])
+
+    if hybrid_rows:
+        html_parts.extend([
+            "<section class='section' id='hybrid-channel-fit'>",
+            _render_section_heading(
+                "Hybrid-channel fit summary",
+                control_id="hybrid_channel_fit_explain",
+                explain_text="These columns make the coupling structure explicit. Higher correlations mean the synthetic panel preserves the same day-to-day flow pattern for the four hybrid channels, while lower share Wasserstein distances mean the relative contribution of those channels is closer to the observed panel.",
+                button_label="How to read this table",
+            ),
+            "<p class='subtitle'>This section surfaces the channel-level diagnostics directly in the report so the hybrid network is evaluated on its own terms rather than only through farm-level epidemic totals.</p>",
+            table_card_from_html(
+                "<table class='report-table'>"
+                + "<thead><tr>"
+                + "".join(f"<th>{html.escape(label)}</th>" for _, label in available_hybrid)
+                + "</tr></thead><tbody>"
+                + "".join(hybrid_rows)
+                + "</tbody></table>"
+            ),
+            "</section>",
+        ])
+
+    if farm_space_rows:
+        html_parts.extend([
+            "<section class='section' id='farm-space-fit'>",
+            _render_section_heading(
+                "Farm-space fit summary",
+                control_id="farm_space_fit_explain",
+                explain_text="These metrics summarize whether the detailed farm-risk pattern is preserved. Correlation and hotspot overlap should be high, while MAE and Moran's I delta should be low if the synthetic panel preserves both local hotspots and overall clustering.",
+                button_label="How to read this table",
+            ),
+            "<p class='subtitle'>This farm-space scorecard makes the detailed-resolution evaluation visible at the top level instead of leaving it buried in per-setting CSV files.</p>",
+            table_card_from_html(
+                "<table class='report-table'>"
+                + "<thead><tr>"
+                + "".join(f"<th>{html.escape(label)}</th>" for _, label in available_farm_space)
+                + "</tr></thead><tbody>"
+                + "".join(farm_space_rows)
+                + "</tbody></table>"
+            ),
+            "</section>",
+        ])
 
     if uncertainty_rows:
         html_parts.extend([
-            "<section class='section'>",
+            "<section class='section' id='uncertainty-calibration'>",
             _render_section_heading(
                 "Uncertainty and calibration",
                 control_id="uncertainty_calibration_explain",
@@ -3883,14 +6171,14 @@ def write_scientific_validation_report(
 
     if regional_rows:
         html_parts.extend([
-            "<section class='section'>",
+            "<section class='section' id='regional-fit-summary'>",
             _render_section_heading(
                 "Regional fit summary",
                 control_id="regional_fit_summary_explain",
-                explain_text="These metrics summarize how well each setting matches the observed COROP-level reservoir, import, and export patterns. Spatial correlations compare regions within each day, temporal correlations compare each COROP through time, and hotspot overlap checks whether the same high-intensity regions are highlighted.",
+                explain_text="These metrics summarize how well each setting matches the observed COROP-level reservoir, import, and export patterns. Spatial correlations compare regions within each day, temporal correlations compare each COROP through time, hotspot overlap checks whether the same high-intensity regions are highlighted, and field distances summarize whole-map mismatch.",
                 button_label="How to read this table",
             ),
-            "<p class='subtitle'>The regional table brings the new COROP-level simulation outputs into the main report so the spatial and temporal fit can be reviewed next to the farm-level epidemic summary.</p>",
+            "<p class='subtitle'>The regional table brings the COROP-level simulation outputs into the main report so the spatial and temporal fit can be reviewed next to the farm-level epidemic summary.</p>",
             table_card_from_html(
                 "<table class='report-table'>"
                 + f"<thead><tr>{regional_header}</tr></thead>"
@@ -3901,23 +6189,51 @@ def write_scientific_validation_report(
             "</section>",
         ])
 
-    gallery_sections = "".join(
-        setting_visual_section(row, row_role_label(row))
-        for _, row in gallery_rows(summary_rows).iterrows()
-    )
-
     html_parts.extend([
-        "<section class='section'>",
+        "<section class='section' id='headline-comparisons'>",
+        _render_section_heading(
+            "Headline comparisons",
+            control_id="headline_comparisons_explain",
+            explain_text="These rows are the quick shortlist across fit domains. Read them across farm trajectories, farm-space risk, regional-space fit, hybrid coupling, and calibration instead of focusing on one number. Higher correlations and coverage are better, while lower Wasserstein and field distances mean tighter agreement.",
+            button_label="How to read this table",
+        ),
+        table_card_from_html(
+            "<table class='report-table'>"
+            + "<thead><tr><th>Role</th><th>Setting</th><th>Farm prevalence corr</th><th>Farm risk corr</th><th>Region spatial corr</th><th>R→F corr</th><th>Attack W1</th><th>Duration W1</th><th>Reservoir field ED</th><th>Prev. 90% coverage</th></tr></thead>"
+            + "<tbody>"
+            + "".join(headline_rows_html)
+            + "</tbody></table>"
+        ),
+        "</section>",
+        "<section class='section' id='full-baseline-gallery'>",
         _render_section_heading(
             "Full baseline gallery",
             control_id="full_baseline_gallery_explain",
-            explain_text="This gallery embeds every generated baseline row. Use the aggregate row for the setting-level view, then inspect each run detail to check how stable the fit, calibration, and regional diagnostics are across the saved panels.",
+            explain_text="This gallery embeds every generated baseline row. Use the aggregate row for the setting-level view, then inspect each run detail to check how stable the temporal fit, hybrid coupling, farm-space agreement, and regional diagnostics are across the saved panels.",
             button_label="How to read this figure",
         ),
         "<div class='gallery-stack'>",
         gallery_sections,
         "</div>",
         "</section>",
+        "<div class='figure-overlay' id='figure_overlay' hidden aria-hidden='true'>",
+        "<div class='figure-overlay-backdrop' data-overlay-close='true'></div>",
+        "<div class='figure-overlay-panel' role='dialog' aria-modal='true' aria-labelledby='figure_overlay_title'>",
+        "<div class='figure-overlay-toolbar'>",
+        "<div class='figure-overlay-title' id='figure_overlay_title'>Figure</div>",
+        "<div class='figure-overlay-actions'>",
+        "<button type='button' class='overlay-button' id='figure_overlay_zoom_out' aria-label='Zoom out'>-</button>",
+        "<button type='button' class='overlay-button' id='figure_overlay_zoom_in' aria-label='Zoom in'>+</button>",
+        "<a class='overlay-button overlay-button-primary' id='figure_overlay_save' href='#' download>Save</a>",
+        "<button type='button' class='overlay-button' id='figure_overlay_close' data-overlay-close='true'>Close</button>",
+        "</div>",
+        "</div>",
+        "<div class='figure-overlay-stage'>",
+        "<img id='figure_overlay_image' alt=''>",
+        "</div>",
+        "<p class='figure-overlay-caption' id='figure_overlay_caption'></p>",
+        "</div>",
+        "</div>",
         "<script>",
         """
         document.querySelectorAll('.explain-button').forEach((button) => {
@@ -3928,6 +6244,71 @@ def write_scientific_validation_report(
             button.setAttribute('aria-expanded', expanded ? 'false' : 'true');
             panel.hidden = expanded;
           });
+        });
+
+        const overlay = document.getElementById('figure_overlay');
+        const overlayImage = document.getElementById('figure_overlay_image');
+        const overlayTitle = document.getElementById('figure_overlay_title');
+        const overlayCaption = document.getElementById('figure_overlay_caption');
+        const overlaySave = document.getElementById('figure_overlay_save');
+        const zoomInButton = document.getElementById('figure_overlay_zoom_in');
+        const zoomOutButton = document.getElementById('figure_overlay_zoom_out');
+        let overlayScale = 1;
+
+        function clampScale(nextScale) {
+          return Math.max(0.5, Math.min(4, nextScale));
+        }
+
+        function applyOverlayScale(nextScale) {
+          overlayScale = clampScale(nextScale);
+          overlayImage.style.transform = `scale(${overlayScale})`;
+        }
+
+        function openFigureOverlay(trigger) {
+          const imageSrc = trigger.dataset.imageSrc;
+          if (!imageSrc) return;
+          overlayImage.src = imageSrc;
+          overlayImage.alt = trigger.dataset.imageCaption || trigger.dataset.imageTitle || 'Figure';
+          overlayTitle.textContent = trigger.dataset.imageTitle || 'Figure';
+          overlayCaption.textContent = trigger.dataset.imageCaption || '';
+          overlaySave.href = imageSrc;
+          overlaySave.download = imageSrc.split('/').pop() || 'figure.png';
+          applyOverlayScale(1);
+          overlay.hidden = false;
+          overlay.setAttribute('aria-hidden', 'false');
+          document.body.classList.add('overlay-open');
+        }
+
+        function closeFigureOverlay() {
+          overlay.hidden = true;
+          overlay.setAttribute('aria-hidden', 'true');
+          overlayImage.removeAttribute('src');
+          overlaySave.href = '#';
+          document.body.classList.remove('overlay-open');
+        }
+
+        document.querySelectorAll('.figure-popout-button').forEach((button) => {
+          button.addEventListener('click', () => openFigureOverlay(button));
+        });
+
+        zoomInButton.addEventListener('click', () => applyOverlayScale(overlayScale + 0.25));
+        zoomOutButton.addEventListener('click', () => applyOverlayScale(overlayScale - 0.25));
+
+        overlay.querySelectorAll('[data-overlay-close="true"]').forEach((element) => {
+          element.addEventListener('click', closeFigureOverlay);
+        });
+
+        document.addEventListener('keydown', (event) => {
+          if (overlay.hidden) return;
+          if (event.key === 'Escape') {
+            closeFigureOverlay();
+          } else if (event.key === '+' || event.key === '=') {
+            event.preventDefault();
+            applyOverlayScale(overlayScale + 0.25);
+          } else if (event.key === '-') {
+            event.preventDefault();
+            applyOverlayScale(overlayScale - 0.25);
+          }
         });
         """,
         "</script>",
@@ -3976,6 +6357,7 @@ def _run_reality_check_for_sample(
     observed_scalar: pd.DataFrame,
     observed_daily: pd.DataFrame,
     observed_region_daily: pd.DataFrame,
+    observed_diagnostics: dict[str, object],
     observed_pack: HybridPanelPack,
     synthetic_manifest: dict,
     synthetic_edges: pd.DataFrame,
@@ -4007,12 +6389,13 @@ def _run_reality_check_for_sample(
         node_types=node_types,
     )
 
-    synthetic_scalar, synthetic_daily, synthetic_region_daily = simulate_panel(
+    synthetic_scalar, synthetic_daily, synthetic_region_daily, synthetic_diagnostics = simulate_panel(
         synthetic_pack,
         run_seeds=run_seeds,
         initial_seed_sets=initial_seed_sets,
         config=config,
         region_frame=region_frame,
+        node_frame=node_frame,
     )
     per_snapshot, summary, detailed = _compare_simulation_outputs(
         observed_scalar,
@@ -4021,6 +6404,8 @@ def _run_reality_check_for_sample(
         synthetic_scalar,
         synthetic_daily,
         synthetic_region_daily,
+        observed_diagnostics=observed_diagnostics,
+        synthetic_diagnostics=synthetic_diagnostics,
         config=config,
         sample_label=sample_label,
         setting_label=setting_label,
@@ -4169,6 +6554,30 @@ def aggregate_posterior_reports(
         if frames:
             detailed_outputs[detail_key] = _aggregate_grouped_numeric_frames(frames, group_keys=group_keys, run_labels=run_labels)
 
+    observed_scalar_path = None
+    for report in reports:
+        outputs = dict(report.get("outputs", {}))
+        observed_scalar_path = outputs.get("observed_outcomes") or observed_scalar_path
+        if observed_scalar_path and Path(str(observed_scalar_path)).exists():
+            break
+    if observed_scalar_path and Path(str(observed_scalar_path)).exists():
+        detailed_outputs["observed_outcomes"] = pd.read_csv(Path(str(observed_scalar_path)))
+
+    synthetic_scalar_frames: list[pd.DataFrame] = []
+    for report in reports:
+        outputs = dict(report.get("outputs", {}))
+        synthetic_scalar_path = outputs.get("synthetic_outcomes")
+        if not synthetic_scalar_path:
+            continue
+        synthetic_scalar_file = Path(str(synthetic_scalar_path))
+        if not synthetic_scalar_file.exists():
+            continue
+        frame = pd.read_csv(synthetic_scalar_file)
+        frame["posterior_run_label"] = str(report.get("sample_label"))
+        synthetic_scalar_frames.append(frame)
+    if synthetic_scalar_frames:
+        detailed_outputs["synthetic_outcomes"] = pd.concat(synthetic_scalar_frames, ignore_index=True, sort=False)
+
     uncertainty_decomposition = _compute_uncertainty_decomposition(
         reports,
         metric_names=[
@@ -4234,13 +6643,22 @@ def _namespace_with_overrides(args: argparse.Namespace, overrides: dict[str, obj
     return argparse.Namespace(**values)
 
 
+def _sort_by_available_scenario_rank_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    available = [(column, ascending) for column, ascending in zip(SCENARIO_RANK_COLUMNS, SCENARIO_RANK_ASCENDING) if column in frame.columns]
+    if not available:
+        return frame.copy()
+    columns = [column for column, _ in available]
+    ascending = [flag for _, flag in available]
+    return frame.sort_values(columns, ascending=ascending, na_position="last")
+
+
 def _select_best_summary_row(summary_rows: pd.DataFrame) -> pd.Series:
     if summary_rows.empty:
         raise ValueError("Cannot select a best summary row from an empty frame.")
     sample_class_series = summary_rows["sample_class"] if "sample_class" in summary_rows.columns else pd.Series(["posterior_predictive"] * len(summary_rows))
     primary_rows = summary_rows.loc[sample_class_series.astype(str) == "posterior_predictive"].reset_index(drop=True)
     candidate_rows = primary_rows if not primary_rows.empty else summary_rows.reset_index(drop=True)
-    ranked = candidate_rows.sort_values(SCENARIO_RANK_COLUMNS, ascending=SCENARIO_RANK_ASCENDING, na_position="last").reset_index(drop=True)
+    ranked = _sort_by_available_scenario_rank_columns(candidate_rows).reset_index(drop=True)
     return ranked.iloc[0]
 
 
@@ -4279,7 +6697,7 @@ def _write_scenario_summary(
     summary_frame = pd.DataFrame(rows)
     if summary_frame.empty:
         raise ValueError("Cannot write a scenario summary without any rows.")
-    summary_frame = summary_frame.sort_values(SCENARIO_RANK_COLUMNS, ascending=SCENARIO_RANK_ASCENDING, na_position="last").reset_index(drop=True)
+    summary_frame = _sort_by_available_scenario_rank_columns(summary_frame).reset_index(drop=True)
     csv_path = output_dir / "scenario_summary.csv"
     md_path = output_dir / "scenario_summary.md"
     summary_frame.to_csv(csv_path, index=False)
@@ -4405,6 +6823,9 @@ def _write_scenario_metric_heatmap(summary_rows: pd.DataFrame, output_dir: Path)
         ("farm_incidence_curve_correlation", "Inc corr", True),
         ("farm_cumulative_incidence_curve_correlation", "Cum corr", True),
         ("reservoir_total_curve_correlation", "Reservoir corr", True),
+        ("farm_attack_probability_correlation", "Farm risk corr", True),
+        ("region_reservoir_spatial_correlation_mean", "Region spatial corr", True),
+        ("region_reservoir_field_energy_distance_mean", "Region ED", False),
         ("farm_attack_rate_wasserstein", "Attack W1", False),
         ("farm_peak_prevalence_wasserstein", "Peak W1", False),
         ("farm_duration_wasserstein", "Duration W1", False),
@@ -4477,7 +6898,7 @@ def write_scenario_comparison_report(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     manifest = _load_json_if_exists(run_dir / "manifest.json") or {}
     dataset_name = str(manifest.get("dataset", "Dataset"))
-    summary_rows = summary_rows.sort_values(SCENARIO_RANK_COLUMNS, ascending=SCENARIO_RANK_ASCENDING, na_position="last").reset_index(drop=True)
+    summary_rows = _sort_by_available_scenario_rank_columns(summary_rows).reset_index(drop=True)
     best_row = summary_rows.iloc[0]
     stress_row = summary_rows.sort_values(
         ["farm_duration_wasserstein", "farm_peak_prevalence_wasserstein", "farm_attack_rate_wasserstein"],
@@ -4487,6 +6908,18 @@ def write_scenario_comparison_report(
     overview_path = write_all_samples_overview(summary_rows, scenario_dir)
     tradeoff_path = _write_scenario_tradeoff_plot(summary_rows, scenario_dir)
     heatmap_path = _write_scenario_metric_heatmap(summary_rows, scenario_dir)
+    scenario_browser_payload = _build_scenario_switch_payload(
+        summary_rows,
+        scenario_root=scenario_dir,
+        current_report_path=output_path,
+        default_scenario_name=str(best_row["scenario_name"]),
+        comparison_report_path=output_path,
+    )
+    scenario_browser_section_html = _render_scenario_browser_section(
+        scenario_browser_payload,
+        widget_id="scenario_browser",
+    )
+    scenario_browser_script_html = _scenario_browser_script("scenario_browser") if scenario_browser_section_html else ""
 
     def fmt_from_row(row: pd.Series, key: str, *, digits: int = 3) -> str:
         return _metric_text(row.get(key), digits=digits)
@@ -4526,15 +6959,21 @@ def write_scenario_comparison_report(
         scenario_path = Path(str(row["output_dir"]))
         dashboard_path = relative_asset(scenario_path / f"{setting_label}_dashboard.png")
         delta_path = relative_asset(scenario_path / f"{setting_label}_delta.png")
+        daily_mean_path = relative_asset(scenario_path / f"{setting_label}_daily_mean_compare.png")
         distribution_path = relative_asset(scenario_path / f"{setting_label}_distribution.png")
         parity_path = relative_asset(scenario_path / f"{setting_label}_parity.png")
+        channel_path = relative_asset(scenario_path / f"{setting_label}_channel_diagnostics.png")
+        farm_spatial_path = relative_asset(scenario_path / f"{setting_label}_farm_spatial_overview.png")
         report_path = relative_asset(Path(str(row["report_path"])))
         figures = "".join(
             fig for fig in [
                 figure_tag(dashboard_path, f"{scenario_name} trajectory dashboard"),
-                figure_tag(delta_path, f"{scenario_name} trajectory deltas"),
+                figure_tag(delta_path, f"{scenario_name} trajectory median deltas"),
+                figure_tag(daily_mean_path, f"{scenario_name} daily mean trajectories"),
                 figure_tag(distribution_path, f"{scenario_name} replicate distributions"),
                 figure_tag(parity_path, f"{scenario_name} parity summary"),
+                figure_tag(channel_path, f"{scenario_name} hybrid-channel diagnostics"),
+                figure_tag(farm_spatial_path, f"{scenario_name} farm-level spatial validation"),
             ]
             if fig
         )
@@ -4544,9 +6983,11 @@ def write_scenario_comparison_report(
         )
         pills = [
             f"<span class='metric-pill'>Prev corr {fmt_from_row(row, 'farm_prevalence_curve_correlation')}</span>",
+            f"<span class='metric-pill'>Prev mean corr {fmt_from_row(row, 'farm_prevalence_mean_curve_correlation')}</span>",
             f"<span class='metric-pill'>Attack W1 {fmt_from_row(row, 'farm_attack_rate_wasserstein')}</span>",
             f"<span class='metric-pill'>Peak W1 {fmt_from_row(row, 'farm_peak_prevalence_wasserstein')}</span>",
             f"<span class='metric-pill'>Duration W1 {fmt_from_row(row, 'farm_duration_wasserstein')}</span>",
+            f"<span class='metric-pill'>Farm risk corr {fmt_from_row(row, 'farm_attack_probability_correlation')}</span>",
         ]
         if "farm_prevalence_interval_coverage" in row.index:
             pills.append(
@@ -4578,8 +7019,12 @@ def write_scenario_comparison_report(
         ("scenario_name", "Scenario"),
         ("farm_prevalence_curve_correlation", "Prev corr"),
         ("farm_incidence_curve_correlation", "Inc corr"),
+        ("farm_prevalence_mean_curve_correlation", "Prev mean corr"),
+        ("farm_incidence_mean_curve_correlation", "Inc mean corr"),
         ("farm_cumulative_incidence_curve_correlation", "Cum corr"),
         ("reservoir_total_curve_correlation", "Reservoir corr"),
+        ("farm_attack_probability_correlation", "Farm risk corr"),
+        ("region_reservoir_field_energy_distance_mean", "Region ED"),
         ("farm_attack_rate_wasserstein", "Attack W1"),
         ("farm_peak_prevalence_wasserstein", "Peak W1"),
         ("farm_duration_wasserstein", "Duration W1"),
@@ -4596,6 +7041,18 @@ def write_scenario_comparison_report(
         ("reservoir_total_interval_coverage", "Reservoir 90% cov"),
     ]
     available_daily = [(key, label) for key, label in daily_calibration_columns if key in summary_rows.columns]
+    daily_mean_columns = [
+        ("scenario_name", "Scenario"),
+        ("farm_prevalence_mean_curve_correlation", "Prev mean corr"),
+        ("farm_incidence_mean_curve_correlation", "Inc mean corr"),
+        ("farm_cumulative_incidence_mean_curve_correlation", "Cum mean corr"),
+        ("reservoir_total_mean_curve_correlation", "Reservoir mean corr"),
+        ("farm_prevalence_mean_curve_mae", "Prev mean MAE"),
+        ("farm_incidence_mean_curve_mae", "Inc mean MAE"),
+        ("farm_cumulative_incidence_mean_curve_mae", "Cum mean MAE"),
+        ("reservoir_total_mean_curve_mae", "Reservoir mean MAE"),
+    ]
+    available_daily_mean = [(key, label) for key, label in daily_mean_columns if key in summary_rows.columns]
 
     scalar_uncertainty_columns = [
         ("scenario_name", "Scenario"),
@@ -4640,15 +7097,15 @@ def write_scenario_comparison_report(
         h2 { margin: 0 0 12px; font-size: 22px; }
         h3 { margin: 0; font-size: 19px; }
         .subtitle { color: var(--muted); max-width: 980px; line-height: 1.6; }
-        .summary-grid { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 14px; margin-top: 18px; }
+        .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px,1fr)); gap: 14px; margin-top: 18px; }
         .summary-card, .scenario-card { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 18px; }
         .summary-card h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; }
-        .metric-value { font-size: 34px; font-weight: 700; line-height: 1; }
+        .metric-value { font-size: clamp(22px, 3vw, 34px); font-weight: 700; line-height: 1.05; overflow-wrap: anywhere; }
         .section { margin-top: 28px; }
         .section-heading { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
         .section-heading h2 { margin: 0; }
         .figure-grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
-        .figure-grid-two { grid-template-columns: 1fr 1fr; }
+        .figure-grid-two { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
         .figure-card { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 18px; }
         .figure-frame { padding: 10px; border-radius: 14px; background: linear-gradient(180deg, #f7fafc 0%, #eef4f8 100%); border: 1px solid var(--line); }
         .figure-card img { width: 100%; border-radius: 12px; display: block; background: var(--panel-soft); }
@@ -4702,6 +7159,7 @@ def write_scenario_comparison_report(
         @media (max-width: 1024px) { .summary-grid { grid-template-columns: 1fr 1fr; } .figure-grid-two { grid-template-columns: 1fr; } }
         @media (max-width: 640px) { .summary-grid { grid-template-columns: 1fr; } }
         """,
+        _scenario_navigation_css(),
         "</style>",
         "</head>",
         "<body>",
@@ -4718,6 +7176,7 @@ def write_scenario_comparison_report(
         "<div class='summary-card'><h3>Median attack net share</h3><div class='metric-value'>" + html.escape(median_attack_network_share) + "</div></div>",
         "</div>",
         "</section>",
+        scenario_browser_section_html,
         "<section class='section'>",
         _render_section_heading(
             "Scenario comparison",
@@ -4792,6 +7251,39 @@ def write_scenario_comparison_report(
             ]
         )
 
+    if len(available_daily_mean) > 1:
+        html_parts.extend(
+            [
+                "<section class='section'>",
+                _render_section_heading(
+                    "Daily mean comparison",
+                    control_id="daily_mean_comparison_explain",
+                    explain_text="These columns compare the mean trajectory across replicates for each day. Higher correlations mean the timing and shape line up well, while lower mean absolute error means the daily gap stays small.",
+                    button_label="How to read this table",
+                ),
+                "<p class='subtitle'>These columns summarize the daywise mean trajectory fit. They are helpful when the median stays flat at zero for long stretches and hides smaller shifts in timing or scale.</p>",
+                "<div class='table-wrap'>",
+                "<table class='report-table'>",
+                "<thead><tr>" + "".join(f"<th>{html.escape(label)}</th>" for _, label in available_daily_mean) + "</tr></thead>",
+                "<tbody>",
+            ]
+        )
+        for _, row in summary_rows.iterrows():
+            cells = []
+            for key, _ in available_daily_mean:
+                if key == "scenario_name":
+                    cells.append(f"<td>{html.escape(str(row.get(key)))}</td>")
+                else:
+                    cells.append(f"<td>{fmt_from_row(row, key)}</td>")
+            html_parts.append("<tr>" + "".join(cells) + "</tr>")
+        html_parts.extend(
+            [
+                "</tbody></table>",
+                "</div>",
+                "</section>",
+            ]
+        )
+
     if len(available_scalar_uncertainty) > 1:
         html_parts.extend(
             [
@@ -4850,6 +7342,7 @@ def write_scenario_comparison_report(
               });
             });
             """,
+            scenario_browser_script_html,
             "</script>",
             "</main></body></html>",
         ]
@@ -4955,12 +7448,13 @@ def _run_single_configuration(
         synthetic_day0_activity_mask=synthetic_day0_activity_mask,
         config=config,
     )
-    observed_scalar, observed_daily, observed_region_daily = simulate_panel(
+    observed_scalar, observed_daily, observed_region_daily, observed_diagnostics = simulate_panel(
         observed_pack,
         run_seeds=run_seeds,
         initial_seed_sets=initial_seed_sets,
         config=config,
         region_frame=region_frame,
+        node_frame=node_frame,
     )
     observed_scalar.to_csv(output_dir / "observed_outcomes.csv", index=False)
     observed_daily.to_csv(output_dir / "observed_daily.csv", index=False)
@@ -4972,6 +7466,7 @@ def _run_single_configuration(
             observed_scalar=observed_scalar,
             observed_daily=observed_daily,
             observed_region_daily=observed_region_daily,
+            observed_diagnostics=observed_diagnostics,
             observed_pack=observed_pack,
             synthetic_manifest=sample_manifest,
             synthetic_edges=synthetic_frame,
@@ -5068,12 +7563,16 @@ def run_command(args: argparse.Namespace) -> dict[str, object]:
     if str(getattr(args, "scenario_set", "single")) != "major":
         return _run_single_configuration(args)
 
+    return run_scenario_set(args, _major_scenarios())
+
+
+def run_scenario_set(args: argparse.Namespace, scenarios: list[SimulationScenario]) -> dict[str, object]:
     run_dir = Path(args.run_dir).expanduser().resolve()
     scenario_root = Path(args.output_dir).expanduser().resolve() if args.output_dir else run_dir / "simulation_scenarios"
     scenario_root.mkdir(parents=True, exist_ok=True)
 
     scenario_rows: list[dict[str, object]] = []
-    for scenario in _major_scenarios():
+    for scenario in scenarios:
         scenario_args = _namespace_with_overrides(args, scenario.overrides)
         scenario_output_dir = scenario_root / scenario.name
         LOGGER.info("Running simulation scenario | name=%s | output_dir=%s", scenario.name, scenario_output_dir)
@@ -5106,6 +7605,28 @@ def run_command(args: argparse.Namespace) -> dict[str, object]:
         summary_rows,
         output_path=scenario_root / "scientific_validation_report.html",
     )
+    for _, row in summary_rows.iterrows():
+        scenario_name = str(row.get("scenario_name") or "").strip()
+        scenario_output_dir_value = str(row.get("output_dir") or "").strip()
+        if not scenario_name or not scenario_output_dir_value:
+            continue
+        scenario_output_dir = Path(scenario_output_dir_value).expanduser().resolve()
+        if not scenario_output_dir.exists():
+            continue
+        scenario_payload = _build_scenario_switch_payload(
+            summary_rows,
+            scenario_root=scenario_root,
+            current_report_path=scenario_output_dir / "scientific_validation_report.html",
+            current_scenario_name=scenario_name,
+            default_scenario_name=summary_payload["best_scenario"],
+            comparison_report_path=comparison_report_path,
+        )
+        write_scientific_validation_report(
+            run_dir,
+            simulation_dir=scenario_output_dir,
+            output_path=scenario_output_dir / "scientific_validation_report.html",
+            scenario_switch_payload=scenario_payload,
+        )
     latest_manifest = load_run_manifest(run_dir)
     latest_manifest["simulation_scenarios"] = {
         "output_dir": str(scenario_root),

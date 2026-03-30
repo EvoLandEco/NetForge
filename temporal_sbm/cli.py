@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import atexit
 import argparse
 from collections import Counter
 import datetime as dt
+import errno
 import logging
+import os
+import pty
 import sys
+import threading
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -37,13 +42,123 @@ from temporal_sbm.pipeline import (
 
 
 LOGGER = logging.getLogger(__name__)
+_ACTIVE_LOG_TEE: Optional["_TerminalLogTee"] = None
+
+
+class _TerminalLogTee:
+    def __init__(self, log_path: Path) -> None:
+        self.log_path = Path(log_path)
+        self._lock = threading.Lock()
+        self._file = None
+        self._streams: list[tuple[int, int, threading.Thread]] = []
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.log_path.open("ab", buffering=0)
+        self._install_stream(1)
+        self._install_stream(2)
+        self._started = True
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+
+        for fd, _, _ in self._streams:
+            _flush_terminal_stream(fd)
+
+        for fd, original_fd, _ in self._streams:
+            try:
+                os.dup2(original_fd, fd)
+            finally:
+                os.close(original_fd)
+
+        for _, _, thread in self._streams:
+            thread.join(timeout=1.0)
+
+        self._streams.clear()
+        if self._file is not None:
+            self._file.flush()
+            self._file.close()
+            self._file = None
+        self._started = False
+
+    def _install_stream(self, fd: int) -> None:
+        original_fd = os.dup(fd)
+        master_fd, slave_fd = pty.openpty()
+        try:
+            _flush_terminal_stream(fd)
+            os.dup2(slave_fd, fd)
+        finally:
+            os.close(slave_fd)
+
+        thread = threading.Thread(
+            target=self._forward_stream,
+            args=(master_fd, original_fd),
+            daemon=True,
+            name=f"netforge-log-tee-{fd}",
+        )
+        thread.start()
+        self._streams.append((fd, original_fd, thread))
+
+    def _forward_stream(self, master_fd: int, original_fd: int) -> None:
+        try:
+            while True:
+                try:
+                    chunk = os.read(master_fd, 8192)
+                except OSError as exc:
+                    if exc.errno in {errno.EIO, errno.EBADF}:
+                        break
+                    raise
+                if not chunk:
+                    break
+                log_chunk = chunk.replace(b"\r\n", b"\n")
+                try:
+                    os.write(original_fd, chunk)
+                except OSError:
+                    break
+                with self._lock:
+                    if self._file is not None:
+                        self._file.write(log_chunk)
+                        self._file.flush()
+        finally:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+
+
+def _flush_terminal_stream(fd: int) -> None:
+    stream = sys.stdout if fd == 1 else sys.stderr
+    try:
+        stream.flush()
+    except Exception:
+        pass
+
+
+def _shutdown_log_tee() -> None:
+    global _ACTIVE_LOG_TEE
+    if _ACTIVE_LOG_TEE is not None:
+        _ACTIVE_LOG_TEE.stop()
+        _ACTIVE_LOG_TEE = None
+
+
+atexit.register(_shutdown_log_tee)
 
 
 def _configure_logging(verbose: bool, log_path: Optional[Path] = None) -> None:
+    global _ACTIVE_LOG_TEE
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.setLevel(logging.INFO)
+
+    if _ACTIVE_LOG_TEE is not None:
+        _ACTIVE_LOG_TEE.stop()
+        _ACTIVE_LOG_TEE = None
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
@@ -51,10 +166,10 @@ def _configure_logging(verbose: bool, log_path: Optional[Path] = None) -> None:
 
     if log_path is not None:
         log_path = Path(log_path)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_path, mode="w")
-        file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
+        if log_path.exists():
+            log_path.unlink()
+        _ACTIVE_LOG_TEE = _TerminalLogTee(log_path)
+        _ACTIVE_LOG_TEE.start()
 
     package_level = logging.DEBUG if verbose else logging.INFO
     logging.getLogger("temporal_sbm").setLevel(package_level)
@@ -133,6 +248,11 @@ def add_input_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Run directory. Default: <data-root>/<dataset>/graph_tool_out/netforge.",
     )
+    parser.add_argument(
+        "--no-compact",
+        action="store_true",
+        help="Keep the full node universe during fitting instead of compacting to the active subgraph.",
+    )
 
 
 def add_fit_arguments(parser: argparse.ArgumentParser) -> None:
@@ -142,12 +262,78 @@ def add_fit_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Subset of built-in edge covariates to include during fitting. "
-            f"Choices are: {', '.join(sorted(DEFAULT_COVARIATES))}."
+            f"Choices are: {', '.join(sorted(DEFAULT_COVARIATES))}. "
+            "Use 'none' to fit topology only."
         ),
+    )
+    layered_group = parser.add_mutually_exclusive_group()
+    layered_group.add_argument(
+        "--layered",
+        dest="layered",
+        action="store_true",
+        default=True,
+        help="Fit layer-specific block structure with the snapshot edge property.",
+    )
+    layered_group.add_argument(
+        "--no-layered",
+        dest="layered",
+        action="store_false",
+        help="Fit a shared block structure across layers while keeping the snapshot edge property on the graph.",
+    )
+    parser.add_argument(
+        "--allow-mixed-node-types",
+        action="store_true",
+        help="Allow farm and region nodes to share communities during SBM fitting.",
     )
     parser.add_argument("--no-deg-corr", action="store_true", help="Disable degree correction in the fitted SBM.")
     parser.add_argument("--overlap", action="store_true", help="Fit an overlapping base partition.")
     parser.add_argument("--fit-quiet", action="store_true", help="Reduce graph-tool verbosity during fitting.")
+    parser.add_argument(
+        "--exclude-weight-from-fit",
+        action="store_true",
+        help="Keep edge weights out of SBM inference and leave weight sampling to the saved generator.",
+    )
+    joint_metadata_group = parser.add_mutually_exclusive_group()
+    joint_metadata_group.add_argument(
+        "--joint-metadata-model",
+        dest="joint_metadata_model",
+        action="store_true",
+        default=True,
+        help="Fit the joint data-metadata multilayer SBM with discrete metadata-tag vertices.",
+    )
+    joint_metadata_group.add_argument(
+        "--no-joint-metadata-model",
+        dest="joint_metadata_model",
+        action="store_false",
+        help="Fit only the trade network without the metadata bipartite layer.",
+    )
+    parser.add_argument(
+        "--metadata-fields",
+        nargs="+",
+        default=None,
+        help=(
+            "Metadata fields to turn into discrete tag tokens for the joint metadata layer. "
+            "Use 'none' to disable metadata fields while keeping the parser surface explicit."
+        ),
+    )
+    parser.add_argument(
+        "--metadata-numeric-bins",
+        type=int,
+        default=5,
+        help="Quantile bin count used when numeric node metadata is discretized into tags.",
+    )
+    parser.add_argument(
+        "--metadata-grid-km",
+        type=float,
+        default=50.0,
+        help="Grid width in kilometers for centroid-based metadata tags.",
+    )
+    parser.add_argument(
+        "--metadata-ft-top-k",
+        type=int,
+        default=3,
+        help="How many positive ft tokens to keep per node in the metadata layer.",
+    )
     parser.add_argument("--refine-multiflip-rounds", type=int, default=0, help="Extra multiflip refinement rounds after the initial fit.")
     parser.add_argument("--refine-multiflip-niter", type=int, default=10, help="Iterations per multiflip refinement round.")
     parser.add_argument("--anneal-niter", type=int, default=0, help="If positive, run graph-tool annealing for this many iterations.")
@@ -206,6 +392,35 @@ def add_generation_arguments(parser: argparse.ArgumentParser) -> None:
         help="Minimum observed edges in a layer/block-pair cell before backing off to a broader edge-weight sampler.",
     )
     parser.add_argument(
+        "--weight-generation-mode",
+        default="parametric",
+        choices=["parametric", "legacy"],
+        help="Use the saved parametric weight generator or the legacy empirical backoff sampler.",
+    )
+    parser.add_argument(
+        "--weight-parametric-partition-policy",
+        default="fixed",
+        choices=["fixed", "refit_on_refresh"],
+        help="Keep the fitted weight generator fixed or refit it after each posterior partition refresh.",
+    )
+    parser.add_argument(
+        "--weight-parametric-family",
+        default="auto",
+        choices=["auto", "shifted-negbin", "negbin", "lognormal"],
+        help="Weight family used by the parametric generator when weighted generation is enabled.",
+    )
+    parser.add_argument(
+        "--weight-prior-strength",
+        type=float,
+        default=5.0,
+        help="Pseudo-count strength used by the parametric weight model for partial pooling.",
+    )
+    parser.add_argument(
+        "--weight-pure-generative",
+        action="store_true",
+        help="Use only the saved parametric weight generator during weighted generation and forbid empirical weight backoff.",
+    )
+    parser.add_argument(
         "--rewire-model",
         default="none",
         choices=["none", "configuration", "constrained-configuration", "blockmodel-micro"],
@@ -255,7 +470,7 @@ def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _normalise_argv(argv: Optional[Iterable[str]]) -> list[str]:
     argv = list(argv or [])
-    commands = {"run", "fit", "generate", "report"}
+    commands = {"run", "fit", "generate", "report", "sweep"}
     if not argv:
         return ["run", *argv]
     if any(arg in {"-h", "--help"} for arg in argv) and not any(arg in commands for arg in argv):
@@ -302,6 +517,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compare one specific synthetic edge CSV. If omitted, every saved sample in the run directory is reported.",
     )
     report_parser.add_argument("--sample-label", default=None, help="Label used in report filenames.")
+
+    sweep_parser = subparsers.add_parser("sweep", help="Run a configured generation sweep, then report and simulate it.")
+    add_runtime_arguments(sweep_parser)
+    sweep_parser.add_argument("--config", required=True, help="Path to a JSON sweep configuration file.")
     return parser
 
 
@@ -316,6 +535,15 @@ def _resolve_run_dir_for_logging(args: argparse.Namespace) -> Optional[Path]:
         return Path(args.output_dir).expanduser().resolve()
     if args.command in {"generate", "report"} and getattr(args, "run_dir", None):
         return Path(args.run_dir).expanduser().resolve()
+    if args.command == "sweep" and getattr(args, "config", None):
+        try:
+            payload = load_json(Path(args.config).expanduser().resolve())
+        except Exception:
+            return None
+        fit_section = payload.get("fit") if isinstance(payload, dict) else None
+        output_dir = fit_section.get("output_dir") if isinstance(fit_section, dict) else None
+        if output_dir:
+            return Path(str(output_dir)).expanduser().resolve()
     return None
 
 
@@ -669,6 +897,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.command == "report":
         run_report_stage(args)
         _finalize_log_artifacts(log_path, Path(args.run_dir).expanduser().resolve())
+        return 0
+
+    if args.command == "sweep":
+        from temporal_sbm.sweep import run_sweep_command
+
+        result = run_sweep_command(args)
+        run_dir = Path(str(result["run_dir"])).expanduser().resolve()
+        _finalize_log_artifacts(log_path, run_dir)
         return 0
 
     if args.command == "run":

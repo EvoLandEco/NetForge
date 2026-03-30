@@ -79,6 +79,11 @@ class SimulationTests(unittest.TestCase):
             tmp_path = Path(tmpdir)
             per_snapshot_a = tmp_path / "run_a_per_snapshot.csv"
             per_snapshot_b = tmp_path / "run_b_per_snapshot.csv"
+            observed_outcomes = tmp_path / "observed_outcomes.csv"
+            synthetic_outcomes_a = tmp_path / "run_a_synthetic_outcomes.csv"
+            synthetic_outcomes_b = tmp_path / "run_b_synthetic_outcomes.csv"
+            outcome_summary_a = tmp_path / "run_a_outcome_distribution_summary.csv"
+            outcome_summary_b = tmp_path / "run_b_outcome_distribution_summary.csv"
             pd.DataFrame(
                 {
                     "day_index": [0],
@@ -95,6 +100,46 @@ class SimulationTests(unittest.TestCase):
                     "synthetic_farm_prevalence": [3.0],
                 }
             ).to_csv(per_snapshot_b, index=False)
+            pd.DataFrame(
+                {
+                    "farm_attack_rate": [0.1, 0.2],
+                    "farm_peak_prevalence": [2.0, 3.0],
+                    "farm_peak_day_index": [4.0, 5.0],
+                    "farm_duration_days": [8.0, 9.0],
+                }
+            ).to_csv(observed_outcomes, index=False)
+            pd.DataFrame(
+                {
+                    "farm_attack_rate": [0.11, 0.13],
+                    "farm_peak_prevalence": [2.0, 2.0],
+                    "farm_peak_day_index": [4.0, 6.0],
+                    "farm_duration_days": [7.0, 10.0],
+                }
+            ).to_csv(synthetic_outcomes_a, index=False)
+            pd.DataFrame(
+                {
+                    "farm_attack_rate": [0.14, 0.16],
+                    "farm_peak_prevalence": [3.0, 4.0],
+                    "farm_peak_day_index": [6.0, 7.0],
+                    "farm_duration_days": [9.0, 11.0],
+                }
+            ).to_csv(synthetic_outcomes_b, index=False)
+            pd.DataFrame(
+                {
+                    "metric": ["farm_attack_rate", "farm_peak_prevalence", "farm_peak_day_index", "farm_duration_days"],
+                    "wasserstein_distance": [0.01, 0.02, 0.03, 0.04],
+                    "original_median": [0.10, 2.0, 4.0, 8.5],
+                    "synthetic_median": [0.12, 2.5, 5.0, 8.0],
+                }
+            ).to_csv(outcome_summary_a, index=False)
+            pd.DataFrame(
+                {
+                    "metric": ["farm_attack_rate", "farm_peak_prevalence", "farm_peak_day_index", "farm_duration_days"],
+                    "wasserstein_distance": [0.02, 0.03, 0.04, 0.05],
+                    "original_median": [0.10, 2.0, 4.0, 8.5],
+                    "synthetic_median": [0.14, 3.0, 6.0, 10.0],
+                }
+            ).to_csv(outcome_summary_b, index=False)
 
             reports = [
                 {
@@ -109,7 +154,12 @@ class SimulationTests(unittest.TestCase):
                         "farm_peak_prevalence_wasserstein": 0.2,
                         "farm_duration_wasserstein": 0.3,
                     },
-                    "outputs": {"per_snapshot_csv": str(per_snapshot_a)},
+                    "outputs": {
+                        "per_snapshot_csv": str(per_snapshot_a),
+                        "observed_outcomes": str(observed_outcomes),
+                        "synthetic_outcomes": str(synthetic_outcomes_a),
+                        "outcome_distribution_summary": str(outcome_summary_a),
+                    },
                 },
                 {
                     "sample_label": "maxent_micro__rewire_none__sample_0001",
@@ -123,7 +173,12 @@ class SimulationTests(unittest.TestCase):
                         "farm_peak_prevalence_wasserstein": 0.22,
                         "farm_duration_wasserstein": 0.35,
                     },
-                    "outputs": {"per_snapshot_csv": str(per_snapshot_b)},
+                    "outputs": {
+                        "per_snapshot_csv": str(per_snapshot_b),
+                        "observed_outcomes": str(observed_outcomes),
+                        "synthetic_outcomes": str(synthetic_outcomes_b),
+                        "outcome_distribution_summary": str(outcome_summary_b),
+                    },
                 },
             ]
 
@@ -134,6 +189,7 @@ class SimulationTests(unittest.TestCase):
             )
 
             self.assertEqual(aggregated["sample_class"], "posterior_predictive")
+            self.assertTrue(Path(aggregated["outputs"]["distribution_png"]).exists())
 
     def test_write_scientific_validation_report_reads_custom_simulation_dir(self):
         with TemporaryDirectory() as tmpdir:
@@ -259,6 +315,14 @@ class SimulationTests(unittest.TestCase):
             self.assertIn(".summary-card, .figure-card, .artifact-card, .table-card { min-width: 0; }", report_html)
             self.assertIn(".figure-frame { min-width: 0; overflow: hidden;", report_html)
             self.assertIn(".table-wrap { max-width: 100%; overflow: auto;", report_html)
+            self.assertIn(".dataframe.report-table {", report_html)
+            self.assertIn("width: max-content;", report_html)
+            self.assertIn("white-space: nowrap;", report_html)
+            self.assertIn(".figure-popout-button {", report_html)
+            self.assertIn("id='figure_overlay'", report_html)
+            self.assertIn("id='figure_overlay_zoom_in'", report_html)
+            self.assertIn("id='figure_overlay_save'", report_html)
+            self.assertIn("document.querySelectorAll('.figure-popout-button')", report_html)
             self.assertIn("<div class='table-card'><div class='table-wrap'><table class='report-table'>", report_html)
 
     def test_write_region_geo_html_uses_stacked_metric_sections_and_scale_switch(self):
@@ -312,6 +376,8 @@ class SimulationTests(unittest.TestCase):
                     "ts": [10, 11],
                     "original_farm_prevalence": [1.0, 2.0],
                     "synthetic_farm_prevalence": [1.0, 3.0],
+                    "original_farm_prevalence_mean": [1.1, 2.2],
+                    "synthetic_farm_prevalence_mean": [1.0, 2.8],
                     "original_farm_incidence": [1.0, 1.0],
                     "synthetic_farm_incidence": [1.0, 2.0],
                     "original_farm_incidence_mean": [0.8, 1.1],
@@ -324,12 +390,20 @@ class SimulationTests(unittest.TestCase):
                     "synthetic_farm_infection_event_probability": [0.40, 0.65],
                     "original_farm_cumulative_incidence": [1.0, 2.0],
                     "synthetic_farm_cumulative_incidence": [1.0, 3.0],
+                    "original_farm_cumulative_incidence_mean": [1.0, 2.1],
+                    "synthetic_farm_cumulative_incidence_mean": [1.2, 2.9],
                     "original_reservoir_total": [0.5, 0.8],
                     "synthetic_reservoir_total": [0.4, 1.0],
+                    "original_reservoir_total_mean": [0.55, 0.82],
+                    "synthetic_reservoir_total_mean": [0.48, 0.98],
                     "original_reservoir_max": [0.2, 0.3],
                     "synthetic_reservoir_max": [0.2, 0.4],
+                    "original_reservoir_max_mean": [0.25, 0.31],
+                    "synthetic_reservoir_max_mean": [0.24, 0.39],
                     "original_reservoir_positive_regions": [1.0, 2.0],
                     "synthetic_reservoir_positive_regions": [1.0, 3.0],
+                    "original_reservoir_positive_regions_mean": [1.1, 2.1],
+                    "synthetic_reservoir_positive_regions_mean": [1.0, 2.8],
                     "farm_prevalence_delta": [0.0, 1.0],
                     "farm_incidence_delta": [0.0, 1.0],
                     "farm_cumulative_incidence_delta": [0.0, 1.0],
@@ -339,6 +413,14 @@ class SimulationTests(unittest.TestCase):
             summary = {
                 "farm_prevalence_curve_correlation": 0.9,
                 "farm_incidence_curve_correlation": 0.8,
+                "farm_prevalence_mean_curve_correlation": 0.88,
+                "farm_incidence_mean_curve_correlation": 0.84,
+                "farm_cumulative_incidence_mean_curve_correlation": 0.82,
+                "reservoir_total_mean_curve_correlation": 0.74,
+                "reservoir_max_mean_curve_correlation": 0.66,
+                "reservoir_positive_regions_mean_curve_correlation": 0.78,
+                "farm_prevalence_mean_curve_mae": 0.15,
+                "farm_incidence_mean_curve_mae": 0.22,
                 "farm_cumulative_incidence_curve_correlation": 0.85,
                 "reservoir_total_curve_correlation": 0.7,
                 "reservoir_max_curve_correlation": 0.6,
@@ -382,6 +464,20 @@ class SimulationTests(unittest.TestCase):
                     "synthetic_median": [0.3, 4.0, 3.0, 6.0, 3.0, 4.0, 1.5, 0.5],
                 }
             )
+            daily_mean_comparison = pd.DataFrame(
+                {
+                    "metric": [
+                        "farm_prevalence",
+                        "farm_incidence",
+                        "farm_cumulative_incidence",
+                        "reservoir_total",
+                    ],
+                    "curve_correlation": [0.88, 0.84, 0.82, 0.74],
+                    "mean_abs_delta": [0.15, 0.22, 0.31, 0.18],
+                    "rmse": [0.16, 0.24, 0.33, 0.20],
+                    "max_abs_delta": [0.30, 0.50, 0.70, 0.40],
+                }
+            )
 
             outputs = write_report(
                 per_snapshot,
@@ -392,16 +488,20 @@ class SimulationTests(unittest.TestCase):
                     "observed_outcomes": observed_outcomes,
                     "synthetic_outcomes": synthetic_outcomes,
                     "outcome_distribution_summary": outcome_summary,
+                    "daily_mean_comparison": daily_mean_comparison,
                 },
             )
 
             self.assertTrue(Path(outputs["dashboard_png"]).exists())
             self.assertTrue(Path(outputs["delta_png"]).exists())
+            self.assertTrue(Path(outputs["daily_mean_png"]).exists())
             self.assertTrue(Path(outputs["distribution_png"]).exists())
             self.assertTrue(Path(outputs["parity_png"]).exists())
+            self.assertTrue(Path(outputs["daily_mean_comparison"]).exists())
             report_md = Path(outputs["report_md"]).read_text(encoding="utf-8")
             self.assertIn("## How to read the figures", report_md)
             self.assertIn("## How to read the tables", report_md)
+            self.assertIn("## Daily mean comparison", report_md)
 
     @unittest.skipUnless(HAS_MATPLOTLIB, "matplotlib not installed in test environment")
     def test_write_scenario_comparison_report_creates_html(self):
@@ -423,6 +523,14 @@ class SimulationTests(unittest.TestCase):
                     "report_path": [str(scenario_output / "scientific_validation_report.html")],
                     "farm_prevalence_curve_correlation": [0.9],
                     "farm_incidence_curve_correlation": [0.8],
+                    "farm_prevalence_mean_curve_correlation": [0.88],
+                    "farm_incidence_mean_curve_correlation": [0.84],
+                    "farm_cumulative_incidence_mean_curve_correlation": [0.82],
+                    "reservoir_total_mean_curve_correlation": [0.74],
+                    "farm_prevalence_mean_curve_mae": [0.15],
+                    "farm_incidence_mean_curve_mae": [0.22],
+                    "farm_cumulative_incidence_mean_curve_mae": [0.31],
+                    "reservoir_total_mean_curve_mae": [0.18],
                     "farm_cumulative_incidence_curve_correlation": [0.85],
                     "reservoir_total_curve_correlation": [0.7],
                     "farm_attack_rate_wasserstein": [0.1],
@@ -456,6 +564,7 @@ class SimulationTests(unittest.TestCase):
             self.assertIn("How to read this figure", report_html)
             self.assertIn("How to read this table", report_html)
             self.assertIn("Daily calibration", report_html)
+            self.assertIn("Daily mean comparison", report_html)
             self.assertIn("Scalar calibration and uncertainty", report_html)
 
 

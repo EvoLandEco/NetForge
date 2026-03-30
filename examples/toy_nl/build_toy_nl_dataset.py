@@ -1,4 +1,4 @@
-"""Create the Dutch toy dataset used in the GitHub tutorial."""
+"""Create the Dutch toy dataset used in the docs and tutorial."""
 
 from __future__ import annotations
 
@@ -77,6 +77,14 @@ PUBLIC_HOLIDAYS = {
     date(2019, 12, 26),
     date(2020, 1, 1),
 }
+
+DEFAULT_METADATA_FIELDS = (
+    "corop",
+    "num_farms_bin",
+    "total_animals_bin",
+    "centroid_grid",
+    "ft_tokens",
+)
 
 
 def build_nodes() -> pd.DataFrame:
@@ -216,6 +224,20 @@ def write_dataset(node_frame: pd.DataFrame, edge_frame: pd.DataFrame) -> None:
                 "node_map_file": NODE_MAP_PATH.name,
                 "weight_column": "trade",
                 "node_row_offset": 0,
+                "joint_metadata_model": {
+                    "enabled_by_default": True,
+                    "layer_name": "__metadata__",
+                    "metadata_fields": list(DEFAULT_METADATA_FIELDS),
+                    "node_map_fields": ["corop"],
+                    "node_feature_columns": [
+                        "xco",
+                        "yco",
+                        "num_farms",
+                        "total_animals",
+                        "count_ft_cattle",
+                        "count_ft_pig",
+                    ],
+                },
             },
             indent=2,
         )

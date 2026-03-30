@@ -1,6 +1,6 @@
 # NetForge
 
-NetForge fits temporal stochastic block models to repeated network snapshots, draws synthetic panels from the fitted model, and writes diagnostics that compare the observed and generated networks.
+NetForge fits temporal stochastic block models to repeated network snapshots, draws synthetic panels from the fitted model, and writes diagnostics that compare the observed and generated networks. It can also add a metadata layer with discrete tag vertices for a joint data-metadata fit.
 
 These pages follow the workflow most people need first:
 
@@ -66,5 +66,6 @@ The repository includes a Dutch toy dataset builder at `examples/toy_nl/build_to
 - higher activity among larger farms
 - lower activity on weekends
 - lower activity on Dutch public holidays
+- metadata tag inputs from COROP codes, size bins, grid cells, and `count_ft_*` columns
 
 Use the [quickstart](quickstart.md) to run the full example.
