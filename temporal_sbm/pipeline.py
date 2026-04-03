@@ -3798,12 +3798,6 @@ def fit_command(args: argparse.Namespace) -> dict:
         base_covariate_specs = _select_covariate_specs(_available_covariate_specs(graph), requested_fit_covariates)
     weight_generation_mode = _weight_generation_mode_name(args)
     include_weight_in_fit = _fit_includes_edge_weight_covariate(args)
-    if joint_metadata_active and include_weight_in_fit:
-        LOGGER.warning(
-            "Joint data-metadata model active: excluding edge weights from SBM fitting because metadata-layer edges do not carry trade weights. "
-            "Weights will be handled only by the downstream generator."
-        )
-        include_weight_in_fit = False
     if include_weight_in_fit:
         weight_candidates = _build_weight_candidates(prepared, graph, args)
     else:

@@ -1,0 +1,105 @@
+{
+  "fit": {
+    "data_root": "/Users/tianjian/Source/NetForge/processed_data",
+    "dataset": "CR35",
+    "directed": true,
+    "exclude_weight_from_fit": true,
+    "fit_covariates": [
+      "none"
+    ],
+    "fit_quiet": true,
+    "joint_metadata_model": true,
+    "layered": false,
+    "metadata_fields": [
+      "corop",
+      "num_farms_bin",
+      "total_animals_bin",
+      "centroid_grid",
+      "ft_tokens"
+    ],
+    "metadata_ft_top_k": 3,
+    "metadata_grid_km": 50.0,
+    "metadata_numeric_bins": 5,
+    "output_dir": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_full_workflow_280d_20260402_joint_cov_toggle/combos/meta_on__cov_off__layered_off",
+    "ts_end": 736974,
+    "ts_start": 736695,
+    "weight_col": "trade",
+    "weight_model": "auto",
+    "weight_transform": "none"
+  },
+  "generate": {
+    "num_samples": 10,
+    "posterior_partition_beta": 1.0,
+    "posterior_partition_sweep_niter": 5,
+    "posterior_partition_sweeps": 10,
+    "rewire_n_iter": 10,
+    "sample_n_iter": 5000,
+    "seed": 2026,
+    "weight_generation_mode": "parametric",
+    "weight_min_cell_count": 8,
+    "weight_parametric_family": "auto",
+    "weight_parametric_partition_policy": "refit_on_refresh",
+    "weight_prior_strength": 5.0
+  },
+  "grid": {
+    "rewires": [
+      "none"
+    ],
+    "samplers": [
+      "maxent_micro"
+    ]
+  },
+  "report": {
+    "detailed_diagnostics": true,
+    "diagnostic_top_k": 12,
+    "html_report": true
+  },
+  "simulation": {
+    "base_args": {
+      "log_level": "INFO"
+    },
+    "scenarios": [
+      {
+        "beta_ff": 0.45,
+        "beta_fr": 0.25,
+        "beta_rf": 0.85,
+        "beta_rr": 0.22,
+        "description": "SIS long-burn stress test with persistent plateau pressure.",
+        "farm_daily_import_prob": 0.0015,
+        "gamma": 0.02,
+        "initial_seed_count": 8,
+        "model": "SIS",
+        "name": "extreme_stress_persistent_plateau",
+        "num_replicates": 100,
+        "require_day0_activity": false,
+        "reservoir_background": 0.002,
+        "reservoir_decay": 0.97,
+        "seed_pool_mode": "overall",
+        "seed_scope": "all_farms",
+        "tail_days": 45,
+        "weight_scale": 1.0
+      },
+      {
+        "beta_ff": 0.5,
+        "beta_fr": 0.1,
+        "beta_rf": 0.55,
+        "beta_rr": 0.08,
+        "description": "SEIR long-burn stress test with lower background pressure.",
+        "farm_daily_import_prob": 0.0002,
+        "gamma": 0.05,
+        "initial_seed_count": 6,
+        "model": "SEIR",
+        "name": "strong_long_burn",
+        "num_replicates": 100,
+        "require_day0_activity": false,
+        "reservoir_background": 0.0007,
+        "reservoir_decay": 0.9,
+        "seed_pool_mode": "overall",
+        "seed_scope": "all_farms",
+        "sigma": 0.45,
+        "tail_days": 45,
+        "weight_scale": 1.5
+      }
+    ]
+  }
+}

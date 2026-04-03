@@ -86,7 +86,7 @@ EOF
   esac
 done
 
-SCRIPT_DIR="/Users/tianjian/Source/NetForge/.stress_runs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER="$SCRIPT_DIR/partition_factor_grid_refresh.py"
 
 export OMP_NUM_THREADS=1

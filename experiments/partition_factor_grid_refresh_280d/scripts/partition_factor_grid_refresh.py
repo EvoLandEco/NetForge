@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -39,13 +39,11 @@ def _combo_label(
     *,
     joint_metadata_model: bool,
     edge_covariates: bool,
-    exclude_weight_from_fit: bool,
     layered: bool,
 ) -> str:
     return (
         f"meta_{'on' if joint_metadata_model else 'off'}"
         f"__cov_{'on' if edge_covariates else 'off'}"
-        f"__exw_{'on' if exclude_weight_from_fit else 'off'}"
         f"__layered_{'on' if layered else 'off'}"
     )
 
@@ -54,13 +52,11 @@ def _combo_short_label(
     *,
     joint_metadata_model: bool,
     edge_covariates: bool,
-    exclude_weight_from_fit: bool,
     layered: bool,
 ) -> str:
     return (
         f"M{int(joint_metadata_model)} "
         f"C{int(edge_covariates)} "
-        f"W{int(exclude_weight_from_fit)} "
         f"L{int(layered)}"
     )
 
@@ -70,30 +66,27 @@ def _combo_specs() -> list[dict[str, Any]]:
     index = 0
     for joint_metadata_model in (False, True):
         for edge_covariates in (False, True):
-            for exclude_weight_from_fit in (False, True):
-                for layered in (False, True):
-                    specs.append(
-                        {
-                            "index": index,
-                            "label": _combo_label(
-                                joint_metadata_model=joint_metadata_model,
-                                edge_covariates=edge_covariates,
-                                exclude_weight_from_fit=exclude_weight_from_fit,
-                                layered=layered,
-                            ),
-                            "short_label": _combo_short_label(
-                                joint_metadata_model=joint_metadata_model,
-                                edge_covariates=edge_covariates,
-                                exclude_weight_from_fit=exclude_weight_from_fit,
-                                layered=layered,
-                            ),
-                            "joint_metadata_model": bool(joint_metadata_model),
-                            "edge_covariates": bool(edge_covariates),
-                            "exclude_weight_from_fit": bool(exclude_weight_from_fit),
-                            "layered": bool(layered),
-                        }
-                    )
-                    index += 1
+            for layered in (False, True):
+                specs.append(
+                    {
+                        "index": index,
+                        "label": _combo_label(
+                            joint_metadata_model=joint_metadata_model,
+                            edge_covariates=edge_covariates,
+                            layered=layered,
+                        ),
+                        "short_label": _combo_short_label(
+                            joint_metadata_model=joint_metadata_model,
+                            edge_covariates=edge_covariates,
+                            layered=layered,
+                        ),
+                        "joint_metadata_model": bool(joint_metadata_model),
+                        "edge_covariates": bool(edge_covariates),
+                        "exclude_weight_from_fit": not bool(edge_covariates),
+                        "layered": bool(layered),
+                    }
+                )
+                index += 1
     return specs
 
 
@@ -156,6 +149,7 @@ def _fit_values_for_combo(
     fit_values["fit_covariates"] = list(EDGE_COVARIATES) if combo_spec["edge_covariates"] else ["none"]
     fit_values["exclude_weight_from_fit"] = bool(combo_spec["exclude_weight_from_fit"])
     fit_values["layered"] = bool(combo_spec["layered"])
+    fit_values["weight_model"] = "discrete-geometric" if combo_spec["edge_covariates"] else base_fit.get("weight_model", "auto")
     fit_values["fit_quiet"] = True
     return fit_values
 
@@ -432,7 +426,10 @@ def run_combo_command(args: argparse.Namespace) -> int:
 
     refresh_metrics = metrics_frame.loc[metrics_frame["replicate_index"] > 0].copy()
     metadata_enabled = bool(combo_spec["joint_metadata_model"])
-    effective_exclude_weight_from_fit = bool(combo_spec["exclude_weight_from_fit"]) or metadata_enabled
+    manifest_fit_options = manifest.get("fit_options") or {}
+    effective_exclude_weight_from_fit = bool(
+        manifest_fit_options.get("exclude_weight_from_fit", combo_spec["exclude_weight_from_fit"])
+    )
     combo_summary = {
         "combo_label": combo_spec["label"],
         "short_label": combo_spec["short_label"],
@@ -504,7 +501,6 @@ def _plot_boxplot(summary_frame: pd.DataFrame, replicate_frame: pd.DataFrame, ou
         [
             "requested_joint_metadata_model",
             "requested_edge_covariates",
-            "requested_exclude_weight_from_fit",
             "requested_layered",
         ]
     )
@@ -537,39 +533,35 @@ def _plot_heatmap_facets(
     output_path: Path,
     fmt: str,
 ) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), constrained_layout=True)
     cmap = plt.cm.viridis
     valid_values = summary_frame[value_column].dropna().to_numpy(dtype=float)
     vmin = float(np.min(valid_values)) if valid_values.size else 0.0
     vmax = float(np.max(valid_values)) if valid_values.size else 1.0
     image = None
-    for row_index, exclude_weight_from_fit in enumerate([False, True]):
-        for col_index, layered in enumerate([False, True]):
-            ax = axes[row_index, col_index]
-            panel = summary_frame[
-                (summary_frame["requested_exclude_weight_from_fit"] == exclude_weight_from_fit)
-                & (summary_frame["requested_layered"] == layered)
-            ]
-            matrix = np.full((2, 2), np.nan, dtype=float)
-            for metadata in [False, True]:
-                for edge_covariates in [False, True]:
-                    matched = panel[
-                        (panel["requested_joint_metadata_model"] == metadata)
-                        & (panel["requested_edge_covariates"] == edge_covariates)
-                    ]
-                    if not matched.empty:
-                        matrix[int(metadata), int(edge_covariates)] = float(matched.iloc[0][value_column])
-            image = ax.imshow(matrix, vmin=vmin, vmax=vmax, cmap=cmap)
-            ax.set_xticks([0, 1])
-            ax.set_xticklabels(["cov off", "cov on"])
-            ax.set_yticks([0, 1])
-            ax.set_yticklabels(["meta off", "meta on"])
-            ax.set_title(f"exclude_weight_from_fit={int(exclude_weight_from_fit)} | layered={int(layered)}")
-            for meta_index in [0, 1]:
-                for cov_index in [0, 1]:
-                    value = matrix[meta_index, cov_index]
-                    text = "NA" if math.isnan(value) else format(value, fmt)
-                    ax.text(cov_index, meta_index, text, ha="center", va="center", color="white", fontsize=11)
+    for col_index, layered in enumerate([False, True]):
+        ax = axes[col_index]
+        panel = summary_frame[summary_frame["requested_layered"] == layered]
+        matrix = np.full((2, 2), np.nan, dtype=float)
+        for metadata in [False, True]:
+            for edge_covariates in [False, True]:
+                matched = panel[
+                    (panel["requested_joint_metadata_model"] == metadata)
+                    & (panel["requested_edge_covariates"] == edge_covariates)
+                ]
+                if not matched.empty:
+                    matrix[int(metadata), int(edge_covariates)] = float(matched.iloc[0][value_column])
+        image = ax.imshow(matrix, vmin=vmin, vmax=vmax, cmap=cmap)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["cov off", "cov on"])
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(["meta off", "meta on"])
+        ax.set_title(f"layered={int(layered)}")
+        for meta_index in [0, 1]:
+            for cov_index in [0, 1]:
+                value = matrix[meta_index, cov_index]
+                text = "NA" if math.isnan(value) else format(value, fmt)
+                ax.text(cov_index, meta_index, text, ha="center", va="center", color="white", fontsize=11)
     if image is not None:
         fig.colorbar(image, ax=axes, shrink=0.85)
     fig.suptitle(title, fontsize=16)
@@ -591,9 +583,7 @@ def _write_html_report(
         "short_label",
         "requested_joint_metadata_model",
         "requested_edge_covariates",
-        "requested_exclude_weight_from_fit",
         "requested_layered",
-        "effective_exclude_weight_from_fit",
         "fit_block_count",
         "block_count_mean",
         "block_count_std",
@@ -643,17 +633,15 @@ def _write_html_report(
     Each combination includes the fitted partition and {run_manifest['total_replicates'] - 1} posterior partition refreshes.
   </p>
   <p>
-    One code path matters when reading the tables: with <code>joint_metadata_model=true</code>,
-    the current pipeline forces edge weights out of SBM inference because the metadata layer is unweighted.
-    The report keeps both the requested flags and the effective weight-fit flag visible.
+    This grid ties trade-edge covariates and edge weights into one switch. With <code>cov on</code>, the fit uses
+    <code>dist_km</code>, <code>mass_grav</code>, <code>anim_grav</code>, and the edge-weight covariate together.
+    With <code>cov off</code>, all of them stay out of the SBM.
   </p>
   {missing_html}
   <h2>Combination Summary</h2>
   {summary_html}
   <h2>Requested-Factor Main Effects</h2>
   {main_effects_html}
-  <h2>Effective Exclude-Weight Main Effects</h2>
-  {effective_effects_html}
   <h2>Figures</h2>
   <img src="{plot_paths['boxplot'].name}" alt="Block count boxplot">
   <img src="{plot_paths['mean_heatmap'].name}" alt="Mean block count heatmaps">
@@ -702,7 +690,6 @@ def summarize_command(args: argparse.Namespace) -> int:
         [
             "requested_joint_metadata_model",
             "requested_edge_covariates",
-            "requested_exclude_weight_from_fit",
             "requested_layered",
         ]
     ).reset_index(drop=True)
@@ -719,17 +706,12 @@ def summarize_command(args: argparse.Namespace) -> int:
     for factor in [
         "requested_joint_metadata_model",
         "requested_edge_covariates",
-        "requested_exclude_weight_from_fit",
         "requested_layered",
     ]:
         main_effects_frames.append(_main_effects_table(summary_frame, factor))
     main_effects_frame = pd.concat(main_effects_frames, ignore_index=True)
     main_effects_path = summary_dir / "requested_main_effects.csv"
     main_effects_frame.to_csv(main_effects_path, index=False)
-
-    effective_effects_frame = _main_effects_table(summary_frame, "effective_exclude_weight_from_fit")
-    effective_effects_path = summary_dir / "effective_main_effects.csv"
-    effective_effects_frame.to_csv(effective_effects_path, index=False)
 
     boxplot_path = summary_dir / "block_count_by_combination.png"
     _plot_boxplot(summary_frame, replicate_frame, boxplot_path)
@@ -758,7 +740,7 @@ def summarize_command(args: argparse.Namespace) -> int:
         run_manifest=run_manifest,
         summary_frame=summary_frame,
         main_effects_frame=main_effects_frame,
-        effective_effects_frame=effective_effects_frame,
+        effective_effects_frame=pd.DataFrame(),
         plot_paths={
             "boxplot": boxplot_path,
             "mean_heatmap": mean_heatmap_path,

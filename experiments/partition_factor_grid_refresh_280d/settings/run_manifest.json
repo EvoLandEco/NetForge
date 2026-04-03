@@ -1,5 +1,5 @@
 {
-  "base_config_path": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_140d_joint_metadata_topology_only_no_layered_maxent_micro_parametric_refit_10runs_100rep_rerun_20260327_132542.json",
+  "base_config_path": "/Users/tianjian/Source/NetForge/experiments/partition_factor_grid_refresh_280d/settings/base_config.json",
   "base_fit": {
     "data_root": "/Users/tianjian/Source/NetForge/processed_data",
     "dataset": "CR35",
@@ -38,14 +38,14 @@
     "weight_parametric_partition_policy": "refit_on_refresh",
     "weight_prior_strength": 5.0
   },
-  "combo_count": 16,
-  "created_at_utc": "2026-03-28T10:54:45.121641+00:00",
+  "combo_count": 8,
+  "created_at_utc": "2026-04-02T14:48:06.428892+00:00",
   "dataset_bounds": {
     "ts_max": 738886,
     "ts_min": 736695
   },
   "days": 280,
-  "output_root": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_grid_280d_rep10_20260328_105445",
+  "output_root": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_grid_280d_rep10_20260402_joint_cov_toggle_refresh",
   "refresh_options": {
     "posterior_partition_beta": 1.0,
     "posterior_partition_sweep_niter": 5,

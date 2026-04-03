@@ -1,0 +1,98 @@
+[
+  {
+    "config_path": "/Users/tianjian/Source/NetForge/experiments/partition_factor_full_workflow_280d/settings/combos/meta_off__cov_off__layered_off.json",
+    "edge_covariates": false,
+    "exclude_weight_from_fit": true,
+    "forced_weight_model": null,
+    "index": 0,
+    "joint_metadata_model": false,
+    "label": "meta_off__cov_off__layered_off",
+    "layered": false,
+    "run_dir": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_full_workflow_280d_20260402_joint_cov_toggle/combos/meta_off__cov_off__layered_off",
+    "short_label": "M0 C0 L0"
+  },
+  {
+    "config_path": "/Users/tianjian/Source/NetForge/experiments/partition_factor_full_workflow_280d/settings/combos/meta_off__cov_off__layered_on.json",
+    "edge_covariates": false,
+    "exclude_weight_from_fit": true,
+    "forced_weight_model": null,
+    "index": 1,
+    "joint_metadata_model": false,
+    "label": "meta_off__cov_off__layered_on",
+    "layered": true,
+    "run_dir": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_full_workflow_280d_20260402_joint_cov_toggle/combos/meta_off__cov_off__layered_on",
+    "short_label": "M0 C0 L1"
+  },
+  {
+    "config_path": "/Users/tianjian/Source/NetForge/experiments/partition_factor_full_workflow_280d/settings/combos/meta_off__cov_on__layered_off.json",
+    "edge_covariates": true,
+    "exclude_weight_from_fit": false,
+    "forced_weight_model": "discrete-geometric",
+    "index": 2,
+    "joint_metadata_model": false,
+    "label": "meta_off__cov_on__layered_off",
+    "layered": false,
+    "run_dir": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_full_workflow_280d_20260402_joint_cov_toggle/combos/meta_off__cov_on__layered_off",
+    "short_label": "M0 C1 L0"
+  },
+  {
+    "config_path": "/Users/tianjian/Source/NetForge/experiments/partition_factor_full_workflow_280d/settings/combos/meta_off__cov_on__layered_on.json",
+    "edge_covariates": true,
+    "exclude_weight_from_fit": false,
+    "forced_weight_model": "discrete-geometric",
+    "index": 3,
+    "joint_metadata_model": false,
+    "label": "meta_off__cov_on__layered_on",
+    "layered": true,
+    "run_dir": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_full_workflow_280d_20260402_joint_cov_toggle/combos/meta_off__cov_on__layered_on",
+    "short_label": "M0 C1 L1"
+  },
+  {
+    "config_path": "/Users/tianjian/Source/NetForge/experiments/partition_factor_full_workflow_280d/settings/combos/meta_on__cov_off__layered_off.json",
+    "edge_covariates": false,
+    "exclude_weight_from_fit": true,
+    "forced_weight_model": null,
+    "index": 4,
+    "joint_metadata_model": true,
+    "label": "meta_on__cov_off__layered_off",
+    "layered": false,
+    "run_dir": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_full_workflow_280d_20260402_joint_cov_toggle/combos/meta_on__cov_off__layered_off",
+    "short_label": "M1 C0 L0"
+  },
+  {
+    "config_path": "/Users/tianjian/Source/NetForge/experiments/partition_factor_full_workflow_280d/settings/combos/meta_on__cov_off__layered_on.json",
+    "edge_covariates": false,
+    "exclude_weight_from_fit": true,
+    "forced_weight_model": null,
+    "index": 5,
+    "joint_metadata_model": true,
+    "label": "meta_on__cov_off__layered_on",
+    "layered": true,
+    "run_dir": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_full_workflow_280d_20260402_joint_cov_toggle/combos/meta_on__cov_off__layered_on",
+    "short_label": "M1 C0 L1"
+  },
+  {
+    "config_path": "/Users/tianjian/Source/NetForge/experiments/partition_factor_full_workflow_280d/settings/combos/meta_on__cov_on__layered_off.json",
+    "edge_covariates": true,
+    "exclude_weight_from_fit": false,
+    "forced_weight_model": "discrete-geometric",
+    "index": 6,
+    "joint_metadata_model": true,
+    "label": "meta_on__cov_on__layered_off",
+    "layered": false,
+    "run_dir": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_full_workflow_280d_20260402_joint_cov_toggle/combos/meta_on__cov_on__layered_off",
+    "short_label": "M1 C1 L0"
+  },
+  {
+    "config_path": "/Users/tianjian/Source/NetForge/experiments/partition_factor_full_workflow_280d/settings/combos/meta_on__cov_on__layered_on.json",
+    "edge_covariates": true,
+    "exclude_weight_from_fit": false,
+    "forced_weight_model": "discrete-geometric",
+    "index": 7,
+    "joint_metadata_model": true,
+    "label": "meta_on__cov_on__layered_on",
+    "layered": true,
+    "run_dir": "/Users/tianjian/Source/NetForge/.stress_runs/cr35_partition_factor_full_workflow_280d_20260402_joint_cov_toggle/combos/meta_on__cov_on__layered_on",
+    "short_label": "M1 C1 L1"
+  }
+]

@@ -2,6 +2,7 @@ import unittest
 import argparse
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -25,10 +26,47 @@ from temporal_sbm.pipeline import (
     resolve_input_paths,
     _sample_kwargs,
     _split_layered_entropy_args,
+    fit_command,
 )
 
 
 class PipelineWeightAlignmentTests(unittest.TestCase):
+    def test_fit_command_keeps_weight_candidates_when_joint_metadata_is_active(self):
+        prepared = argparse.Namespace(
+            metadata_summary={"enabled": True},
+            weight_column="trade",
+            original_edges=pd.DataFrame(),
+        )
+        args = argparse.Namespace(
+            output_dir="/tmp/netforge-fit",
+            directed=True,
+            fit_covariates=None,
+            exclude_weight_from_fit=False,
+            weight_generation_mode="legacy",
+        )
+        weight_model = {
+            "input_column": "trade",
+            "output_column": "trade",
+            "graph_property": "_edge_weight_int",
+            "rec_type": "discrete-geometric",
+            "transform": "none",
+            "candidate_label": "trade:discrete-geometric/none",
+        }
+
+        with (
+            mock.patch("temporal_sbm.pipeline.prepare_data", return_value=prepared),
+            mock.patch("temporal_sbm.pipeline._validate_weight_generation_configuration"),
+            mock.patch("temporal_sbm.pipeline.build_layered_graph", return_value=object()),
+            mock.patch("temporal_sbm.pipeline._build_weight_candidates", return_value=[object()]) as build_weights,
+            mock.patch("temporal_sbm.pipeline._fit_with_weight_candidates", return_value=("state", weight_model, [])),
+            mock.patch("temporal_sbm.pipeline.attach_partition_maps"),
+            mock.patch("temporal_sbm.pipeline.write_fit_artifacts", return_value={"run_dir": "/tmp/netforge-fit"}),
+        ):
+            manifest = fit_command(args)
+
+        build_weights.assert_called_once()
+        self.assertEqual(manifest["run_dir"], "/tmp/netforge-fit")
+
     def test_stored_weight_reference_blocks_uses_saved_node_blocks(self):
         class DummyGraph:
             def num_vertices(self) -> int:
