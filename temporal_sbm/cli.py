@@ -254,8 +254,9 @@ def add_input_arguments(parser: argparse.ArgumentParser) -> None:
         help="Keep the full node universe during fitting instead of compacting to the active subgraph.",
     )
 
-
-def add_fit_arguments(parser: argparse.ArgumentParser) -> None:
+def add_fit_arguments(
+    parser: argparse.ArgumentParser,
+) -> None:
     parser.add_argument(
         "--fit-covariates",
         nargs="+",
@@ -341,7 +342,9 @@ def add_fit_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--anneal-beta-stop", type=float, default=10.0, help="Stopping beta when annealing is enabled.")
 
 
-def add_generation_arguments(parser: argparse.ArgumentParser) -> None:
+def add_generation_arguments(
+    parser: argparse.ArgumentParser,
+) -> None:
     parser.add_argument("--run-dir", default=None, help="Existing fitted run directory for generation/report stages.")
     parser.add_argument(
         "--output-subdir",
@@ -461,6 +464,16 @@ def add_report_arguments(parser: argparse.ArgumentParser) -> None:
         "--html-report-path",
         default=None,
         help="Output path for --html-report. Default: <run-dir>/diagnostics/scientific_validation_report.html.",
+    )
+    parser.add_argument(
+        "--skip-spectral-metrics",
+        action="store_true",
+        help="Skip magnetic-spectrum diagnostics during report generation.",
+    )
+    parser.add_argument(
+        "--skip-posterior-detail-aggregation",
+        action="store_true",
+        help="Skip cross-sample detail aggregation when building setting summaries.",
     )
 
 
@@ -587,12 +600,14 @@ def _report_one_sample(
     *,
     detailed_diagnostics: bool = False,
     diagnostic_top_k: int = 12,
+    skip_spectral_metrics: bool = False,
 ) -> dict:
-    LOGGER.debug(
-        "Reporting sample | run_dir=%s | synthetic_edges_csv=%s | sample_label=%s",
+    LOGGER.info(
+        "Reporting sample | run_dir=%s | synthetic_edges_csv=%s | sample_label=%s | detailed_diagnostics=%s",
         run_dir,
         synthetic_edges_csv,
         sample_label,
+        detailed_diagnostics,
     )
     manifest = load_manifest(run_dir)
     original_df = pd.read_csv(manifest["filtered_input_edges_path"])
@@ -616,6 +631,7 @@ def _report_one_sample(
 
     detailed_outputs = None
     if detailed_diagnostics:
+        LOGGER.info("Comparing panels with detailed diagnostics | sample_label=%s", sample_label)
         comparison = compare_panels_detailed(
             original_df=original_df,
             synthetic_df=synthetic_df,
@@ -624,11 +640,13 @@ def _report_one_sample(
             weight_col=weight_col,
             node_blocks=node_blocks,
             node_types=node_types,
+            skip_spectral_metrics=skip_spectral_metrics,
         )
         per_snapshot = comparison["per_snapshot"]
         summary = comparison["summary"]
         detailed_outputs = comparison.get("details") or {}
     else:
+        LOGGER.info("Comparing panels | sample_label=%s", sample_label)
         per_snapshot, summary = compare_panels(
             original_df=original_df,
             synthetic_df=synthetic_df,
@@ -646,7 +664,7 @@ def _report_one_sample(
         directed=bool(manifest["directed"]),
         diagnostic_top_k=diagnostic_top_k,
     )
-    LOGGER.debug("Completed sample report | sample_label=%s | summary=%s", sample_label, summary)
+    LOGGER.info("Completed sample report | sample_label=%s", sample_label)
     return {
         "sample_label": sample_label,
         "synthetic_edges_csv": str(synthetic_edges_csv),
@@ -774,16 +792,23 @@ def run_report_stage(args: argparse.Namespace) -> list[dict]:
         samples = _discover_generated_samples(run_dir, manifest)
         if not samples:
             raise ValueError(f"No generated samples were found under {run_dir / 'generated'} and none are usable from the run manifest.")
-    LOGGER.debug("Resolved report samples | %s", samples)
+    LOGGER.info("Resolved report samples | count=%s", len(samples))
 
     run_reports: list[dict] = []
     for sample in samples:
+        LOGGER.info(
+            "Starting report sample %s/%s | sample_label=%s",
+            len(run_reports) + 1,
+            len(samples),
+            sample["sample_label"],
+        )
         report = _report_one_sample(
             run_dir,
             Path(sample["synthetic_edges_csv"]),
             str(sample["sample_label"]),
             detailed_diagnostics=bool(getattr(args, "detailed_diagnostics", False)),
             diagnostic_top_k=max(1, int(getattr(args, "diagnostic_top_k", 12))),
+            skip_spectral_metrics=bool(getattr(args, "skip_spectral_metrics", False)),
         )
         report["setting_label"] = str(sample["setting_label"])
         report["sample_index"] = int(sample["sample_index"])
@@ -825,6 +850,8 @@ def run_report_stage(args: argparse.Namespace) -> list[dict]:
                 setting_label=setting_label,
                 directed=bool(manifest["directed"]),
                 diagnostic_top_k=max(1, int(getattr(args, "diagnostic_top_k", 12))),
+                skip_detail_aggregation=bool(getattr(args, "skip_posterior_detail_aggregation", False)),
+                skip_spectral_metrics=bool(getattr(args, "skip_spectral_metrics", False)),
             )
         )
 
@@ -855,6 +882,7 @@ def run_report_stage(args: argparse.Namespace) -> list[dict]:
         html_report_path = write_scientific_validation_report(
             run_dir=run_dir,
             output_path=Path(args.html_report_path).expanduser().resolve() if getattr(args, "html_report_path", None) else None,
+            skip_spectral_metrics=bool(getattr(args, "skip_spectral_metrics", False)),
         )
         manifest["scientific_validation_report_html"] = str(html_report_path)
     save_json(manifest, Path(manifest["manifest_path"]))

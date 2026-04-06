@@ -2513,6 +2513,7 @@ def compare_panels_detailed(
     weight_col: Optional[str] = None,
     node_blocks: Optional[Dict[int, int]] = None,
     node_types: Optional[Dict[int, str]] = None,
+    skip_spectral_metrics: bool = False,
 ) -> dict:
     per_snapshot, summary = compare_panels(
         original_df=original_df,
@@ -2762,39 +2763,42 @@ def compare_panels_detailed(
         summary["pagerank_active_farm_count_correlation"] = _metric_lookup(pi_pagerank_summary, "active_farm_count", "correlation") or 0.0
         summary["pagerank_active_region_count_correlation"] = _metric_lookup(pi_pagerank_summary, "active_region_count", "correlation") or 0.0
 
-    magnetic_original = _compute_magnetic_spectrum_time_series(
-        original,
-        node_universe=node_universe,
-        weight_col=effective_weight_col,
-        directed=directed,
-    )
-    magnetic_synthetic = _compute_magnetic_spectrum_time_series(
-        synthetic,
-        node_universe=node_universe,
-        weight_col=effective_weight_col,
-        directed=directed,
-    )
-    magnetic_merged = _merge_entity_time_series(magnetic_original, magnetic_synthetic, ["ts"])
-    magnetic_metrics = [column for column in magnetic_original.columns if column != "ts"]
-    magnetic_summary = _summarise_metric_time_series(magnetic_merged, magnetic_metrics)
-    if not magnetic_merged.empty:
-        details["magnetic_laplacian_per_snapshot"] = magnetic_merged
-        details["magnetic_laplacian_summary"] = magnetic_summary
-        if len(magnetic_summary):
-            summary["magnetic_spectrum_mean_correlation"] = float(pd.to_numeric(magnetic_summary["correlation"], errors="coerce").fillna(0.0).mean())
-            summary["magnetic_spectrum_mean_abs_delta"] = float(pd.to_numeric(magnetic_summary["mean_abs_delta"], errors="coerce").fillna(0.0).mean())
+    if skip_spectral_metrics:
+        LOGGER.info("Skipping magnetic spectral diagnostics for this comparison.")
+    else:
+        magnetic_original = _compute_magnetic_spectrum_time_series(
+            original,
+            node_universe=node_universe,
+            weight_col=effective_weight_col,
+            directed=directed,
+        )
+        magnetic_synthetic = _compute_magnetic_spectrum_time_series(
+            synthetic,
+            node_universe=node_universe,
+            weight_col=effective_weight_col,
+            directed=directed,
+        )
+        magnetic_merged = _merge_entity_time_series(magnetic_original, magnetic_synthetic, ["ts"])
+        magnetic_metrics = [column for column in magnetic_original.columns if column != "ts"]
+        magnetic_summary = _summarise_metric_time_series(magnetic_merged, magnetic_metrics)
+        if not magnetic_merged.empty:
+            details["magnetic_laplacian_per_snapshot"] = magnetic_merged
+            details["magnetic_laplacian_summary"] = magnetic_summary
+            if len(magnetic_summary):
+                summary["magnetic_spectrum_mean_correlation"] = float(pd.to_numeric(magnetic_summary["correlation"], errors="coerce").fillna(0.0).mean())
+                summary["magnetic_spectrum_mean_abs_delta"] = float(pd.to_numeric(magnetic_summary["mean_abs_delta"], errors="coerce").fillna(0.0).mean())
 
-    magnetic_distance = _compute_magnetic_spectral_distance_time_series(magnetic_original, magnetic_synthetic)
-    magnetic_distance_summary = _summarise_distance_time_series(
-        magnetic_distance,
-        ["spectral_wasserstein_distance", "spectral_mean_abs_delta", "spectral_rmse", "spectral_max_abs_delta"],
-    )
-    if not magnetic_distance.empty:
-        details["magnetic_spectral_distance_per_snapshot"] = magnetic_distance
-        details["magnetic_spectral_distance_summary"] = magnetic_distance_summary
-        summary["magnetic_spectral_wasserstein_mean"] = float(pd.to_numeric(magnetic_distance["spectral_wasserstein_distance"], errors="coerce").dropna().mean()) if len(magnetic_distance) else 0.0
-        summary["magnetic_spectral_wasserstein_median"] = float(pd.to_numeric(magnetic_distance["spectral_wasserstein_distance"], errors="coerce").dropna().median()) if len(magnetic_distance) else 0.0
-        summary["magnetic_spectral_wasserstein_max"] = float(pd.to_numeric(magnetic_distance["spectral_wasserstein_distance"], errors="coerce").dropna().max()) if len(magnetic_distance) else 0.0
+        magnetic_distance = _compute_magnetic_spectral_distance_time_series(magnetic_original, magnetic_synthetic)
+        magnetic_distance_summary = _summarise_distance_time_series(
+            magnetic_distance,
+            ["spectral_wasserstein_distance", "spectral_mean_abs_delta", "spectral_rmse", "spectral_max_abs_delta"],
+        )
+        if not magnetic_distance.empty:
+            details["magnetic_spectral_distance_per_snapshot"] = magnetic_distance
+            details["magnetic_spectral_distance_summary"] = magnetic_distance_summary
+            summary["magnetic_spectral_wasserstein_mean"] = float(pd.to_numeric(magnetic_distance["spectral_wasserstein_distance"], errors="coerce").dropna().mean()) if len(magnetic_distance) else 0.0
+            summary["magnetic_spectral_wasserstein_median"] = float(pd.to_numeric(magnetic_distance["spectral_wasserstein_distance"], errors="coerce").dropna().median()) if len(magnetic_distance) else 0.0
+            summary["magnetic_spectral_wasserstein_max"] = float(pd.to_numeric(magnetic_distance["spectral_wasserstein_distance"], errors="coerce").dropna().max()) if len(magnetic_distance) else 0.0
 
     details["summary"] = pd.DataFrame([summary])
     if not node_blocks:
@@ -8395,6 +8399,8 @@ def aggregate_posterior_reports(
     setting_label: str,
     directed: bool,
     diagnostic_top_k: int = 12,
+    skip_detail_aggregation: bool = False,
+    skip_spectral_metrics: bool = False,
 ) -> dict[str, object]:
     if not reports:
         raise ValueError(f"No reports were provided for posterior aggregation of setting '{setting_label}'.")
@@ -8405,82 +8411,96 @@ def aggregate_posterior_reports(
     summary = _aggregate_summary_payloads(setting_label, [dict(report["summary"]) for report in reports], run_labels=run_labels)
 
     detailed_outputs: dict[str, pd.DataFrame] = {}
-    raw_detail_frames: dict[str, list[pd.DataFrame]] = {}
-    for detail_key, group_keys in POSTERIOR_DETAIL_GROUP_KEYS.items():
-        frames: list[pd.DataFrame] = []
-        for report in reports:
-            outputs = dict(report.get("outputs", {}))
-            detail_path = outputs.get(detail_key)
-            if not detail_path:
+    if skip_detail_aggregation:
+        LOGGER.info(
+            "Skipping posterior detail aggregation for setting summary | setting_label=%s",
+            setting_label,
+        )
+    else:
+        raw_detail_frames: dict[str, list[pd.DataFrame]] = {}
+        for detail_key, group_keys in POSTERIOR_DETAIL_GROUP_KEYS.items():
+            frames: list[pd.DataFrame] = []
+            for report in reports:
+                outputs = dict(report.get("outputs", {}))
+                detail_path = outputs.get(detail_key)
+                if not detail_path:
+                    continue
+                path = Path(str(detail_path))
+                if path.exists():
+                    frames.append(pd.read_csv(path))
+            if frames:
+                raw_detail_frames[detail_key] = frames
+                detailed_outputs[detail_key] = _aggregate_grouped_numeric_frames(frames, group_keys=group_keys, run_labels=run_labels)
+
+        detailed_outputs = _recompute_posterior_detail_summaries(
+            detailed_outputs,
+            directed=directed,
+        )
+
+        entity_summary_specs = [
+            ("block_pair_per_snapshot", "block_pair_summary", ["block_u", "block_v"]),
+            ("block_activity_per_snapshot", "block_activity_summary", ["block_id"]),
+            ("node_activity_per_snapshot", "node_activity_summary", ["node_id", "block_id"]),
+            ("edge_type_per_snapshot", "edge_type_summary", ["source_type", "target_type"]),
+            ("tea_type_pair_per_snapshot", "tea_type_pair_summary", ["source_type", "target_type"]),
+            ("tna_type_per_snapshot", "tna_type_summary", ["type_label"]),
+        ]
+        for per_snapshot_key, summary_key, entity_keys in entity_summary_specs:
+            frames = raw_detail_frames.get(per_snapshot_key, [])
+            summary_frame = detailed_outputs.get(summary_key)
+            if not frames or summary_frame is None or summary_frame.empty:
                 continue
-            path = Path(str(detail_path))
-            if path.exists():
-                frames.append(pd.read_csv(path))
-        if frames:
-            raw_detail_frames[detail_key] = frames
-            detailed_outputs[detail_key] = _aggregate_grouped_numeric_frames(frames, group_keys=group_keys, run_labels=run_labels)
+            entity_metric_names = sorted(
+                {
+                    column.removesuffix("_correlation")
+                    for column in summary_frame.columns
+                    if str(column).endswith("_correlation") and not str(column).startswith("mean_abs_") and not str(column).startswith("max_abs_")
+                }
+            )
+            detail_frame = _posterior_entity_correlation_details(
+                frames,
+                entity_keys=entity_keys,
+                metric_names=entity_metric_names,
+                run_labels=run_labels,
+            )
+            detailed_outputs[summary_key] = _merge_posterior_correlation_details(summary_frame, detail_frame, on_keys=entity_keys)
 
-    detailed_outputs = _recompute_posterior_detail_summaries(
-        detailed_outputs,
-        directed=directed,
-    )
+        metric_summary_specs = [
+            ("tea_per_snapshot", "tea_summary"),
+            ("tna_per_snapshot", "tna_summary"),
+            ("pi_mass_per_snapshot", "pi_mass_summary"),
+            ("pi_mass_closed_per_snapshot", "pi_mass_closed_summary"),
+            ("pi_mass_pagerank_per_snapshot", "pi_mass_pagerank_summary"),
+        ]
+        if not skip_spectral_metrics:
+            metric_summary_specs.append(("magnetic_laplacian_per_snapshot", "magnetic_laplacian_summary"))
+        for per_snapshot_key, summary_key in metric_summary_specs:
+            frames = raw_detail_frames.get(per_snapshot_key, [])
+            summary_frame = detailed_outputs.get(summary_key)
+            if not frames or summary_frame is None or summary_frame.empty or "metric" not in summary_frame.columns:
+                continue
+            metric_names = summary_frame["metric"].astype(str).tolist()
+            detail_frame = _posterior_metric_correlation_details(
+                frames,
+                metric_names=metric_names,
+                run_labels=run_labels,
+            )
+            detailed_outputs[summary_key] = _merge_posterior_correlation_details(summary_frame, detail_frame, on_keys=["metric"])
 
-    entity_summary_specs = [
-        ("block_pair_per_snapshot", "block_pair_summary", ["block_u", "block_v"]),
-        ("block_activity_per_snapshot", "block_activity_summary", ["block_id"]),
-        ("node_activity_per_snapshot", "node_activity_summary", ["node_id", "block_id"]),
-        ("edge_type_per_snapshot", "edge_type_summary", ["source_type", "target_type"]),
-        ("tea_type_pair_per_snapshot", "tea_type_pair_summary", ["source_type", "target_type"]),
-        ("tna_type_per_snapshot", "tna_type_summary", ["type_label"]),
-    ]
-    for per_snapshot_key, summary_key, entity_keys in entity_summary_specs:
-        frames = raw_detail_frames.get(per_snapshot_key, [])
-        summary_frame = detailed_outputs.get(summary_key)
-        if not frames or summary_frame is None or summary_frame.empty:
-            continue
-        entity_metric_names = sorted(
-            {
-                column.removesuffix("_correlation")
-                for column in summary_frame.columns
-                if str(column).endswith("_correlation") and not str(column).startswith("mean_abs_") and not str(column).startswith("max_abs_")
-            }
+        if skip_spectral_metrics:
+            detailed_outputs.pop("magnetic_laplacian_per_snapshot", None)
+            detailed_outputs.pop("magnetic_laplacian_summary", None)
+            detailed_outputs.pop("magnetic_spectral_distance_per_snapshot", None)
+            detailed_outputs.pop("magnetic_spectral_distance_summary", None)
+            raw_detail_frames.pop("magnetic_laplacian_per_snapshot", None)
+
+        _update_summary_with_recomputed_diagnostics(
+            summary,
+            per_snapshot=per_snapshot,
+            detailed_outputs=detailed_outputs,
+            run_level_per_snapshot=per_snapshot_frames,
+            run_level_details=raw_detail_frames,
         )
-        detail_frame = _posterior_entity_correlation_details(
-            frames,
-            entity_keys=entity_keys,
-            metric_names=entity_metric_names,
-            run_labels=run_labels,
-        )
-        detailed_outputs[summary_key] = _merge_posterior_correlation_details(summary_frame, detail_frame, on_keys=entity_keys)
-
-    metric_summary_specs = [
-        ("tea_per_snapshot", "tea_summary"),
-        ("tna_per_snapshot", "tna_summary"),
-        ("pi_mass_per_snapshot", "pi_mass_summary"),
-        ("pi_mass_closed_per_snapshot", "pi_mass_closed_summary"),
-        ("pi_mass_pagerank_per_snapshot", "pi_mass_pagerank_summary"),
-        ("magnetic_laplacian_per_snapshot", "magnetic_laplacian_summary"),
-    ]
-    for per_snapshot_key, summary_key in metric_summary_specs:
-        frames = raw_detail_frames.get(per_snapshot_key, [])
-        summary_frame = detailed_outputs.get(summary_key)
-        if not frames or summary_frame is None or summary_frame.empty or "metric" not in summary_frame.columns:
-            continue
-        metric_names = summary_frame["metric"].astype(str).tolist()
-        detail_frame = _posterior_metric_correlation_details(
-            frames,
-            metric_names=metric_names,
-            run_labels=run_labels,
-        )
-        detailed_outputs[summary_key] = _merge_posterior_correlation_details(summary_frame, detail_frame, on_keys=["metric"])
-
-    _update_summary_with_recomputed_diagnostics(
-        summary,
-        per_snapshot=per_snapshot,
-        detailed_outputs=detailed_outputs,
-        run_level_per_snapshot=per_snapshot_frames,
-        run_level_details=raw_detail_frames,
-    )
 
     report_paths = write_report(
         per_snapshot=per_snapshot,
@@ -8544,6 +8564,7 @@ def write_scientific_validation_report(
     *,
     output_path: Optional[Path] = None,
     title: Optional[str] = None,
+    skip_spectral_metrics: bool = False,
 ) -> Path:
     run_dir = Path(run_dir).expanduser().resolve()
     diagnostics_dir = run_dir / "diagnostics"
@@ -8601,12 +8622,14 @@ def write_scientific_validation_report(
         if label not in selected_labels:
             selected_labels.append(label)
     selected_local_fit_path = _write_selected_setting_local_fit_plot(selected_labels, diagnostics_dir, diagnostics_dir)
-    phase_assets = _write_hybrid_phase_assets(
-        run_dir,
-        diagnostics_dir,
-        manifest,
-        summary_rows["sample_label"].astype(str).tolist(),
-    )
+    phase_assets = None
+    if not skip_spectral_metrics:
+        phase_assets = _write_hybrid_phase_assets(
+            run_dir,
+            diagnostics_dir,
+            manifest,
+            summary_rows["sample_label"].astype(str).tolist(),
+        )
     network_assets = _write_daily_network_snapshot_assets(
         run_dir,
         diagnostics_dir,

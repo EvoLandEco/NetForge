@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from temporal_sbm.pipeline import (
+    DEFAULT_METADATA_FIELDS,
     _build_joint_metadata_links,
     _align_external_weight_values,
     _detect_transformed_external_weight_companion,
@@ -31,6 +32,17 @@ from temporal_sbm.pipeline import (
 
 
 class PipelineWeightAlignmentTests(unittest.TestCase):
+    def test_default_metadata_fields_include_rebuilt_cr35_tags(self):
+        self.assertIn("coord_source", DEFAULT_METADATA_FIELDS)
+        self.assertIn("priority", DEFAULT_METADATA_FIELDS)
+        self.assertIn("CR_code", DEFAULT_METADATA_FIELDS)
+        self.assertIn("trade_species", DEFAULT_METADATA_FIELDS)
+        self.assertIn("diersoort", DEFAULT_METADATA_FIELDS)
+        self.assertIn("diergroep", DEFAULT_METADATA_FIELDS)
+        self.assertIn("diergroeplang", DEFAULT_METADATA_FIELDS)
+        self.assertIn("BtypNL", DEFAULT_METADATA_FIELDS)
+        self.assertIn("bedrtype", DEFAULT_METADATA_FIELDS)
+
     def test_fit_command_keeps_weight_candidates_when_joint_metadata_is_active(self):
         prepared = argparse.Namespace(
             metadata_summary={"enabled": True},
@@ -296,6 +308,63 @@ class PipelineWeightAlignmentTests(unittest.TestCase):
         self.assertIn("corop", summary["fields_used"])
         self.assertIn("num_farms_bin", summary["fields_used"])
         self.assertIn("total_animals_bin", summary["fields_used"])
+
+    def test_build_joint_metadata_links_splits_multi_value_text_fields(self):
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            node_map_csv = tmp_path / "node_map.csv"
+            pd.DataFrame(
+                {
+                    "node_id": [0, 1],
+                    "type": ["Farm", "Farm"],
+                    "corop": ["CR35", "CR35"],
+                    "diersoort": ["RUNDVEE|SCHAPEN", "GEITEN;SCHAPEN"],
+                    "trade_species": ["cows;goats", "sheep|goats|sheep"],
+                }
+            ).to_csv(node_map_csv, index=False)
+
+            args = argparse.Namespace(
+                joint_metadata_model=True,
+                metadata_fields=["diersoort", "trade_species"],
+                metadata_numeric_bins=2,
+                metadata_grid_km=50.0,
+                metadata_ft_top_k=3,
+            )
+
+            links, summary = _build_joint_metadata_links(
+                compact_to_original=np.array([0, 1], dtype=np.int64),
+                node_features=np.array(
+                    [
+                        [0.0, 0.0, 0.0, 0.0],
+                        [10.0, 20.0, 1.0, 20.0],
+                        [30.0, 40.0, 1.0, 40.0],
+                    ],
+                    dtype=float,
+                ),
+                node_feature_columns=["xco", "yco", "num_farms", "total_animals"],
+                centroid_x_index=0,
+                centroid_y_index=1,
+                active_compact_mask=np.array([True, True]),
+                node_map_csv=node_map_csv,
+                args=args,
+            )
+
+        self.assertEqual(summary["field_link_counts"]["diersoort"], 4)
+        self.assertEqual(summary["field_link_counts"]["trade_species"], 4)
+        self.assertEqual(summary["field_tag_counts"]["diersoort"], 3)
+        self.assertEqual(summary["field_tag_counts"]["trade_species"], 3)
+        self.assertEqual(
+            set(links["tag_key"]),
+            {
+                "diersoort::GEITEN",
+                "diersoort::RUNDVEE",
+                "diersoort::SCHAPEN",
+                "trade_species::cows",
+                "trade_species::goats",
+                "trade_species::sheep",
+            },
+        )
+        self.assertEqual(len(links), 8)
 
     def test_select_covariate_specs_accepts_none_sentinel(self):
         available = [

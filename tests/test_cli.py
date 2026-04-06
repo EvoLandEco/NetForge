@@ -56,6 +56,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.command, "sweep")
         self.assertEqual(args.config, "/tmp/sweep.json")
 
+    def test_build_parser_accepts_skip_spectral_metrics(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "report",
+                "--run-dir",
+                "/tmp/run",
+                "--skip-spectral-metrics",
+                "--skip-posterior-detail-aggregation",
+            ]
+        )
+
+        self.assertTrue(args.skip_spectral_metrics)
+        self.assertTrue(args.skip_posterior_detail_aggregation)
+
     def test_build_parser_exposes_parametric_weight_generation_arguments(self):
         parser = build_parser()
         args = parser.parse_args(
@@ -80,6 +95,20 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.weight_parametric_family, "lognormal")
         self.assertEqual(args.weight_prior_strength, 7.5)
         self.assertTrue(args.weight_pure_generative)
+
+    def test_build_parser_rejects_retired_temporal_generation_flags(self):
+        parser = build_parser()
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "generate",
+                    "--run-dir",
+                    "/tmp/run",
+                    "--temporal-edge-generation-mode",
+                    "schedule",
+                ]
+            )
 
     def test_build_parser_accepts_exclude_weight_from_fit(self):
         parser = build_parser()

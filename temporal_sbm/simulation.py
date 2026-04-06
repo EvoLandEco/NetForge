@@ -1449,6 +1449,293 @@ def _summarise_region_daily_arrays(
     return pd.DataFrame(rows)
 
 
+def _reservoir_active_threshold(config: HybridSimulationConfig) -> float:
+    background = max(float(config.reservoir_background), 0.0)
+    decay = float(config.reservoir_decay)
+    if background <= 0.0:
+        return 0.0
+    if decay >= 1.0:
+        return background
+    return background / max(1e-9, 1.0 - decay)
+
+
+def _prepare_rf_edge_day_bundles(pack: HybridPanelPack) -> dict[str, object]:
+    node_count = len(pack.node_universe)
+    is_farm = np.asarray(pack.is_farm, dtype=bool)
+    is_region = np.asarray(pack.is_region, dtype=bool)
+    farm_positions = np.flatnonzero(is_farm)
+    region_positions = np.flatnonzero(is_region)
+    farm_order_by_node = np.full(node_count, -1, dtype=np.int64)
+    region_order_by_node = np.full(node_count, -1, dtype=np.int64)
+    farm_order_by_node[farm_positions] = np.arange(len(farm_positions), dtype=np.int64)
+    region_order_by_node[region_positions] = np.arange(len(region_positions), dtype=np.int64)
+
+    empty_int = np.array([], dtype=np.int64)
+    empty_float = np.array([], dtype=float)
+    day_bundles: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for src_nodes, dst_nodes, weights in zip(pack.src, pack.dst, pack.weight):
+        src = np.asarray(src_nodes, dtype=np.int64)
+        dst = np.asarray(dst_nodes, dtype=np.int64)
+        weight = np.asarray(weights, dtype=float)
+        if len(src) == 0:
+            day_bundles.append((empty_int, empty_int, empty_float))
+            continue
+        rf_mask = is_region[src] & is_farm[dst]
+        if not bool(rf_mask.any()):
+            day_bundles.append((empty_int, empty_int, empty_float))
+            continue
+        region_ids = region_order_by_node[src[rf_mask]]
+        farm_ids = farm_order_by_node[dst[rf_mask]]
+        edge_weights = weight[rf_mask]
+        valid = (region_ids >= 0) & (farm_ids >= 0)
+        day_bundles.append(
+            (
+                region_ids[valid].astype(np.int64, copy=False),
+                farm_ids[valid].astype(np.int64, copy=False),
+                edge_weights[valid].astype(float, copy=False),
+            )
+        )
+    return {
+        "farm_count": int(len(farm_positions)),
+        "region_count": int(len(region_positions)),
+        "day_bundles": tuple(day_bundles),
+    }
+
+
+def _rf_indegree_and_hazard_from_field(
+    bundle: tuple[np.ndarray, np.ndarray, np.ndarray],
+    region_field: np.ndarray,
+    *,
+    farm_count: int,
+    positive_threshold: float,
+    config: HybridSimulationConfig,
+) -> tuple[np.ndarray, float]:
+    region_ids, farm_ids, weights = bundle
+    indegree = np.zeros(farm_count, dtype=float)
+    if len(region_ids) == 0 or farm_count == 0:
+        return indegree, 0.0
+    field = np.asarray(region_field, dtype=float)
+    if field.ndim != 1:
+        raise ValueError("Region field must be one-dimensional.")
+    valid = region_ids < len(field)
+    if not bool(valid.any()):
+        return indegree, 0.0
+    region_ids = region_ids[valid]
+    farm_ids = farm_ids[valid]
+    weights = weights[valid]
+    effective_pressure = np.clip(field[region_ids], a_min=0.0, a_max=float(config.reservoir_clip))
+    positive_mask = effective_pressure > positive_threshold
+    if bool(positive_mask.any()):
+        indegree = np.bincount(farm_ids[positive_mask], minlength=farm_count).astype(float)
+    hazard_total = float(np.sum(float(config.beta_rf) * weights * np.log1p(effective_pressure) * float(config.farm_susceptibility)))
+    return indegree, hazard_total
+
+
+def _summarise_rf_pathway_fields(
+    *,
+    pack: HybridPanelPack,
+    region_fields: np.ndarray,
+    config: HybridSimulationConfig,
+    hazard_metric_name: Optional[str] = None,
+) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+    region_fields_array = np.asarray(region_fields, dtype=float)
+    if region_fields_array.ndim != 3 or region_fields_array.shape[2] != len(pack.ts_values):
+        return pd.DataFrame(columns=["day_index", "ts"]), {}
+
+    bundle_info = _prepare_rf_edge_day_bundles(pack)
+    farm_count = int(bundle_info["farm_count"])
+    if farm_count == 0:
+        return pd.DataFrame(columns=["day_index", "ts"]), {}
+
+    day_bundles = tuple(bundle_info["day_bundles"])
+    run_count = int(region_fields_array.shape[0])
+    day_count = int(region_fields_array.shape[2])
+    arrays: dict[str, np.ndarray] = {
+        "positive_rf_farm_count": np.zeros((run_count, day_count), dtype=float),
+        "positive_rf_union_7d_farm_count": np.zeros((run_count, day_count), dtype=float),
+        "positive_rf_indegree_mean": np.zeros((run_count, day_count), dtype=float),
+        "positive_rf_indegree_median": np.zeros((run_count, day_count), dtype=float),
+        "positive_rf_indegree_q95": np.zeros((run_count, day_count), dtype=float),
+        "positive_rf_indegree_max": np.zeros((run_count, day_count), dtype=float),
+    }
+    if hazard_metric_name:
+        arrays[str(hazard_metric_name)] = np.zeros((run_count, day_count), dtype=float)
+
+    positive_threshold = _reservoir_active_threshold(config)
+    for run_index in range(run_count):
+        reach_window: list[np.ndarray] = []
+        for day_index, bundle in enumerate(day_bundles):
+            indegree, hazard_total = _rf_indegree_and_hazard_from_field(
+                bundle,
+                region_fields_array[run_index, :, day_index],
+                farm_count=farm_count,
+                positive_threshold=positive_threshold,
+                config=config,
+            )
+            reached = indegree > 0
+            reach_window.append(reached)
+            if len(reach_window) > 7:
+                reach_window.pop(0)
+            union_mask = np.logical_or.reduce(reach_window) if reach_window else np.zeros(farm_count, dtype=bool)
+            arrays["positive_rf_farm_count"][run_index, day_index] = float(np.sum(reached))
+            arrays["positive_rf_union_7d_farm_count"][run_index, day_index] = float(np.sum(union_mask))
+            arrays["positive_rf_indegree_mean"][run_index, day_index] = float(np.mean(indegree))
+            arrays["positive_rf_indegree_median"][run_index, day_index] = float(np.median(indegree))
+            arrays["positive_rf_indegree_q95"][run_index, day_index] = float(np.quantile(indegree, 0.95))
+            arrays["positive_rf_indegree_max"][run_index, day_index] = float(np.max(indegree)) if len(indegree) else 0.0
+            if hazard_metric_name:
+                arrays[str(hazard_metric_name)][run_index, day_index] = hazard_total
+
+    summary = _summarise_daily_arrays(ts_values=pack.ts_values, arrays=arrays)
+    return summary, arrays
+
+
+def _binary_jaccard(left: np.ndarray, right: np.ndarray) -> float:
+    left_bool = np.asarray(left, dtype=bool)
+    right_bool = np.asarray(right, dtype=bool)
+    union = np.logical_or(left_bool, right_bool)
+    if not bool(union.any()):
+        return 1.0
+    return float(np.sum(np.logical_and(left_bool, right_bool)) / np.sum(union))
+
+
+def _summarise_daily_comparison_arrays(
+    *,
+    ts_values: tuple[int, ...],
+    arrays: dict[str, np.ndarray],
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    if not arrays:
+        return pd.DataFrame(columns=["day_index", "ts"])
+    for day_index, ts_value in enumerate(ts_values):
+        row: dict[str, object] = {"day_index": int(day_index), "ts": int(ts_value)}
+        for metric_name, matrix in arrays.items():
+            values = np.asarray(matrix[:, day_index], dtype=float)
+            finite = values[np.isfinite(values)]
+            if len(finite):
+                row[metric_name] = float(np.mean(finite))
+                row[f"{metric_name}_q05"] = float(np.quantile(finite, 0.05))
+                row[f"{metric_name}_q95"] = float(np.quantile(finite, 0.95))
+                row[f"{metric_name}_std"] = float(np.std(finite, ddof=0))
+            else:
+                row[metric_name] = np.nan
+                row[f"{metric_name}_q05"] = np.nan
+                row[f"{metric_name}_q95"] = np.nan
+                row[f"{metric_name}_std"] = np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _compare_rf_pathway_fields(
+    *,
+    observed_pack: HybridPanelPack,
+    synthetic_pack: HybridPanelPack,
+    observed_region_fields: np.ndarray,
+    synthetic_region_fields: np.ndarray,
+    config: HybridSimulationConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    observed_reservoir = np.asarray(observed_region_fields, dtype=float)
+    synthetic_reservoir = np.asarray(synthetic_region_fields, dtype=float)
+    if (
+        observed_reservoir.ndim != 3
+        or synthetic_reservoir.ndim != 3
+        or observed_reservoir.shape[2] != len(observed_pack.ts_values)
+        or synthetic_reservoir.shape[2] != len(synthetic_pack.ts_values)
+    ):
+        empty = pd.DataFrame(columns=["day_index", "ts"])
+        return empty, empty, empty
+
+    observed_daily, _ = _summarise_rf_pathway_fields(
+        pack=observed_pack,
+        region_fields=observed_reservoir,
+        config=config,
+        hazard_metric_name="rf_observed_field_hazard",
+    )
+    synthetic_own_daily, _ = _summarise_rf_pathway_fields(
+        pack=synthetic_pack,
+        region_fields=synthetic_reservoir,
+        config=config,
+        hazard_metric_name=None,
+    )
+    synthetic_observed_field_daily, _ = _summarise_rf_pathway_fields(
+        pack=synthetic_pack,
+        region_fields=observed_reservoir,
+        config=config,
+        hazard_metric_name="rf_observed_field_hazard",
+    )
+    hazard_columns = [
+        "rf_observed_field_hazard",
+        "rf_observed_field_hazard_q05",
+        "rf_observed_field_hazard_q95",
+        "rf_observed_field_hazard_mean",
+        "rf_observed_field_hazard_std",
+    ]
+    synthetic_daily = synthetic_own_daily.merge(
+        synthetic_observed_field_daily[["day_index", "ts", *hazard_columns]],
+        on=["day_index", "ts"],
+        how="left",
+    )
+
+    observed_bundle = _prepare_rf_edge_day_bundles(observed_pack)
+    synthetic_bundle = _prepare_rf_edge_day_bundles(synthetic_pack)
+    farm_count = min(int(observed_bundle["farm_count"]), int(synthetic_bundle["farm_count"]))
+    if farm_count == 0:
+        return observed_daily, synthetic_daily, _merge_daily_summaries(observed_daily, synthetic_daily)
+
+    run_count = min(int(observed_reservoir.shape[0]), int(synthetic_reservoir.shape[0]))
+    day_count = min(int(observed_reservoir.shape[2]), int(synthetic_reservoir.shape[2]))
+    compare_arrays: dict[str, np.ndarray] = {
+        "positive_rf_reach_jaccard": np.zeros((run_count, day_count), dtype=float),
+        "positive_rf_union_7d_jaccard": np.zeros((run_count, day_count), dtype=float),
+        "positive_rf_indegree_wasserstein": np.zeros((run_count, day_count), dtype=float),
+        "positive_rf_indegree_energy_distance": np.zeros((run_count, day_count), dtype=float),
+    }
+    positive_threshold = _reservoir_active_threshold(config)
+    observed_bundles = tuple(observed_bundle["day_bundles"])
+    synthetic_bundles = tuple(synthetic_bundle["day_bundles"])
+    for run_index in range(run_count):
+        observed_window: list[np.ndarray] = []
+        synthetic_window: list[np.ndarray] = []
+        for day_index in range(day_count):
+            observed_indegree, _ = _rf_indegree_and_hazard_from_field(
+                observed_bundles[day_index],
+                observed_reservoir[run_index, :, day_index],
+                farm_count=farm_count,
+                positive_threshold=positive_threshold,
+                config=config,
+            )
+            synthetic_indegree, _ = _rf_indegree_and_hazard_from_field(
+                synthetic_bundles[day_index],
+                synthetic_reservoir[run_index, :, day_index],
+                farm_count=farm_count,
+                positive_threshold=positive_threshold,
+                config=config,
+            )
+            observed_reached = observed_indegree > 0
+            synthetic_reached = synthetic_indegree > 0
+            observed_window.append(observed_reached)
+            synthetic_window.append(synthetic_reached)
+            if len(observed_window) > 7:
+                observed_window.pop(0)
+            if len(synthetic_window) > 7:
+                synthetic_window.pop(0)
+            observed_union = np.logical_or.reduce(observed_window) if observed_window else np.zeros(farm_count, dtype=bool)
+            synthetic_union = np.logical_or.reduce(synthetic_window) if synthetic_window else np.zeros(farm_count, dtype=bool)
+            compare_arrays["positive_rf_reach_jaccard"][run_index, day_index] = _binary_jaccard(observed_reached, synthetic_reached)
+            compare_arrays["positive_rf_union_7d_jaccard"][run_index, day_index] = _binary_jaccard(observed_union, synthetic_union)
+            compare_arrays["positive_rf_indegree_wasserstein"][run_index, day_index] = _wasserstein_distance_1d(observed_indegree, synthetic_indegree)
+            compare_arrays["positive_rf_indegree_energy_distance"][run_index, day_index] = _ensemble_energy_distance(
+                observed_indegree.reshape(1, -1),
+                synthetic_indegree.reshape(1, -1),
+            )
+
+    compare_daily = _summarise_daily_comparison_arrays(ts_values=tuple(observed_pack.ts_values[:day_count]), arrays=compare_arrays)
+    rf_pathway_daily = _merge_daily_summaries(observed_daily, synthetic_daily)
+    if not compare_daily.empty:
+        rf_pathway_daily = rf_pathway_daily.merge(compare_daily, on=["day_index", "ts"], how="left")
+    return observed_daily, synthetic_daily, rf_pathway_daily
+
+
 def _summarise_farm_node_arrays(
     *,
     pack: HybridPanelPack,
@@ -2487,6 +2774,8 @@ def _compare_simulation_outputs(
     synthetic_daily: pd.DataFrame,
     synthetic_region_daily: pd.DataFrame,
     *,
+    observed_pack: HybridPanelPack,
+    synthetic_pack: HybridPanelPack,
     observed_diagnostics: Optional[dict[str, object]] = None,
     synthetic_diagnostics: Optional[dict[str, object]] = None,
     config: HybridSimulationConfig,
@@ -2505,7 +2794,21 @@ def _compare_simulation_outputs(
     observed_farm_summary = observed_farm_summary_obj.copy() if isinstance(observed_farm_summary_obj, pd.DataFrame) else pd.DataFrame()
     synthetic_farm_summary = synthetic_farm_summary_obj.copy() if isinstance(synthetic_farm_summary_obj, pd.DataFrame) else pd.DataFrame()
 
-    per_snapshot = _merge_daily_summaries(observed_daily, synthetic_daily)
+    observed_rf_daily, synthetic_rf_daily, rf_pathway_daily = _compare_rf_pathway_fields(
+        observed_pack=observed_pack,
+        synthetic_pack=synthetic_pack,
+        observed_region_fields=np.asarray(observed_region_arrays.get("reservoir_pressure", np.empty((0, 0, 0))), dtype=float),
+        synthetic_region_fields=np.asarray(synthetic_region_arrays.get("reservoir_pressure", np.empty((0, 0, 0))), dtype=float),
+        config=config,
+    )
+    observed_daily_with_rf = observed_daily.copy()
+    if not observed_rf_daily.empty:
+        observed_daily_with_rf = observed_daily_with_rf.merge(observed_rf_daily, on=["day_index", "ts"], how="left")
+    synthetic_daily_with_rf = synthetic_daily.copy()
+    if not synthetic_rf_daily.empty:
+        synthetic_daily_with_rf = synthetic_daily_with_rf.merge(synthetic_rf_daily, on=["day_index", "ts"], how="left")
+
+    per_snapshot = _merge_daily_summaries(observed_daily_with_rf, synthetic_daily_with_rf)
     outcome_metrics = [
         "farm_attack_rate",
         "farm_attack_count",
@@ -2559,6 +2862,26 @@ def _compare_simulation_outputs(
         _frame_numeric_series(per_snapshot, "original_farm_hazard_rf").fillna(0.0).to_numpy(dtype=float),
         _frame_numeric_series(per_snapshot, "synthetic_farm_hazard_rf").fillna(0.0).to_numpy(dtype=float),
     ) if len(per_snapshot) and "original_farm_hazard_rf" in per_snapshot.columns and "synthetic_farm_hazard_rf" in per_snapshot.columns else np.nan
+    positive_rf_farm_count_corr = _safe_correlation(
+        _frame_numeric_series(per_snapshot, "original_positive_rf_farm_count").fillna(0.0).to_numpy(dtype=float),
+        _frame_numeric_series(per_snapshot, "synthetic_positive_rf_farm_count").fillna(0.0).to_numpy(dtype=float),
+    ) if len(per_snapshot) and "original_positive_rf_farm_count" in per_snapshot.columns and "synthetic_positive_rf_farm_count" in per_snapshot.columns else np.nan
+    positive_rf_union_7d_farm_count_corr = _safe_correlation(
+        _frame_numeric_series(per_snapshot, "original_positive_rf_union_7d_farm_count").fillna(0.0).to_numpy(dtype=float),
+        _frame_numeric_series(per_snapshot, "synthetic_positive_rf_union_7d_farm_count").fillna(0.0).to_numpy(dtype=float),
+    ) if len(per_snapshot) and "original_positive_rf_union_7d_farm_count" in per_snapshot.columns and "synthetic_positive_rf_union_7d_farm_count" in per_snapshot.columns else np.nan
+    positive_rf_indegree_mean_corr = _safe_correlation(
+        _frame_numeric_series(per_snapshot, "original_positive_rf_indegree_mean").fillna(0.0).to_numpy(dtype=float),
+        _frame_numeric_series(per_snapshot, "synthetic_positive_rf_indegree_mean").fillna(0.0).to_numpy(dtype=float),
+    ) if len(per_snapshot) and "original_positive_rf_indegree_mean" in per_snapshot.columns and "synthetic_positive_rf_indegree_mean" in per_snapshot.columns else np.nan
+    positive_rf_indegree_q95_corr = _safe_correlation(
+        _frame_numeric_series(per_snapshot, "original_positive_rf_indegree_q95").fillna(0.0).to_numpy(dtype=float),
+        _frame_numeric_series(per_snapshot, "synthetic_positive_rf_indegree_q95").fillna(0.0).to_numpy(dtype=float),
+    ) if len(per_snapshot) and "original_positive_rf_indegree_q95" in per_snapshot.columns and "synthetic_positive_rf_indegree_q95" in per_snapshot.columns else np.nan
+    rf_observed_field_hazard_corr = _safe_correlation(
+        _frame_numeric_series(per_snapshot, "original_rf_observed_field_hazard").fillna(0.0).to_numpy(dtype=float),
+        _frame_numeric_series(per_snapshot, "synthetic_rf_observed_field_hazard").fillna(0.0).to_numpy(dtype=float),
+    ) if len(per_snapshot) and "original_rf_observed_field_hazard" in per_snapshot.columns and "synthetic_rf_observed_field_hazard" in per_snapshot.columns else np.nan
     region_pressure_fr_corr = _safe_correlation(
         _frame_numeric_series(per_snapshot, "original_region_pressure_fr").fillna(0.0).to_numpy(dtype=float),
         _frame_numeric_series(per_snapshot, "synthetic_region_pressure_fr").fillna(0.0).to_numpy(dtype=float),
@@ -2583,6 +2906,11 @@ def _compare_simulation_outputs(
             "reservoir_total",
             "reservoir_max",
             "reservoir_positive_regions",
+            "positive_rf_farm_count",
+            "positive_rf_union_7d_farm_count",
+            "positive_rf_indegree_mean",
+            "positive_rf_indegree_q95",
+            "rf_observed_field_hazard",
         ]
     ])
     daily_mean_comparison = pd.DataFrame([
@@ -2594,6 +2922,11 @@ def _compare_simulation_outputs(
             "reservoir_total",
             "reservoir_max",
             "reservoir_positive_regions",
+            "positive_rf_farm_count",
+            "positive_rf_union_7d_farm_count",
+            "positive_rf_indegree_mean",
+            "positive_rf_indegree_q95",
+            "rf_observed_field_hazard",
         ]
     ])
     scalar_calibration = pd.DataFrame([
@@ -2694,6 +3027,11 @@ def _compare_simulation_outputs(
         "reservoir_positive_regions_curve_correlation": float(reservoir_positive_regions_corr),
         "farm_hazard_ff_curve_correlation": float(farm_hazard_ff_corr) if pd.notna(farm_hazard_ff_corr) else np.nan,
         "farm_hazard_rf_curve_correlation": float(farm_hazard_rf_corr) if pd.notna(farm_hazard_rf_corr) else np.nan,
+        "positive_rf_farm_count_curve_correlation": float(positive_rf_farm_count_corr) if pd.notna(positive_rf_farm_count_corr) else np.nan,
+        "positive_rf_union_7d_farm_count_curve_correlation": float(positive_rf_union_7d_farm_count_corr) if pd.notna(positive_rf_union_7d_farm_count_corr) else np.nan,
+        "positive_rf_indegree_mean_curve_correlation": float(positive_rf_indegree_mean_corr) if pd.notna(positive_rf_indegree_mean_corr) else np.nan,
+        "positive_rf_indegree_q95_curve_correlation": float(positive_rf_indegree_q95_corr) if pd.notna(positive_rf_indegree_q95_corr) else np.nan,
+        "rf_observed_field_hazard_curve_correlation": float(rf_observed_field_hazard_corr) if pd.notna(rf_observed_field_hazard_corr) else np.nan,
         "region_pressure_fr_curve_correlation": float(region_pressure_fr_corr) if pd.notna(region_pressure_fr_corr) else np.nan,
         "region_pressure_rr_curve_correlation": float(region_pressure_rr_corr) if pd.notna(region_pressure_rr_corr) else np.nan,
         "mean_abs_farm_prevalence_delta": float(pd.to_numeric(per_snapshot.get("farm_prevalence_delta", np.nan), errors="coerce").abs().mean()) if "farm_prevalence_delta" in per_snapshot.columns else np.nan,
@@ -2703,6 +3041,11 @@ def _compare_simulation_outputs(
         "mean_abs_reservoir_max_delta": float(pd.to_numeric(per_snapshot.get("reservoir_max_delta", np.nan), errors="coerce").abs().mean()) if "reservoir_max_delta" in per_snapshot.columns else np.nan,
         "mean_abs_farm_hazard_ff_delta": float(pd.to_numeric(per_snapshot.get("farm_hazard_ff_delta", np.nan), errors="coerce").abs().mean()) if "farm_hazard_ff_delta" in per_snapshot.columns else np.nan,
         "mean_abs_farm_hazard_rf_delta": float(pd.to_numeric(per_snapshot.get("farm_hazard_rf_delta", np.nan), errors="coerce").abs().mean()) if "farm_hazard_rf_delta" in per_snapshot.columns else np.nan,
+        "mean_abs_positive_rf_farm_count_delta": float(pd.to_numeric(per_snapshot.get("positive_rf_farm_count_delta", np.nan), errors="coerce").abs().mean()) if "positive_rf_farm_count_delta" in per_snapshot.columns else np.nan,
+        "mean_abs_positive_rf_union_7d_farm_count_delta": float(pd.to_numeric(per_snapshot.get("positive_rf_union_7d_farm_count_delta", np.nan), errors="coerce").abs().mean()) if "positive_rf_union_7d_farm_count_delta" in per_snapshot.columns else np.nan,
+        "mean_abs_positive_rf_indegree_mean_delta": float(pd.to_numeric(per_snapshot.get("positive_rf_indegree_mean_delta", np.nan), errors="coerce").abs().mean()) if "positive_rf_indegree_mean_delta" in per_snapshot.columns else np.nan,
+        "mean_abs_positive_rf_indegree_q95_delta": float(pd.to_numeric(per_snapshot.get("positive_rf_indegree_q95_delta", np.nan), errors="coerce").abs().mean()) if "positive_rf_indegree_q95_delta" in per_snapshot.columns else np.nan,
+        "mean_abs_rf_observed_field_hazard_delta": float(pd.to_numeric(per_snapshot.get("rf_observed_field_hazard_delta", np.nan), errors="coerce").abs().mean()) if "rf_observed_field_hazard_delta" in per_snapshot.columns else np.nan,
         "mean_abs_region_pressure_fr_delta": float(pd.to_numeric(per_snapshot.get("region_pressure_fr_delta", np.nan), errors="coerce").abs().mean()) if "region_pressure_fr_delta" in per_snapshot.columns else np.nan,
         "mean_abs_region_pressure_rr_delta": float(pd.to_numeric(per_snapshot.get("region_pressure_rr_delta", np.nan), errors="coerce").abs().mean()) if "region_pressure_rr_delta" in per_snapshot.columns else np.nan,
         "farm_attack_rate_wasserstein": _metric_lookup(outcome_summary, "farm_attack_rate", "wasserstein_distance"),
@@ -2732,12 +3075,22 @@ def _compare_simulation_outputs(
         "reservoir_total_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "reservoir_total", "curve_correlation"),
         "reservoir_max_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "reservoir_max", "curve_correlation"),
         "reservoir_positive_regions_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "reservoir_positive_regions", "curve_correlation"),
+        "positive_rf_farm_count_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "positive_rf_farm_count", "curve_correlation"),
+        "positive_rf_union_7d_farm_count_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "positive_rf_union_7d_farm_count", "curve_correlation"),
+        "positive_rf_indegree_mean_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "positive_rf_indegree_mean", "curve_correlation"),
+        "positive_rf_indegree_q95_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "positive_rf_indegree_q95", "curve_correlation"),
+        "rf_observed_field_hazard_mean_curve_correlation": _calibration_lookup(daily_mean_comparison, "rf_observed_field_hazard", "curve_correlation"),
         "farm_prevalence_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "farm_prevalence", "mean_abs_delta"),
         "farm_incidence_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "farm_incidence", "mean_abs_delta"),
         "farm_cumulative_incidence_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "farm_cumulative_incidence", "mean_abs_delta"),
         "reservoir_total_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "reservoir_total", "mean_abs_delta"),
         "reservoir_max_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "reservoir_max", "mean_abs_delta"),
         "reservoir_positive_regions_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "reservoir_positive_regions", "mean_abs_delta"),
+        "positive_rf_farm_count_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "positive_rf_farm_count", "mean_abs_delta"),
+        "positive_rf_union_7d_farm_count_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "positive_rf_union_7d_farm_count", "mean_abs_delta"),
+        "positive_rf_indegree_mean_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "positive_rf_indegree_mean", "mean_abs_delta"),
+        "positive_rf_indegree_q95_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "positive_rf_indegree_q95", "mean_abs_delta"),
+        "rf_observed_field_hazard_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "rf_observed_field_hazard", "mean_abs_delta"),
         "farm_attack_rate_observed_median_in_synthetic_90pct": _calibration_lookup(scalar_calibration, "farm_attack_rate", "observed_median_in_synthetic_90pct"),
         "farm_attack_rate_observed_median_tail_area": _calibration_lookup(scalar_calibration, "farm_attack_rate", "observed_median_tail_area"),
         "farm_attack_rate_synthetic_interval_width": _calibration_lookup(scalar_calibration, "farm_attack_rate", "synthetic_interval_width"),
@@ -2769,6 +3122,17 @@ def _compare_simulation_outputs(
         "farm_corop_attack_probability_mae": farm_corop_attack_probability_mae,
     }
 
+    if not rf_pathway_daily.empty:
+        for metric_name, summary_key in [
+            ("positive_rf_reach_jaccard", "rf_positive_reach_jaccard_mean"),
+            ("positive_rf_union_7d_jaccard", "rf_positive_union_7d_jaccard_mean"),
+            ("positive_rf_indegree_wasserstein", "rf_positive_indegree_wasserstein_mean"),
+            ("positive_rf_indegree_energy_distance", "rf_positive_indegree_energy_distance_mean"),
+        ]:
+            if metric_name in rf_pathway_daily.columns:
+                values = pd.to_numeric(rf_pathway_daily[metric_name], errors="coerce").dropna()
+                summary[summary_key] = float(values.mean()) if not values.empty else np.nan
+
     if not region_spatial_per_snapshot.empty:
         summary["region_reservoir_spatial_correlation_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("reservoir_pressure_spatial_correlation", np.nan), errors="coerce").dropna().mean())
         summary["region_import_spatial_correlation_mean"] = float(pd.to_numeric(region_spatial_per_snapshot.get("import_pressure_spatial_correlation", np.nan), errors="coerce").dropna().mean())
@@ -2792,14 +3156,15 @@ def _compare_simulation_outputs(
     detailed = {
         "observed_outcomes": observed_scalar,
         "synthetic_outcomes": synthetic_scalar,
-        "observed_daily": observed_daily,
-        "synthetic_daily": synthetic_daily,
+        "observed_daily": observed_daily_with_rf,
+        "synthetic_daily": synthetic_daily_with_rf,
         "outcome_distribution_summary": outcome_summary,
         "daily_calibration": daily_calibration,
         "daily_mean_comparison": daily_mean_comparison,
         "scalar_calibration": scalar_calibration,
         "trajectory_distribution_summary": trajectory_distribution_summary,
         "lag_diagnostics": lag_diagnostics,
+        "rf_pathway_daily": rf_pathway_daily,
         "observed_region_daily": observed_region_daily,
         "synthetic_region_daily": synthetic_region_daily,
         "region_spatial_per_snapshot": region_spatial_per_snapshot,
@@ -2831,6 +3196,7 @@ DETAIL_GROUP_KEYS: dict[str, list[str]] = {
     "outcome_distribution_summary": ["metric"],
     "observed_daily": ["day_index", "ts"],
     "synthetic_daily": ["day_index", "ts"],
+    "rf_pathway_daily": ["day_index", "ts"],
     "daily_calibration": ["metric"],
     "daily_mean_comparison": ["metric"],
     "scalar_calibration": ["metric"],
@@ -3379,6 +3745,582 @@ def _write_channel_diagnostics_plot(
     return output_path
 
 
+def _write_rf_pathway_compare_plot(
+    per_snapshot: pd.DataFrame,
+    rf_pathway_daily: pd.DataFrame,
+    summary: dict,
+    output_dir: Path,
+    sample_label: str,
+) -> Optional[Path]:
+    curve_specs = [
+        spec
+        for spec in [
+            ("positive_rf_farm_count", "Farms reached from positive regions", "Farms", "positive_rf_farm_count_curve_correlation"),
+            ("positive_rf_union_7d_farm_count", "Seven-day RF reach union", "Farms", "positive_rf_union_7d_farm_count_curve_correlation"),
+            ("positive_rf_indegree_mean", "Positive-region RF in-degree mean", "Edges per farm", "positive_rf_indegree_mean_curve_correlation"),
+            ("positive_rf_indegree_q95", "Positive-region RF in-degree q95", "Edges per farm", "positive_rf_indegree_q95_curve_correlation"),
+            ("rf_observed_field_hazard", "One-step RF hazard under observed field", "Hazard mass", "rf_observed_field_hazard_curve_correlation"),
+        ]
+        if f"original_{spec[0]}" in per_snapshot.columns and f"synthetic_{spec[0]}" in per_snapshot.columns
+    ]
+    has_compare_panel = not rf_pathway_daily.empty and any(
+        column in rf_pathway_daily.columns
+        for column in [
+            "positive_rf_reach_jaccard",
+            "positive_rf_union_7d_jaccard",
+            "positive_rf_indegree_wasserstein",
+            "positive_rf_indegree_energy_distance",
+        ]
+    )
+    if not curve_specs and not has_compare_panel:
+        return None
+    plt = _load_matplotlib()
+    if plt is None:
+        return None
+
+    total_panels = len(curve_specs) + int(has_compare_panel)
+    ncols = 2
+    nrows = int(math.ceil(total_panels / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14.8, max(5.4, 4.3 * nrows)), constrained_layout=True)
+    axes_array = np.atleast_1d(axes).ravel()
+    _style_figure(fig, axes_array)
+    fig.suptitle(f"RF route localization: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
+
+    panel_index = 0
+    for value_column, title, y_label, summary_key in curve_specs:
+        ax = axes_array[panel_index]
+        _plot_metric_panel(
+            ax,
+            per_snapshot=per_snapshot,
+            value_column=value_column,
+            title=title,
+            y_label=y_label,
+            summary_value=summary.get(summary_key),
+            lower_column=f"{value_column}_q05",
+            upper_column=f"{value_column}_q95",
+        )
+        panel_index += 1
+
+    if has_compare_panel:
+        ax = axes_array[panel_index]
+        x_values = pd.to_numeric(rf_pathway_daily.get("day_index", np.nan), errors="coerce").to_numpy(dtype=float)
+        if "positive_rf_reach_jaccard" in rf_pathway_daily.columns:
+            ax.plot(
+                x_values,
+                pd.to_numeric(rf_pathway_daily["positive_rf_reach_jaccard"], errors="coerce").to_numpy(dtype=float),
+                color=PLOT_COLORS["original"],
+                linewidth=2.0,
+                label="Reach Jaccard",
+            )
+        if "positive_rf_union_7d_jaccard" in rf_pathway_daily.columns:
+            ax.plot(
+                x_values,
+                pd.to_numeric(rf_pathway_daily["positive_rf_union_7d_jaccard"], errors="coerce").to_numpy(dtype=float),
+                color=PLOT_COLORS["synthetic"],
+                linewidth=2.0,
+                linestyle="--",
+                label="Seven-day union Jaccard",
+            )
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_xlabel("Day index")
+        ax.set_ylabel("Overlap")
+
+        right_axis = ax.twinx()
+        if "positive_rf_indegree_wasserstein" in rf_pathway_daily.columns:
+            right_axis.plot(
+                x_values,
+                pd.to_numeric(rf_pathway_daily["positive_rf_indegree_wasserstein"], errors="coerce").to_numpy(dtype=float),
+                color=PLOT_COLORS["accent"],
+                linewidth=1.9,
+                label="In-degree W1",
+            )
+        if "positive_rf_indegree_energy_distance" in rf_pathway_daily.columns:
+            right_axis.plot(
+                x_values,
+                pd.to_numeric(rf_pathway_daily["positive_rf_indegree_energy_distance"], errors="coerce").to_numpy(dtype=float),
+                color=PLOT_COLORS["delta"],
+                linewidth=1.7,
+                linestyle=":",
+                label="In-degree energy",
+            )
+        right_axis.set_ylabel("Distance")
+
+        left_handles, left_labels = ax.get_legend_handles_labels()
+        right_handles, right_labels = right_axis.get_legend_handles_labels()
+        if left_handles or right_handles:
+            _style_legend(ax.legend(left_handles + right_handles, left_labels + right_labels, loc="best"))
+        ax.set_title(
+            "RF reach overlap and in-degree distance "
+            f"(reach={_metric_text(summary.get('rf_positive_reach_jaccard_mean'), digits=2)}, "
+            f"union={_metric_text(summary.get('rf_positive_union_7d_jaccard_mean'), digits=2)}, "
+            f"W1={_metric_text(summary.get('rf_positive_indegree_wasserstein_mean'), digits=2)})"
+        )
+        panel_index += 1
+
+    for ax in axes_array[panel_index:]:
+        ax.axis("off")
+
+    output_path = output_dir / f"{sample_label}_rf_pathway_compare.png"
+    _save_figure(fig, output_path)
+    plt.close(fig)
+    return output_path
+
+
+def _run_dir_from_manifest_payload(manifest: Optional[dict]) -> Optional[Path]:
+    if not manifest:
+        return None
+    run_dir_value = str(manifest.get("run_dir") or "").strip()
+    if run_dir_value:
+        return Path(run_dir_value).expanduser().resolve()
+    manifest_path_value = str(manifest.get("manifest_path") or "").strip()
+    if manifest_path_value:
+        return Path(manifest_path_value).expanduser().resolve().parent
+    return None
+
+
+def _diagnostics_output_path(
+    manifest: Optional[dict],
+    *,
+    setting_label: str,
+    output_key: str,
+    fallback_name: str,
+) -> Optional[Path]:
+    if manifest:
+        for record in list(manifest.get("diagnostics") or []):
+            record_label = str(record.get("setting_label") or record.get("sample_label") or "").strip()
+            if record_label != setting_label:
+                continue
+            outputs = dict(record.get("outputs") or {})
+            output_value = str(outputs.get(output_key) or "").strip()
+            if output_value:
+                candidate = Path(output_value).expanduser().resolve()
+                if candidate.exists():
+                    return candidate
+            break
+    run_dir = _run_dir_from_manifest_payload(manifest)
+    if run_dir is None:
+        return None
+    candidate = run_dir / "diagnostics" / fallback_name
+    return candidate if candidate.exists() else None
+
+
+def _load_turnover_relationship_daily(
+    per_snapshot: pd.DataFrame,
+    summary: dict,
+    manifest: Optional[dict],
+) -> pd.DataFrame:
+    setting_label = str(summary.get("setting_label") or summary.get("sample_label") or "").strip()
+    if not setting_label or per_snapshot.empty:
+        return pd.DataFrame()
+
+    tea_path = _diagnostics_output_path(
+        manifest,
+        setting_label=setting_label,
+        output_key="tea_per_snapshot",
+        fallback_name=f"{setting_label}_tea_per_snapshot.csv",
+    )
+    if tea_path is None:
+        return pd.DataFrame()
+
+    relationship = per_snapshot.copy()
+    keep_columns = [
+        column
+        for column in [
+            "day_index",
+            "ts",
+            "original_farm_prevalence",
+            "synthetic_farm_prevalence",
+            "original_farm_cumulative_incidence",
+            "synthetic_farm_cumulative_incidence",
+            "farm_prevalence_delta",
+            "farm_cumulative_incidence_delta",
+        ]
+        if column in relationship.columns
+    ]
+    relationship = relationship[keep_columns].copy()
+
+    if tea_path is not None:
+        tea_frame = pd.read_csv(tea_path)
+        tea_keep = [
+            column
+            for column in [
+                "ts",
+                "original_new_ratio",
+                "synthetic_new_ratio",
+                "original_persist_ratio",
+                "synthetic_persist_ratio",
+                "original_reactivated_ratio",
+                "synthetic_reactivated_ratio",
+                "original_churn_ratio",
+                "synthetic_churn_ratio",
+                "new_ratio_delta",
+                "persist_ratio_delta",
+                "reactivated_ratio_delta",
+                "churn_ratio_delta",
+            ]
+            if column in tea_frame.columns
+        ]
+        if tea_keep:
+            relationship = relationship.merge(tea_frame[tea_keep], on="ts", how="left")
+
+    relationship = relationship.sort_values(
+        [column for column in ["day_index", "ts"] if column in relationship.columns],
+        na_position="last",
+    ).reset_index(drop=True)
+    return relationship
+
+
+def _summarise_turnover_relationship_pairs(turnover_daily: pd.DataFrame) -> pd.DataFrame:
+    if turnover_daily.empty:
+        return pd.DataFrame()
+
+    turnover_specs = [
+        ("new_ratio_delta", "New-share delta"),
+        ("persist_ratio_delta", "Persistence-share delta"),
+        ("reactivated_ratio_delta", "Reactivated-share delta"),
+        ("churn_ratio_delta", "Churn-share delta"),
+    ]
+    outcome_specs = [
+        ("farm_prevalence_delta", "Farm prevalence delta"),
+        ("farm_cumulative_incidence_delta", "Farm cumulative-incidence delta"),
+    ]
+    rows: list[dict[str, object]] = []
+    for turnover_metric, turnover_label in turnover_specs:
+        if turnover_metric not in turnover_daily.columns:
+            continue
+        turnover_values = _frame_numeric_series(turnover_daily, turnover_metric).to_numpy(dtype=float)
+        for outcome_metric, outcome_label in outcome_specs:
+            if outcome_metric not in turnover_daily.columns:
+                continue
+            outcome_values = _frame_numeric_series(turnover_daily, outcome_metric).to_numpy(dtype=float)
+            valid = np.isfinite(turnover_values) & np.isfinite(outcome_values)
+            turnover_valid = turnover_values[valid]
+            outcome_valid = outcome_values[valid]
+            same_sign = np.nan
+            if turnover_valid.size:
+                same_sign = float(np.mean(np.sign(turnover_valid) == np.sign(outcome_valid)))
+            rows.append(
+                {
+                    "turnover_metric": turnover_metric,
+                    "turnover_label": turnover_label,
+                    "outcome_metric": outcome_metric,
+                    "outcome_label": outcome_label,
+                    "day_count": int(turnover_valid.size),
+                    "correlation": _safe_correlation(turnover_valid, outcome_valid),
+                    "same_sign_share": same_sign,
+                    "turnover_mean_abs_delta": float(np.mean(np.abs(turnover_valid))) if turnover_valid.size else np.nan,
+                    "outcome_mean_abs_delta": float(np.mean(np.abs(outcome_valid))) if outcome_valid.size else np.nan,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _build_turnover_accumulated_daily(turnover_daily: pd.DataFrame) -> pd.DataFrame:
+    if turnover_daily.empty:
+        return pd.DataFrame()
+
+    columns = [
+        column
+        for column in [
+            "day_index",
+            "ts",
+            "new_ratio_delta",
+            "persist_ratio_delta",
+            "reactivated_ratio_delta",
+            "churn_ratio_delta",
+            "farm_prevalence_delta",
+            "farm_cumulative_incidence_delta",
+        ]
+        if column in turnover_daily.columns
+    ]
+    if not columns:
+        return pd.DataFrame()
+
+    accumulated = turnover_daily[columns].copy()
+    for column in [
+        "new_ratio_delta",
+        "persist_ratio_delta",
+        "reactivated_ratio_delta",
+        "churn_ratio_delta",
+        "farm_prevalence_delta",
+        "farm_cumulative_incidence_delta",
+    ]:
+        if column not in accumulated.columns:
+            continue
+        values = pd.to_numeric(accumulated[column], errors="coerce").fillna(0.0)
+        accumulated[f"{column}_cumulative"] = values.cumsum()
+    return accumulated
+
+
+def _write_turnover_relationship_plot(
+    turnover_daily: pd.DataFrame,
+    output_dir: Path,
+    sample_label: str,
+) -> Optional[Path]:
+    if turnover_daily.empty:
+        return None
+    plt = _load_matplotlib()
+    if plt is None:
+        return None
+
+    turnover_specs = [
+        ("new", "New-share"),
+        ("persist", "Persistence-share"),
+        ("reactivated", "Reactivated-share"),
+        ("churn", "Churn-share"),
+    ]
+    outcome_specs = [
+        ("farm_prevalence", "Farm prevalence"),
+        ("farm_cumulative_incidence", "Farm cumulative incidence"),
+    ]
+    available_turnover = []
+    for turnover_prefix, turnover_label in turnover_specs:
+        if any(
+            column in turnover_daily.columns
+            for column in [
+                f"original_{turnover_prefix}_ratio",
+                f"synthetic_{turnover_prefix}_ratio",
+                f"{turnover_prefix}_ratio_delta",
+            ]
+        ):
+            available_turnover.append((turnover_prefix, turnover_label))
+    if not available_turnover:
+        return None
+
+    fig, axes = plt.subplots(
+        len(available_turnover),
+        len(outcome_specs) * 2,
+        figsize=(23.5, 3.2 * len(available_turnover) + 1.4),
+        constrained_layout=True,
+        sharex="col",
+    )
+    axes_array = np.atleast_2d(axes)
+    _style_figure(fig, axes_array.ravel())
+    fig.suptitle(
+        f"Turnover-share and epidemic-curve alignment by snapshot: {sample_label}",
+        fontsize=16,
+        fontweight="bold",
+        color=PLOT_COLORS["text"],
+    )
+    day_values = pd.to_numeric(turnover_daily.get("day_index", np.arange(len(turnover_daily))), errors="coerce").to_numpy(dtype=float)
+    valid_day_values = np.isfinite(day_values)
+    if np.any(valid_day_values):
+        x_axis = day_values
+    else:
+        x_axis = np.arange(len(turnover_daily), dtype=float)
+
+    raw_turnover_colors = {
+        "observed": "#264653",
+        "synthetic": "#5B8EAD",
+    }
+    raw_outcome_colors = {
+        "observed": "#B56576",
+        "synthetic": "#E5989B",
+    }
+    delta_colors = {
+        "turnover": "#264653",
+        "outcome": "#E76F51",
+    }
+
+    for row_index, (turnover_prefix, turnover_label) in enumerate(available_turnover):
+        raw_observed_col = f"original_{turnover_prefix}_ratio"
+        raw_synthetic_col = f"synthetic_{turnover_prefix}_ratio"
+        delta_turnover_col = f"{turnover_prefix}_ratio_delta"
+        for outcome_index, (outcome_prefix, outcome_label) in enumerate(outcome_specs):
+            raw_ax = axes_array[row_index, outcome_index]
+            delta_ax = axes_array[row_index, outcome_index + len(outcome_specs)]
+
+            raw_ax.grid(axis="x", alpha=0.16)
+            delta_ax.grid(axis="x", alpha=0.16)
+
+            raw_turnover_observed = _frame_numeric_series(turnover_daily, raw_observed_col).to_numpy(dtype=float) if raw_observed_col in turnover_daily.columns else np.full(len(turnover_daily), np.nan)
+            raw_turnover_synthetic = _frame_numeric_series(turnover_daily, raw_synthetic_col).to_numpy(dtype=float) if raw_synthetic_col in turnover_daily.columns else np.full(len(turnover_daily), np.nan)
+            raw_outcome_observed_col = f"original_{outcome_prefix}"
+            raw_outcome_synthetic_col = f"synthetic_{outcome_prefix}"
+            raw_outcome_observed = _frame_numeric_series(turnover_daily, raw_outcome_observed_col).to_numpy(dtype=float) if raw_outcome_observed_col in turnover_daily.columns else np.full(len(turnover_daily), np.nan)
+            raw_outcome_synthetic = _frame_numeric_series(turnover_daily, raw_outcome_synthetic_col).to_numpy(dtype=float) if raw_outcome_synthetic_col in turnover_daily.columns else np.full(len(turnover_daily), np.nan)
+
+            if np.isfinite(raw_turnover_observed).any() or np.isfinite(raw_turnover_synthetic).any():
+                raw_ax.plot(
+                    x_axis,
+                    raw_turnover_observed,
+                    color=raw_turnover_colors["observed"],
+                    linewidth=2.0,
+                    label="Observed share",
+                )
+                raw_ax.plot(
+                    x_axis,
+                    raw_turnover_synthetic,
+                    color=raw_turnover_colors["synthetic"],
+                    linewidth=2.0,
+                    linestyle="--",
+                    label="Synthetic share",
+                )
+                raw_ax.set_ylabel(f"{turnover_label}")
+            else:
+                raw_ax.text(0.5, 0.5, "n/a", ha="center", va="center", transform=raw_ax.transAxes, color=PLOT_COLORS["muted"])
+
+            raw_twin = raw_ax.twinx()
+            raw_twin.patch.set_alpha(0.0)
+            raw_twin.plot(
+                x_axis,
+                raw_outcome_observed,
+                color=raw_outcome_colors["observed"],
+                linewidth=1.8,
+                alpha=0.95,
+                label="Observed curve",
+            )
+            raw_twin.plot(
+                x_axis,
+                raw_outcome_synthetic,
+                color=raw_outcome_colors["synthetic"],
+                linewidth=1.8,
+                linestyle="--",
+                alpha=0.95,
+                label="Synthetic curve",
+            )
+            raw_twin.set_ylabel(outcome_label)
+
+            turnover_delta = _frame_numeric_series(turnover_daily, delta_turnover_col).to_numpy(dtype=float) if delta_turnover_col in turnover_daily.columns else np.full(len(turnover_daily), np.nan)
+            outcome_delta_col = f"{outcome_prefix}_delta"
+            outcome_delta = _frame_numeric_series(turnover_daily, outcome_delta_col).to_numpy(dtype=float) if outcome_delta_col in turnover_daily.columns else np.full(len(turnover_daily), np.nan)
+            delta_ax.axhline(0.0, color=PLOT_COLORS["grid_strong"], linewidth=1.0, zorder=1)
+            delta_ax.plot(
+                x_axis,
+                turnover_delta,
+                color=delta_colors["turnover"],
+                linewidth=2.0,
+                label=f"{turnover_label} delta",
+                zorder=3,
+            )
+            delta_ax.set_ylabel(f"{turnover_label} delta")
+            delta_twin = delta_ax.twinx()
+            delta_twin.patch.set_alpha(0.0)
+            delta_twin.axhline(0.0, color=PLOT_COLORS["grid_strong"], linewidth=1.0, alpha=0.0)
+            delta_twin.plot(
+                x_axis,
+                outcome_delta,
+                color=delta_colors["outcome"],
+                linewidth=1.8,
+                label=f"{outcome_label} delta",
+                zorder=2,
+            )
+            delta_twin.set_ylabel(f"{outcome_label} delta")
+
+            valid_delta = np.isfinite(turnover_delta) & np.isfinite(outcome_delta)
+            delta_corr = _safe_correlation(turnover_delta[valid_delta], outcome_delta[valid_delta])
+            raw_ax.set_title(f"{turnover_label} vs {outcome_label}")
+            delta_ax.set_title(f"{turnover_label} delta vs {outcome_label} delta\ncorr={_metric_text(delta_corr, digits=2)}")
+
+            if row_index == 0 and outcome_index == 0:
+                raw_handles, raw_labels = raw_ax.get_legend_handles_labels()
+                raw_twin_handles, raw_twin_labels = raw_twin.get_legend_handles_labels()
+                raw_ax.legend(raw_handles + raw_twin_handles, raw_labels + raw_twin_labels, loc="upper left", fontsize=8, frameon=False, ncol=2)
+                delta_handles, delta_labels = delta_ax.get_legend_handles_labels()
+                delta_twin_handles, delta_twin_labels = delta_twin.get_legend_handles_labels()
+                delta_ax.legend(delta_handles + delta_twin_handles, delta_labels + delta_twin_labels, loc="upper left", fontsize=8, frameon=False)
+
+            if row_index == len(available_turnover) - 1:
+                raw_ax.set_xlabel("Snapshot index")
+                delta_ax.set_xlabel("Snapshot index")
+
+    output_path = output_dir / f"{sample_label}_turnover_relationship.png"
+    _save_figure(fig, output_path)
+    plt.close(fig)
+    return output_path
+
+
+def _write_turnover_accumulated_plot(
+    accumulated_daily: pd.DataFrame,
+    output_dir: Path,
+    sample_label: str,
+) -> Optional[Path]:
+    if accumulated_daily.empty:
+        return None
+    plt = _load_matplotlib()
+    if plt is None:
+        return None
+
+    turnover_specs = [
+        ("new_ratio_delta_cumulative", "Accumulated new-share delta"),
+        ("persist_ratio_delta_cumulative", "Accumulated persistence-share delta"),
+        ("reactivated_ratio_delta_cumulative", "Accumulated reactivated-share delta"),
+        ("churn_ratio_delta_cumulative", "Accumulated churn-share delta"),
+    ]
+    outcome_specs = [
+        ("farm_prevalence_delta_cumulative", "Accumulated farm-prevalence delta"),
+        ("farm_cumulative_incidence_delta_cumulative", "Accumulated farm cumulative-incidence delta"),
+    ]
+    available_turnover = [(column, label) for column, label in turnover_specs if column in accumulated_daily.columns]
+    available_outcomes = [(column, label) for column, label in outcome_specs if column in accumulated_daily.columns]
+    if not available_turnover or not available_outcomes:
+        return None
+
+    fig, axes = plt.subplots(
+        len(available_turnover),
+        len(available_outcomes),
+        figsize=(12.8, 3.0 * len(available_turnover) + 1.4),
+        constrained_layout=True,
+        sharex=True,
+    )
+    axes_array = np.atleast_2d(axes)
+    _style_figure(fig, axes_array.ravel())
+    fig.suptitle(
+        f"Accumulated turnover and epidemic deltas by snapshot: {sample_label}",
+        fontsize=16,
+        fontweight="bold",
+        color=PLOT_COLORS["text"],
+    )
+
+    day_values = pd.to_numeric(accumulated_daily.get("day_index", np.arange(len(accumulated_daily))), errors="coerce").to_numpy(dtype=float)
+    x_axis = day_values if np.isfinite(day_values).any() else np.arange(len(accumulated_daily), dtype=float)
+    turnover_color = "#264653"
+    outcome_color = "#E76F51"
+
+    for row_index, (turnover_column, turnover_label) in enumerate(available_turnover):
+        turnover_values = _frame_numeric_series(accumulated_daily, turnover_column).to_numpy(dtype=float)
+        for col_index, (outcome_column, outcome_label) in enumerate(available_outcomes):
+            ax = axes_array[row_index, col_index]
+            ax.axhline(0.0, color=PLOT_COLORS["grid_strong"], linewidth=1.0, zorder=1)
+            ax.plot(
+                x_axis,
+                turnover_values,
+                color=turnover_color,
+                linewidth=2.2,
+                label=turnover_label,
+                zorder=3,
+            )
+            ax.set_ylabel(turnover_label)
+            twin = ax.twinx()
+            twin.patch.set_alpha(0.0)
+            outcome_values = _frame_numeric_series(accumulated_daily, outcome_column).to_numpy(dtype=float)
+            twin.plot(
+                x_axis,
+                outcome_values,
+                color=outcome_color,
+                linewidth=1.9,
+                label=outcome_label,
+                zorder=2,
+            )
+            twin.set_ylabel(outcome_label)
+            valid = np.isfinite(turnover_values) & np.isfinite(outcome_values)
+            ax.set_title(
+                f"{turnover_label} vs {outcome_label}\n"
+                f"corr={_metric_text(_safe_correlation(turnover_values[valid], outcome_values[valid]), digits=2)}"
+            )
+            if row_index == 0 and col_index == 0:
+                handles, labels = ax.get_legend_handles_labels()
+                twin_handles, twin_labels = twin.get_legend_handles_labels()
+                ax.legend(handles + twin_handles, labels + twin_labels, loc="upper left", fontsize=8, frameon=False)
+            if row_index == len(available_turnover) - 1:
+                ax.set_xlabel("Snapshot index")
+
+    output_path = output_dir / f"{sample_label}_turnover_accumulated.png"
+    _save_figure(fig, output_path)
+    plt.close(fig)
+    return output_path
+
+
 def _write_farm_spatial_overview(
     farm_spatial_summary: pd.DataFrame,
     summary: dict,
@@ -3681,6 +4623,18 @@ def _simulation_figure_reading_notes(*, include_scenario_overview: bool = False)
                 "These panels separate farm→farm, region→farm, farm→region, and region→region flow so you can see whether the hybrid coupling itself is preserved rather than only the final epidemic totals.",
             ),
             (
+                "Turnover relationship view",
+                "These panels keep snapshot order on the x axis. The first two columns compare observed and synthetic turnover-share curves with the observed and synthetic epidemic curves, and the last two columns compare the turnover deltas with the prevalence and cumulative-incidence deltas.",
+            ),
+            (
+                "Accumulated-difference view",
+                "These panels accumulate the daily delta terms over snapshot index. They make it easier to see whether mismatch keeps building in the same direction across the turnover terms and the epidemic curves.",
+            ),
+            (
+                "RF route localization",
+                "These panels stay on the region→farm route. They compare which farms are reached from positive regions, how broad that RF reach stays over seven days, how concentrated positive-region RF in-degree is across farms, and the one-step RF hazard under the observed reservoir field.",
+            ),
+            (
                 "Farm spatial view",
                 "This figure checks whether the same farms are consistently high-risk. Read the two maps with the parity panel and Moran's I delta together: good alignment means the synthetic network preserves both hotspot location and overall spatial clustering.",
             ),
@@ -3731,6 +4685,10 @@ def _simulation_table_reading_notes(*, include_scenario_scorecard: bool = False)
             (
                 "Lag diagnostics and farm spatial metrics",
                 "Best-lag correlation tells you whether the synthetic epidemic is shape-correct but shifted in time. Farm-level attack-probability correlation, hotspot overlap, and Moran's I delta tell you whether the detailed spatial risk pattern is preserved.",
+            ),
+            (
+                "RF route-localization metrics",
+                "These rows stay on the region→farm route. Higher reach correlations and Jaccard scores mean the same farms are exposed from positive regions on the same days, while lower in-degree distance means the RF contact spread across farms is closer to the observed panel.",
             ),
         ]
     )
@@ -3820,6 +4778,7 @@ def write_report(
     daily_mean_comparison = detailed_outputs.get("daily_mean_comparison", pd.DataFrame())
     scalar_calibration = detailed_outputs.get("scalar_calibration", pd.DataFrame())
     uncertainty_decomposition = detailed_outputs.get("uncertainty_decomposition", pd.DataFrame())
+    rf_pathway_daily = detailed_outputs.get("rf_pathway_daily", pd.DataFrame())
     observed_region_daily = detailed_outputs.get("observed_region_daily", pd.DataFrame())
     synthetic_region_daily = detailed_outputs.get("synthetic_region_daily", pd.DataFrame())
     region_spatial_per_snapshot = detailed_outputs.get("region_spatial_per_snapshot", pd.DataFrame())
@@ -3831,12 +4790,25 @@ def write_report(
     synthetic_farm_summary = detailed_outputs.get("synthetic_farm_summary", pd.DataFrame())
     farm_spatial_summary = detailed_outputs.get("farm_spatial_summary", pd.DataFrame())
     farm_corop_summary = detailed_outputs.get("farm_corop_summary", pd.DataFrame())
+    turnover_relationship_daily = _load_turnover_relationship_daily(per_snapshot, summary, manifest)
+    turnover_accumulated_daily = pd.DataFrame()
+    if not turnover_relationship_daily.empty:
+        detailed_outputs["turnover_relationship_daily"] = turnover_relationship_daily
+        turnover_relationship_pair_summary = _summarise_turnover_relationship_pairs(turnover_relationship_daily)
+        if not turnover_relationship_pair_summary.empty:
+            detailed_outputs["turnover_relationship_pair_summary"] = turnover_relationship_pair_summary
+        turnover_accumulated_daily = _build_turnover_accumulated_daily(turnover_relationship_daily)
+        if not turnover_accumulated_daily.empty:
+            detailed_outputs["turnover_accumulated_daily"] = turnover_accumulated_daily
     dashboard_path = _write_sample_dashboard(per_snapshot, summary, outcome_summary, output_dir, sample_label)
     delta_path = _write_curve_delta_plot(per_snapshot, output_dir, sample_label)
     daily_mean_path = _write_daily_mean_comparison_plot(per_snapshot, summary, output_dir, sample_label)
     distribution_path = _write_outcome_distribution_plot(observed_scalar, synthetic_scalar, outcome_summary, output_dir, sample_label)
     parity_path = _write_sample_parity_plot(outcome_summary, output_dir, sample_label)
     channel_path = _write_channel_diagnostics_plot(per_snapshot, summary, output_dir, sample_label)
+    turnover_relationship_path = _write_turnover_relationship_plot(turnover_relationship_daily, output_dir, sample_label)
+    turnover_accumulated_path = _write_turnover_accumulated_plot(turnover_accumulated_daily, output_dir, sample_label)
+    rf_pathway_path = _write_rf_pathway_compare_plot(per_snapshot, rf_pathway_daily, summary, output_dir, sample_label)
     farm_spatial_path = _write_farm_spatial_overview(farm_spatial_summary, summary, output_dir, sample_label)
     region_spatial_path = _write_region_spatial_overview(region_spatial_per_snapshot, output_dir, sample_label)
 
@@ -3971,6 +4943,39 @@ def write_report(
             f"- Region→region pressure-share Wasserstein distance: {_metric_text(summary.get('region_pressure_rr_share_wasserstein'))}",
         ])
 
+    if not turnover_relationship_daily.empty:
+        lines.extend([
+            "",
+            "## Network turnover and epidemic relationships",
+            "",
+            "These panels keep snapshot order on the x axis. The first half compares observed and synthetic turnover-share curves with the observed and synthetic farm prevalence and cumulative-incidence curves. The second half compares the turnover deltas with the prevalence and cumulative-incidence deltas.",
+        ])
+    if not turnover_accumulated_daily.empty:
+        lines.extend([
+            "",
+            "## Accumulated turnover and epidemic deltas",
+            "",
+            "These panels accumulate the daily differences over snapshot index. They help show whether mismatch in new, persist, churn, or reactivated terms keeps building in the same direction as the mismatch in farm prevalence or farm cumulative incidence.",
+        ])
+
+    if not rf_pathway_daily.empty:
+        lines.extend([
+            "",
+            "## RF route localization checks",
+            "",
+            "These checks stay on the region to farm route itself. They compare which farms receive at least one incoming RF edge from a positive region, how concentrated that RF in-degree is across farms, the seven-day reach union, and the one-step RF hazard under the observed reservoir field.",
+            "",
+            f"- RF reach-count correlation: {_metric_text(summary.get('positive_rf_farm_count_curve_correlation'))}",
+            f"- RF reach-count mean-curve correlation: {_metric_text(summary.get('positive_rf_farm_count_mean_curve_correlation'))}",
+            f"- RF seven-day union correlation: {_metric_text(summary.get('positive_rf_union_7d_farm_count_curve_correlation'))}",
+            f"- RF in-degree mean correlation: {_metric_text(summary.get('positive_rf_indegree_mean_curve_correlation'))}",
+            f"- RF in-degree q95 correlation: {_metric_text(summary.get('positive_rf_indegree_q95_curve_correlation'))}",
+            f"- Observed-field RF hazard correlation: {_metric_text(summary.get('rf_observed_field_hazard_curve_correlation'))}",
+            f"- Mean RF reach Jaccard: {_metric_text(summary.get('rf_positive_reach_jaccard_mean'))}",
+            f"- Mean RF seven-day union Jaccard: {_metric_text(summary.get('rf_positive_union_7d_jaccard_mean'))}",
+            f"- Mean RF in-degree Wasserstein distance: {_metric_text(summary.get('rf_positive_indegree_wasserstein_mean'))}",
+        ])
+
     if not trajectory_distribution_summary.empty or not lag_diagnostics.empty:
         lines.extend([
             "",
@@ -4074,6 +5079,12 @@ def write_report(
         lines.append(f"- Parity PNG: `{Path(parity_path).name}`")
     if channel_path is not None:
         lines.append(f"- Channel-diagnostics PNG: `{Path(channel_path).name}`")
+    if turnover_relationship_path is not None:
+        lines.append(f"- Turnover-relationship PNG: `{Path(turnover_relationship_path).name}`")
+    if turnover_accumulated_path is not None:
+        lines.append(f"- Accumulated-turnover PNG: `{Path(turnover_accumulated_path).name}`")
+    if rf_pathway_path is not None:
+        lines.append(f"- RF route-localization PNG: `{Path(rf_pathway_path).name}`")
     if farm_spatial_path is not None:
         lines.append(f"- Farm spatial-overview PNG: `{Path(farm_spatial_path).name}`")
     if region_spatial_path is not None:
@@ -4101,6 +5112,12 @@ def write_report(
         payload["parity_png"] = str(parity_path)
     if channel_path is not None:
         payload["channel_png"] = str(channel_path)
+    if turnover_relationship_path is not None:
+        payload["turnover_relationship_png"] = str(turnover_relationship_path)
+    if turnover_accumulated_path is not None:
+        payload["turnover_accumulated_png"] = str(turnover_accumulated_path)
+    if rf_pathway_path is not None:
+        payload["rf_pathway_png"] = str(rf_pathway_path)
     if farm_spatial_path is not None:
         payload["farm_spatial_png"] = str(farm_spatial_path)
     if region_spatial_path is not None:
@@ -4110,7 +5127,7 @@ def write_report(
         payload["region_geo_payload_js"] = str(region_geo_html_path.with_name(f"{region_geo_html_path.stem}_payload.js"))
     payload.update(detail_paths)
     LOGGER.debug(
-        "Simulation artifacts written | per_snapshot_csv=%s | summary_json=%s | report_md=%s | dashboard_png=%s | delta_png=%s | daily_mean_png=%s | distribution_png=%s | parity_png=%s | region_spatial_png=%s | region_geo_html=%s",
+        "Simulation artifacts written | per_snapshot_csv=%s | summary_json=%s | report_md=%s | dashboard_png=%s | delta_png=%s | daily_mean_png=%s | distribution_png=%s | parity_png=%s | turnover_png=%s | turnover_accumulated_png=%s | rf_pathway_png=%s | region_spatial_png=%s | region_geo_html=%s",
         csv_path,
         json_path,
         md_path,
@@ -4119,6 +5136,9 @@ def write_report(
         daily_mean_path,
         distribution_path,
         parity_path,
+        turnover_relationship_path,
+        turnover_accumulated_path,
+        rf_pathway_path,
         region_spatial_path,
         region_geo_html_path,
     )
@@ -4556,6 +5576,8 @@ def _scenario_summary_sentence(item: dict[str, object]) -> str:
         ("duration W1", "farm_duration_wasserstein"),
         ("farm risk corr", "farm_attack_probability_correlation"),
         ("region spatial corr", "region_reservoir_spatial_correlation_mean"),
+        ("RF hazard corr", "rf_observed_field_hazard_curve_correlation"),
+        ("RF reach J", "rf_positive_reach_jaccard_mean"),
     ):
         value = pd.to_numeric(pd.Series([item.get(key)]), errors="coerce").iloc[0]
         if pd.notna(value):
@@ -4686,6 +5708,8 @@ def _scenario_browser_script(widget_id: str = "scenario_browser") -> str:
                   ["duration W1", "farm_duration_wasserstein"],
                   ["farm risk corr", "farm_attack_probability_correlation"],
                   ["region spatial corr", "region_reservoir_spatial_correlation_mean"],
+                  ["RF hazard corr", "rf_observed_field_hazard_curve_correlation"],
+                  ["RF reach J", "rf_positive_reach_jaccard_mean"],
                 ];
                 metricSpecs.forEach(([label, key]) => {
                   const value = Number(item[key]);
@@ -5068,6 +6092,39 @@ def write_scientific_validation_report(
             working = working[keep_columns]
         return working.reset_index(drop=True)
 
+    def transform_rf_pathway(frame: pd.DataFrame) -> pd.DataFrame:
+        working = frame.copy()
+        keep_columns = [
+            "day_index",
+            "ts",
+            "original_positive_rf_farm_count",
+            "synthetic_positive_rf_farm_count",
+            "positive_rf_farm_count_delta",
+            "original_positive_rf_union_7d_farm_count",
+            "synthetic_positive_rf_union_7d_farm_count",
+            "positive_rf_union_7d_farm_count_delta",
+            "original_positive_rf_indegree_mean",
+            "synthetic_positive_rf_indegree_mean",
+            "positive_rf_indegree_mean_delta",
+            "original_positive_rf_indegree_q95",
+            "synthetic_positive_rf_indegree_q95",
+            "positive_rf_indegree_q95_delta",
+            "original_rf_observed_field_hazard",
+            "synthetic_rf_observed_field_hazard",
+            "rf_observed_field_hazard_delta",
+            "positive_rf_reach_jaccard",
+            "positive_rf_union_7d_jaccard",
+            "positive_rf_indegree_wasserstein",
+            "positive_rf_indegree_energy_distance",
+        ]
+        keep_columns = [column for column in keep_columns if column in working.columns]
+        if keep_columns:
+            working = working[keep_columns]
+        sort_columns = [column for column in ["day_index", "ts"] if column in working.columns]
+        if sort_columns:
+            working = working.sort_values(sort_columns)
+        return working.reset_index(drop=True)
+
     def coverage_matrix_html(frame: pd.DataFrame) -> tuple[str, Optional[float]]:
         if frame.empty:
             return "", None
@@ -5078,12 +6135,19 @@ def write_scientific_validation_report(
             ("distribution", "Distribution fig", "png"),
             ("parity", "Parity", "png"),
             ("channel_diagnostics", "Channel", "png"),
+            ("turnover_relationship", "Turnover fig", "png"),
+            ("turnover_accumulated", "Accumulated turnover fig", "png"),
+            ("rf_pathway_compare", "RF pathway fig", "png"),
             ("farm_spatial_overview", "Farm spatial fig", "png"),
             ("region_spatial_overview", "Region spatial fig", "png"),
             ("region_geo_compare", "Interactive map", "html"),
             ("outcome_distribution_summary", "Outcome table", "csv"),
             ("trajectory_distribution_summary", "Trajectory table", "csv"),
             ("daily_mean_comparison", "Daily mean table", "csv"),
+            ("turnover_relationship_daily", "Turnover table", "csv"),
+            ("turnover_relationship_pair_summary", "Turnover pair table", "csv"),
+            ("turnover_accumulated_daily", "Accumulated turnover table", "csv"),
+            ("rf_pathway_daily", "RF pathway table", "csv"),
             ("daily_calibration", "Daily calib", "csv"),
             ("scalar_calibration", "Scalar calib", "csv"),
             ("uncertainty_decomposition", "Uncertainty", "csv"),
@@ -5129,6 +6193,9 @@ def write_scientific_validation_report(
         distribution_path = artifact_path(sample_label, "distribution")
         parity_path = artifact_path(sample_label, "parity")
         channel_path = artifact_path(sample_label, "channel_diagnostics")
+        turnover_path = artifact_path(sample_label, "turnover_relationship")
+        turnover_accumulated_path = artifact_path(sample_label, "turnover_accumulated")
+        rf_pathway_path = artifact_path(sample_label, "rf_pathway_compare")
         farm_spatial_path = artifact_path(sample_label, "farm_spatial_overview")
         region_spatial_path = artifact_path(sample_label, "region_spatial_overview")
         region_geo_path = artifact_path(sample_label, "region_geo_compare", extension="html")
@@ -5137,6 +6204,10 @@ def write_scientific_validation_report(
         per_snapshot_csv_path = artifact_path(sample_label, "per_snapshot", extension="csv")
         outcome_distribution_csv_path = artifact_path(sample_label, "outcome_distribution_summary", extension="csv")
         daily_mean_comparison_path = artifact_path(sample_label, "daily_mean_comparison", extension="csv")
+        turnover_relationship_daily_path = artifact_path(sample_label, "turnover_relationship_daily", extension="csv")
+        turnover_relationship_pair_summary_path = artifact_path(sample_label, "turnover_relationship_pair_summary", extension="csv")
+        turnover_accumulated_daily_path = artifact_path(sample_label, "turnover_accumulated_daily", extension="csv")
+        rf_pathway_daily_path = artifact_path(sample_label, "rf_pathway_daily", extension="csv")
         daily_calibration_path = artifact_path(sample_label, "daily_calibration", extension="csv")
         scalar_calibration_path = artifact_path(sample_label, "scalar_calibration", extension="csv")
         uncertainty_decomposition_path = artifact_path(sample_label, "uncertainty_decomposition", extension="csv")
@@ -5162,6 +6233,9 @@ def write_scientific_validation_report(
             figure_tag(distribution_path, f"{sample_label} replicate outcome distributions", title_text="Replicate outcome distributions"),
             figure_tag(parity_path, f"{sample_label} median parity checks", title_text="Median parity checks"),
             figure_tag(channel_path, f"{sample_label} hybrid-channel diagnostics", title_text="Hybrid-channel diagnostics"),
+            figure_tag(turnover_path, f"{sample_label} network-delta versus epidemic-delta relationships", title_text="Network-delta versus epidemic-delta relationships"),
+            figure_tag(turnover_accumulated_path, f"{sample_label} accumulated turnover and epidemic deltas", title_text="Accumulated turnover and epidemic deltas"),
+            figure_tag(rf_pathway_path, f"{sample_label} RF route localization", title_text="RF route localization"),
             figure_tag(farm_spatial_path, f"{sample_label} farm-level spatial validation", title_text="Farm-level spatial validation"),
             figure_tag(region_spatial_path, f"{sample_label} regional spatial-fit overview", title_text="Regional spatial-fit overview"),
             link_figure_card(
@@ -5177,6 +6251,10 @@ def write_scientific_validation_report(
             (per_snapshot_csv_path, "Per-day summary CSV"),
             (outcome_distribution_csv_path, "Outcome distribution summary CSV"),
             (daily_mean_comparison_path, "Daily mean-comparison CSV"),
+            (turnover_relationship_daily_path, "Turnover-relationship CSV"),
+            (turnover_relationship_pair_summary_path, "Turnover pair-summary CSV"),
+            (turnover_accumulated_daily_path, "Accumulated-turnover CSV"),
+            (rf_pathway_daily_path, "RF route-localization CSV"),
             (daily_calibration_path, "Daily calibration CSV"),
             (scalar_calibration_path, "Scalar calibration CSV"),
             (uncertainty_decomposition_path, "Uncertainty decomposition CSV"),
@@ -5229,6 +6307,16 @@ def write_scientific_validation_report(
             ("Region→Farm share Wasserstein", fmt_from_row(row, "farm_hazard_rf_share_wasserstein")),
             ("Region→Region share Wasserstein", fmt_from_row(row, "region_pressure_rr_share_wasserstein")),
         ]
+        rf_summary_entries = [
+            ("RF reach-count correlation", fmt_from_row(row, "positive_rf_farm_count_curve_correlation")),
+            ("RF seven-day union correlation", fmt_from_row(row, "positive_rf_union_7d_farm_count_curve_correlation")),
+            ("RF in-degree mean correlation", fmt_from_row(row, "positive_rf_indegree_mean_curve_correlation")),
+            ("RF in-degree q95 correlation", fmt_from_row(row, "positive_rf_indegree_q95_curve_correlation")),
+            ("Observed-field RF hazard correlation", fmt_from_row(row, "rf_observed_field_hazard_curve_correlation")),
+            ("RF reach Jaccard", fmt_from_row(row, "rf_positive_reach_jaccard_mean")),
+            ("RF seven-day union Jaccard", fmt_from_row(row, "rf_positive_union_7d_jaccard_mean")),
+            ("RF in-degree Wasserstein", fmt_from_row(row, "rf_positive_indegree_wasserstein_mean")),
+        ]
         spatial_summary_entries = [
             ("Farm attack-probability correlation", fmt_from_row(row, "farm_attack_probability_correlation")),
             ("Farm attack-probability MAE", fmt_from_row(row, "farm_attack_probability_mae")),
@@ -5249,6 +6337,11 @@ def write_scientific_validation_report(
                     note="These row-level metrics summarize whether the synthetic network preserves the relative contribution of the four hybrid transmission channels, not just the final epidemic totals.",
                 ),
                 kv_table_card(
+                    "RF route-localization summary",
+                    rf_summary_entries,
+                    note="These row-level metrics stay on the region to farm route and compare reach, in-degree concentration, the seven-day reach union, and one-step RF hazard under the observed reservoir field.",
+                ),
+                kv_table_card(
                     "Spatial and field summary",
                     spatial_summary_entries,
                     note="These row-level metrics summarize detailed farm-space agreement and the regional field-distance diagnostics that are otherwise easy to miss in the figure gallery.",
@@ -5262,6 +6355,30 @@ def write_scientific_validation_report(
                     daily_mean_comparison_path,
                     "Daily mean comparison",
                     note="Mean trajectory comparison across days for the main epidemic metrics.",
+                ),
+                table_card_from_csv(
+                    turnover_relationship_daily_path,
+                    "Network-delta versus epidemic-delta relationships",
+                    note="Daily new, persistence, reactivation, and churn deltas from diagnostics paired with daily farm prevalence and cumulative-incidence deltas from the simulation report.",
+                    max_rows=35,
+                ),
+                table_card_from_csv(
+                    turnover_relationship_pair_summary_path,
+                    "Turnover pair summary",
+                    note="Pairwise daywise correlations and sign agreement between each turnover delta and the epidemic deltas.",
+                ),
+                table_card_from_csv(
+                    turnover_accumulated_daily_path,
+                    "Accumulated turnover and epidemic deltas",
+                    note="Cumulative sums of the turnover deltas and the farm-prevalence and farm cumulative-incidence deltas over snapshot index.",
+                    max_rows=35,
+                ),
+                table_card_from_csv(
+                    rf_pathway_daily_path,
+                    "RF route-localization table",
+                    note="Daywise reach, in-degree, reach-union, and observed-field RF hazard checks for the region to farm route.",
+                    max_rows=35,
+                    transform=transform_rf_pathway,
                 ),
                 table_card_from_csv(
                     daily_calibration_path,
@@ -5466,6 +6583,38 @@ def write_scientific_validation_report(
                     cells.append(f"<td>{fmt_from_row(row, key)}</td>")
             hybrid_rows.append("<tr>" + "".join(cells) + "</tr>")
 
+    rf_columns = [
+        ("sample_label", "Setting"),
+        ("positive_rf_farm_count_curve_correlation", "RF reach corr"),
+        ("positive_rf_union_7d_farm_count_curve_correlation", "RF union corr"),
+        ("positive_rf_indegree_mean_curve_correlation", "RF indegree mean corr"),
+        ("positive_rf_indegree_q95_curve_correlation", "RF indegree q95 corr"),
+        ("rf_observed_field_hazard_curve_correlation", "Observed-field RF hazard corr"),
+        ("rf_positive_reach_jaccard_mean", "RF reach Jaccard"),
+        ("rf_positive_union_7d_jaccard_mean", "RF union Jaccard"),
+        ("rf_positive_indegree_wasserstein_mean", "RF indegree W1"),
+    ]
+    available_rf = [(key, label) for key, label in rf_columns if key in summary_rows.columns or key == "sample_label"]
+    rf_rows = []
+    if len(available_rf) > 1:
+        rf_sorted = sort_frame_by_available(
+            headline_rows,
+            [
+                ("rf_observed_field_hazard_curve_correlation", False),
+                ("positive_rf_farm_count_curve_correlation", False),
+                ("rf_positive_reach_jaccard_mean", False),
+                ("rf_positive_indegree_wasserstein_mean", True),
+            ],
+        ).head(12)
+        for _, row in rf_sorted.iterrows():
+            cells = []
+            for key, _ in available_rf:
+                if key == "sample_label":
+                    cells.append(f"<td>{html.escape(str(row.get(key)))}</td>")
+                else:
+                    cells.append(f"<td>{fmt_from_row(row, key)}</td>")
+            rf_rows.append("<tr>" + "".join(cells) + "</tr>")
+
     farm_space_columns = [
         ("sample_label", "Setting"),
         ("farm_attack_probability_correlation", "Farm risk corr"),
@@ -5587,6 +6736,7 @@ def write_scientific_validation_report(
         ("report-coverage", "Report coverage"),
         ("selected-settings", "Selected settings"),
         ("hybrid-channel-fit", "Hybrid channels"),
+        ("rf-pathway-fit", "RF route"),
         ("farm-space-fit", "Farm-space fit"),
         ("uncertainty-calibration", "Uncertainty"),
         ("regional-fit-summary", "Regional fit"),
@@ -6128,6 +7278,27 @@ def write_scientific_validation_report(
             "</section>",
         ])
 
+    if rf_rows:
+        html_parts.extend([
+            "<section class='section' id='rf-pathway-fit'>",
+            _render_section_heading(
+                "RF route-localization summary",
+                control_id="rf_pathway_fit_explain",
+                explain_text="These columns stay on the region to farm route. Higher correlations and Jaccard scores mean the same farms are being reached from positive regions on the same days, while lower in-degree Wasserstein distance means inbound RF exposure is spread across farms in a closer way.",
+                button_label="How to read this table",
+            ),
+            "<p class='subtitle'>This section localizes fit on the reservoir route itself instead of falling back to raw edge totals or the final epidemic curves alone.</p>",
+            table_card_from_html(
+                "<table class='report-table'>"
+                + "<thead><tr>"
+                + "".join(f"<th>{html.escape(label)}</th>" for _, label in available_rf)
+                + "</tr></thead><tbody>"
+                + "".join(rf_rows)
+                + "</tbody></table>"
+            ),
+            "</section>",
+        ])
+
     if farm_space_rows:
         html_parts.extend([
             "<section class='section' id='farm-space-fit'>",
@@ -6404,6 +7575,8 @@ def _run_reality_check_for_sample(
         synthetic_scalar,
         synthetic_daily,
         synthetic_region_daily,
+        observed_pack=observed_pack,
+        synthetic_pack=synthetic_pack,
         observed_diagnostics=observed_diagnostics,
         synthetic_diagnostics=synthetic_diagnostics,
         config=config,
@@ -6963,6 +8136,9 @@ def write_scenario_comparison_report(
         distribution_path = relative_asset(scenario_path / f"{setting_label}_distribution.png")
         parity_path = relative_asset(scenario_path / f"{setting_label}_parity.png")
         channel_path = relative_asset(scenario_path / f"{setting_label}_channel_diagnostics.png")
+        turnover_path = relative_asset(scenario_path / f"{setting_label}_turnover_relationship.png")
+        turnover_accumulated_path = relative_asset(scenario_path / f"{setting_label}_turnover_accumulated.png")
+        rf_pathway_path = relative_asset(scenario_path / f"{setting_label}_rf_pathway_compare.png")
         farm_spatial_path = relative_asset(scenario_path / f"{setting_label}_farm_spatial_overview.png")
         report_path = relative_asset(Path(str(row["report_path"])))
         figures = "".join(
@@ -6973,6 +8149,9 @@ def write_scenario_comparison_report(
                 figure_tag(distribution_path, f"{scenario_name} replicate distributions"),
                 figure_tag(parity_path, f"{scenario_name} parity summary"),
                 figure_tag(channel_path, f"{scenario_name} hybrid-channel diagnostics"),
+                figure_tag(turnover_path, f"{scenario_name} network-delta versus epidemic-delta relationships"),
+                figure_tag(turnover_accumulated_path, f"{scenario_name} accumulated turnover and epidemic deltas"),
+                figure_tag(rf_pathway_path, f"{scenario_name} RF route localization"),
                 figure_tag(farm_spatial_path, f"{scenario_name} farm-level spatial validation"),
             ]
             if fig
@@ -6988,6 +8167,8 @@ def write_scenario_comparison_report(
             f"<span class='metric-pill'>Peak W1 {fmt_from_row(row, 'farm_peak_prevalence_wasserstein')}</span>",
             f"<span class='metric-pill'>Duration W1 {fmt_from_row(row, 'farm_duration_wasserstein')}</span>",
             f"<span class='metric-pill'>Farm risk corr {fmt_from_row(row, 'farm_attack_probability_correlation')}</span>",
+            f"<span class='metric-pill'>RF hazard corr {fmt_from_row(row, 'rf_observed_field_hazard_curve_correlation')}</span>",
+            f"<span class='metric-pill'>RF reach J {fmt_from_row(row, 'rf_positive_reach_jaccard_mean')}</span>",
         ]
         if "farm_prevalence_interval_coverage" in row.index:
             pills.append(
@@ -7047,12 +8228,34 @@ def write_scenario_comparison_report(
         ("farm_incidence_mean_curve_correlation", "Inc mean corr"),
         ("farm_cumulative_incidence_mean_curve_correlation", "Cum mean corr"),
         ("reservoir_total_mean_curve_correlation", "Reservoir mean corr"),
+        ("positive_rf_farm_count_mean_curve_correlation", "RF reach mean corr"),
+        ("positive_rf_union_7d_farm_count_mean_curve_correlation", "RF union mean corr"),
+        ("positive_rf_indegree_mean_mean_curve_correlation", "RF indegree mean corr"),
+        ("rf_observed_field_hazard_mean_curve_correlation", "RF hazard mean corr"),
         ("farm_prevalence_mean_curve_mae", "Prev mean MAE"),
         ("farm_incidence_mean_curve_mae", "Inc mean MAE"),
         ("farm_cumulative_incidence_mean_curve_mae", "Cum mean MAE"),
         ("reservoir_total_mean_curve_mae", "Reservoir mean MAE"),
+        ("positive_rf_farm_count_mean_curve_mae", "RF reach mean MAE"),
+        ("positive_rf_union_7d_farm_count_mean_curve_mae", "RF union mean MAE"),
+        ("positive_rf_indegree_mean_mean_curve_mae", "RF indegree mean MAE"),
+        ("rf_observed_field_hazard_mean_curve_mae", "RF hazard mean MAE"),
     ]
     available_daily_mean = [(key, label) for key, label in daily_mean_columns if key in summary_rows.columns]
+
+    rf_columns = [
+        ("scenario_name", "Scenario"),
+        ("positive_rf_farm_count_curve_correlation", "RF reach corr"),
+        ("positive_rf_union_7d_farm_count_curve_correlation", "RF union corr"),
+        ("positive_rf_indegree_mean_curve_correlation", "RF indegree mean corr"),
+        ("positive_rf_indegree_q95_curve_correlation", "RF indegree q95 corr"),
+        ("rf_observed_field_hazard_curve_correlation", "Observed-field RF hazard corr"),
+        ("rf_positive_reach_jaccard_mean", "RF reach Jaccard"),
+        ("rf_positive_union_7d_jaccard_mean", "RF union Jaccard"),
+        ("rf_positive_indegree_wasserstein_mean", "RF indegree W1"),
+        ("rf_positive_indegree_energy_distance_mean", "RF indegree energy"),
+    ]
+    available_rf = [(key, label) for key, label in rf_columns if key in summary_rows.columns]
 
     scalar_uncertainty_columns = [
         ("scenario_name", "Scenario"),
@@ -7271,6 +8474,39 @@ def write_scenario_comparison_report(
         for _, row in summary_rows.iterrows():
             cells = []
             for key, _ in available_daily_mean:
+                if key == "scenario_name":
+                    cells.append(f"<td>{html.escape(str(row.get(key)))}</td>")
+                else:
+                    cells.append(f"<td>{fmt_from_row(row, key)}</td>")
+            html_parts.append("<tr>" + "".join(cells) + "</tr>")
+        html_parts.extend(
+            [
+                "</tbody></table>",
+                "</div>",
+                "</section>",
+            ]
+        )
+
+    if len(available_rf) > 1:
+        html_parts.extend(
+            [
+                "<section class='section'>",
+                _render_section_heading(
+                    "RF route localization",
+                    control_id="rf_route_localization_explain",
+                    explain_text="These columns localize fit on the region to farm route. Higher correlations and Jaccard scores mean the same farms are being reached from positive regions on the same days, while lower in-degree distances mean inbound RF exposure is spread across farms in a closer way.",
+                    button_label="How to read this table",
+                ),
+                "<p class='subtitle'>This scorecard compares reach, seven-day reach union, positive-region RF in-degree, and one-step RF hazard under the observed reservoir field for each scenario.</p>",
+                "<div class='table-wrap'>",
+                "<table class='report-table'>",
+                "<thead><tr>" + "".join(f"<th>{html.escape(label)}</th>" for _, label in available_rf) + "</tr></thead>",
+                "<tbody>",
+            ]
+        )
+        for _, row in summary_rows.iterrows():
+            cells = []
+            for key, _ in available_rf:
                 if key == "scenario_name":
                     cells.append(f"<td>{html.escape(str(row.get(key)))}</td>")
                 else:

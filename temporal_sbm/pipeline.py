@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import pickle
+import re
 import tempfile
 import sys
 import warnings
@@ -73,10 +74,18 @@ DEFAULT_COVARIATES = (
 
 DEFAULT_METADATA_FIELDS = (
     "corop",
+    "coord_source",
+    "priority",
+    "CR_code",
     "num_farms_bin",
     "total_animals_bin",
     "centroid_grid",
-    "ft_tokens",
+    "trade_species",
+    "diersoort",
+    "diergroep",
+    "diergroeplang",
+    "BtypNL",
+    "bedrtype",
 )
 DEFAULT_METADATA_GRID_KM = 50.0
 DEFAULT_METADATA_NUMERIC_BINS = 5
@@ -500,6 +509,35 @@ def _metadata_quantile_labels(values: Iterable[float], prefix: str, bins: int) -
     return out
 
 
+def _iter_metadata_tokens(value: object) -> Iterable[str]:
+    if pd.isna(value):
+        return ()
+
+    text_value = str(value).strip()
+    if not text_value:
+        return ()
+
+    lowered = text_value.lower()
+    if lowered in {"nan", "none"}:
+        return ()
+
+    if "|" not in text_value and ";" not in text_value:
+        return (text_value,)
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[|;]", text_value):
+        token = str(part).strip()
+        if not token:
+            continue
+        token_lower = token.lower()
+        if token_lower in {"nan", "none"} or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tuple(tokens)
+
+
 def _build_joint_metadata_links(
     *,
     compact_to_original: np.ndarray,
@@ -555,21 +593,17 @@ def _build_joint_metadata_links(
     field_tag_values: dict[str, set[str]] = defaultdict(set)
 
     def add_token(kind: str, compact_id: int, value: object) -> None:
-        if pd.isna(value):
-            return
-        token_value = str(value).strip()
-        if not token_value or token_value.lower() in {"nan", "none"}:
-            return
-        records.append(
-            {
-                "u": int(compact_id),
-                "tag_key": f"{kind}::{token_value}",
-                "tag_kind": kind,
-                "tag_value": token_value,
-            }
-        )
-        field_link_counts[kind] += 1
-        field_tag_values[kind].add(token_value)
+        for token_value in _iter_metadata_tokens(value):
+            records.append(
+                {
+                    "u": int(compact_id),
+                    "tag_key": f"{kind}::{token_value}",
+                    "tag_kind": kind,
+                    "tag_value": token_value,
+                }
+            )
+            field_link_counts[kind] += 1
+            field_tag_values[kind].add(token_value)
 
     for field in fields:
         if field == "corop" and "corop" in node_frame.columns:

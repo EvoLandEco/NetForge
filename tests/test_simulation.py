@@ -12,6 +12,7 @@ from temporal_sbm.simulation import (
     HybridPanelPack,
     HybridSimulationConfig,
     _build_seed_pool,
+    _compare_rf_pathway_fields,
     _filter_sample_manifests,
     _write_region_geo_html,
     aggregate_posterior_reports,
@@ -73,6 +74,55 @@ class SimulationTests(unittest.TestCase):
 
         self.assertEqual(common_day0_pool.tolist(), [0])
         self.assertEqual(all_farms_pool.tolist(), [0, 1, 2])
+
+    def test_compare_rf_pathway_fields_tracks_reach_union_and_hazard(self):
+        observed_pack = HybridPanelPack(
+            label="observed",
+            node_universe=(0, 1, 2),
+            ts_values=(10, 11),
+            src=(np.array([2], dtype=np.int64), np.array([2], dtype=np.int64)),
+            dst=(np.array([0], dtype=np.int64), np.array([1], dtype=np.int64)),
+            weight=(np.array([1.0], dtype=float), np.array([1.0], dtype=float)),
+            active_by_ts=(
+                np.array([True, False, True], dtype=bool),
+                np.array([False, True, True], dtype=bool),
+            ),
+            is_farm=np.array([True, True, False], dtype=bool),
+            is_region=np.array([False, False, True], dtype=bool),
+        )
+        synthetic_pack = HybridPanelPack(
+            label="synthetic",
+            node_universe=(0, 1, 2),
+            ts_values=(10, 11),
+            src=(np.array([2], dtype=np.int64), np.array([2], dtype=np.int64)),
+            dst=(np.array([0], dtype=np.int64), np.array([0], dtype=np.int64)),
+            weight=(np.array([1.0], dtype=float), np.array([1.0], dtype=float)),
+            active_by_ts=(
+                np.array([True, False, True], dtype=bool),
+                np.array([True, False, True], dtype=bool),
+            ),
+            is_farm=np.array([True, True, False], dtype=bool),
+            is_region=np.array([False, False, True], dtype=bool),
+        )
+        config = HybridSimulationConfig(beta_rf=0.5, reservoir_background=0.0, reservoir_decay=0.7)
+        observed_fields = np.array([[[1.0, 1.0]]], dtype=float)
+        synthetic_fields = np.array([[[1.0, 1.0]]], dtype=float)
+
+        observed_daily, synthetic_daily, rf_pathway_daily = _compare_rf_pathway_fields(
+            observed_pack=observed_pack,
+            synthetic_pack=synthetic_pack,
+            observed_region_fields=observed_fields,
+            synthetic_region_fields=synthetic_fields,
+            config=config,
+        )
+
+        self.assertEqual(observed_daily["positive_rf_farm_count"].tolist(), [1.0, 1.0])
+        self.assertEqual(synthetic_daily["positive_rf_farm_count"].tolist(), [1.0, 1.0])
+        self.assertEqual(rf_pathway_daily["positive_rf_reach_jaccard"].tolist(), [1.0, 0.0])
+        self.assertAlmostEqual(float(rf_pathway_daily["positive_rf_union_7d_jaccard"].iloc[1]), 0.5)
+        self.assertIn("original_rf_observed_field_hazard", rf_pathway_daily.columns)
+        self.assertIn("synthetic_rf_observed_field_hazard", rf_pathway_daily.columns)
+        self.assertGreater(float(rf_pathway_daily["original_rf_observed_field_hazard"].iloc[0]), 0.0)
 
     def test_aggregate_posterior_reports_keeps_rewire_none_as_posterior_predictive(self):
         with TemporaryDirectory() as tmpdir:
@@ -369,7 +419,11 @@ class SimulationTests(unittest.TestCase):
     @unittest.skipUnless(HAS_MATPLOTLIB, "matplotlib not installed in test environment")
     def test_write_report_creates_delta_and_distribution_artifacts(self):
         with TemporaryDirectory() as tmpdir:
-            output_dir = Path(tmpdir)
+            output_dir = Path(tmpdir) / "simulation"
+            run_dir = Path(tmpdir) / "run"
+            diagnostics_dir = run_dir / "diagnostics"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
             per_snapshot = pd.DataFrame(
                 {
                     "day_index": [0, 1],
@@ -404,6 +458,36 @@ class SimulationTests(unittest.TestCase):
                     "synthetic_reservoir_positive_regions": [1.0, 3.0],
                     "original_reservoir_positive_regions_mean": [1.1, 2.1],
                     "synthetic_reservoir_positive_regions_mean": [1.0, 2.8],
+                    "original_positive_rf_farm_count": [2.0, 3.0],
+                    "synthetic_positive_rf_farm_count": [2.0, 2.0],
+                    "original_positive_rf_farm_count_q05": [1.0, 2.0],
+                    "synthetic_positive_rf_farm_count_q05": [1.0, 1.0],
+                    "original_positive_rf_farm_count_q95": [3.0, 4.0],
+                    "synthetic_positive_rf_farm_count_q95": [3.0, 3.0],
+                    "original_positive_rf_union_7d_farm_count": [2.0, 4.0],
+                    "synthetic_positive_rf_union_7d_farm_count": [2.0, 3.0],
+                    "original_positive_rf_union_7d_farm_count_q05": [1.0, 3.0],
+                    "synthetic_positive_rf_union_7d_farm_count_q05": [1.0, 2.0],
+                    "original_positive_rf_union_7d_farm_count_q95": [3.0, 5.0],
+                    "synthetic_positive_rf_union_7d_farm_count_q95": [3.0, 4.0],
+                    "original_positive_rf_indegree_mean": [0.5, 0.8],
+                    "synthetic_positive_rf_indegree_mean": [0.4, 0.7],
+                    "original_positive_rf_indegree_mean_q05": [0.2, 0.4],
+                    "synthetic_positive_rf_indegree_mean_q05": [0.1, 0.3],
+                    "original_positive_rf_indegree_mean_q95": [0.9, 1.2],
+                    "synthetic_positive_rf_indegree_mean_q95": [0.8, 1.0],
+                    "original_positive_rf_indegree_q95": [1.0, 2.0],
+                    "synthetic_positive_rf_indegree_q95": [1.0, 1.5],
+                    "original_positive_rf_indegree_q95_q05": [0.8, 1.6],
+                    "synthetic_positive_rf_indegree_q95_q05": [0.7, 1.2],
+                    "original_positive_rf_indegree_q95_q95": [1.4, 2.6],
+                    "synthetic_positive_rf_indegree_q95_q95": [1.3, 2.0],
+                    "original_rf_observed_field_hazard": [0.3, 0.5],
+                    "synthetic_rf_observed_field_hazard": [0.25, 0.45],
+                    "original_rf_observed_field_hazard_q05": [0.2, 0.4],
+                    "synthetic_rf_observed_field_hazard_q05": [0.18, 0.35],
+                    "original_rf_observed_field_hazard_q95": [0.4, 0.6],
+                    "synthetic_rf_observed_field_hazard_q95": [0.35, 0.55],
                     "farm_prevalence_delta": [0.0, 1.0],
                     "farm_incidence_delta": [0.0, 1.0],
                     "farm_cumulative_incidence_delta": [0.0, 1.0],
@@ -411,6 +495,7 @@ class SimulationTests(unittest.TestCase):
                 }
             )
             summary = {
+                "setting_label": "sample_a",
                 "farm_prevalence_curve_correlation": 0.9,
                 "farm_incidence_curve_correlation": 0.8,
                 "farm_prevalence_mean_curve_correlation": 0.88,
@@ -419,17 +504,68 @@ class SimulationTests(unittest.TestCase):
                 "reservoir_total_mean_curve_correlation": 0.74,
                 "reservoir_max_mean_curve_correlation": 0.66,
                 "reservoir_positive_regions_mean_curve_correlation": 0.78,
+                "positive_rf_farm_count_curve_correlation": 0.83,
+                "positive_rf_union_7d_farm_count_curve_correlation": 0.81,
+                "positive_rf_indegree_mean_curve_correlation": 0.79,
+                "positive_rf_indegree_q95_curve_correlation": 0.77,
+                "rf_observed_field_hazard_curve_correlation": 0.85,
+                "positive_rf_farm_count_mean_curve_correlation": 0.82,
+                "positive_rf_union_7d_farm_count_mean_curve_correlation": 0.8,
+                "positive_rf_indegree_mean_mean_curve_correlation": 0.78,
+                "rf_observed_field_hazard_mean_curve_correlation": 0.84,
                 "farm_prevalence_mean_curve_mae": 0.15,
                 "farm_incidence_mean_curve_mae": 0.22,
                 "farm_cumulative_incidence_curve_correlation": 0.85,
                 "reservoir_total_curve_correlation": 0.7,
                 "reservoir_max_curve_correlation": 0.6,
                 "reservoir_positive_regions_curve_correlation": 0.75,
+                "rf_positive_reach_jaccard_mean": 0.74,
+                "rf_positive_union_7d_jaccard_mean": 0.71,
+                "rf_positive_indegree_wasserstein_mean": 0.18,
                 "farm_attack_rate_wasserstein": 0.1,
                 "farm_peak_prevalence_wasserstein": 0.2,
                 "farm_peak_day_wasserstein": 0.3,
                 "farm_duration_wasserstein": 0.4,
                 "simulation_config": {"model": "SEIR"},
+            }
+            diagnostics_per_snapshot = pd.DataFrame(
+                {
+                    "ts": [10, 11],
+                    "original_novel_edge_rate": [0.05, 0.07],
+                    "synthetic_novel_edge_rate": [0.08, 0.10],
+                    "novel_edge_rate_delta": [0.03, 0.03],
+                }
+            )
+            diagnostics_tea = pd.DataFrame(
+                {
+                    "ts": [10, 11],
+                    "new_ratio_delta": [0.04, 0.01],
+                    "original_persist_ratio": [0.60, 0.58],
+                    "synthetic_persist_ratio": [0.55, 0.53],
+                    "persist_ratio_delta": [-0.05, -0.05],
+                    "original_reactivated_ratio": [0.10, 0.12],
+                    "synthetic_reactivated_ratio": [0.13, 0.14],
+                    "reactivated_ratio_delta": [0.03, 0.02],
+                    "original_churn_ratio": [0.25, 0.27],
+                    "synthetic_churn_ratio": [0.30, 0.31],
+                    "churn_ratio_delta": [0.05, 0.04],
+                }
+            )
+            diagnostics_per_snapshot_path = diagnostics_dir / "sample_a_per_snapshot.csv"
+            diagnostics_tea_path = diagnostics_dir / "sample_a_tea_per_snapshot.csv"
+            diagnostics_per_snapshot.to_csv(diagnostics_per_snapshot_path, index=False)
+            diagnostics_tea.to_csv(diagnostics_tea_path, index=False)
+            manifest = {
+                "run_dir": str(run_dir),
+                "diagnostics": [
+                    {
+                        "setting_label": "sample_a",
+                        "outputs": {
+                            "per_snapshot_csv": str(diagnostics_per_snapshot_path),
+                            "tea_per_snapshot": str(diagnostics_tea_path),
+                        },
+                    }
+                ],
             }
             observed_outcomes = pd.DataFrame(
                 {
@@ -471,11 +607,34 @@ class SimulationTests(unittest.TestCase):
                         "farm_incidence",
                         "farm_cumulative_incidence",
                         "reservoir_total",
+                        "positive_rf_farm_count",
+                        "rf_observed_field_hazard",
                     ],
-                    "curve_correlation": [0.88, 0.84, 0.82, 0.74],
-                    "mean_abs_delta": [0.15, 0.22, 0.31, 0.18],
-                    "rmse": [0.16, 0.24, 0.33, 0.20],
-                    "max_abs_delta": [0.30, 0.50, 0.70, 0.40],
+                    "curve_correlation": [0.88, 0.84, 0.82, 0.74, 0.82, 0.84],
+                    "mean_abs_delta": [0.15, 0.22, 0.31, 0.18, 0.25, 0.07],
+                    "rmse": [0.16, 0.24, 0.33, 0.20, 0.28, 0.08],
+                    "max_abs_delta": [0.30, 0.50, 0.70, 0.40, 0.60, 0.14],
+                }
+            )
+            rf_pathway_daily = pd.DataFrame(
+                {
+                    "day_index": [0, 1],
+                    "ts": [10, 11],
+                    "original_positive_rf_farm_count": [2.0, 3.0],
+                    "synthetic_positive_rf_farm_count": [2.0, 2.0],
+                    "positive_rf_farm_count_delta": [0.0, -1.0],
+                    "original_positive_rf_union_7d_farm_count": [2.0, 4.0],
+                    "synthetic_positive_rf_union_7d_farm_count": [2.0, 3.0],
+                    "positive_rf_union_7d_farm_count_delta": [0.0, -1.0],
+                    "original_positive_rf_indegree_mean": [0.5, 0.8],
+                    "synthetic_positive_rf_indegree_mean": [0.4, 0.7],
+                    "positive_rf_indegree_mean_delta": [-0.1, -0.1],
+                    "original_rf_observed_field_hazard": [0.3, 0.5],
+                    "synthetic_rf_observed_field_hazard": [0.25, 0.45],
+                    "rf_observed_field_hazard_delta": [-0.05, -0.05],
+                    "positive_rf_reach_jaccard": [1.0, 0.5],
+                    "positive_rf_union_7d_jaccard": [1.0, 0.67],
+                    "positive_rf_indegree_wasserstein": [0.0, 0.2],
                 }
             )
 
@@ -489,7 +648,9 @@ class SimulationTests(unittest.TestCase):
                     "synthetic_outcomes": synthetic_outcomes,
                     "outcome_distribution_summary": outcome_summary,
                     "daily_mean_comparison": daily_mean_comparison,
+                    "rf_pathway_daily": rf_pathway_daily,
                 },
+                manifest=manifest,
             )
 
             self.assertTrue(Path(outputs["dashboard_png"]).exists())
@@ -497,11 +658,20 @@ class SimulationTests(unittest.TestCase):
             self.assertTrue(Path(outputs["daily_mean_png"]).exists())
             self.assertTrue(Path(outputs["distribution_png"]).exists())
             self.assertTrue(Path(outputs["parity_png"]).exists())
+            self.assertTrue(Path(outputs["turnover_relationship_png"]).exists())
+            self.assertTrue(Path(outputs["turnover_accumulated_png"]).exists())
+            self.assertTrue(Path(outputs["rf_pathway_png"]).exists())
             self.assertTrue(Path(outputs["daily_mean_comparison"]).exists())
+            self.assertTrue(Path(outputs["turnover_relationship_daily"]).exists())
+            self.assertTrue(Path(outputs["turnover_relationship_pair_summary"]).exists())
+            self.assertTrue(Path(outputs["turnover_accumulated_daily"]).exists())
+            self.assertTrue(Path(outputs["rf_pathway_daily"]).exists())
             report_md = Path(outputs["report_md"]).read_text(encoding="utf-8")
             self.assertIn("## How to read the figures", report_md)
             self.assertIn("## How to read the tables", report_md)
             self.assertIn("## Daily mean comparison", report_md)
+            self.assertIn("## Network turnover and epidemic relationships", report_md)
+            self.assertIn("## RF route localization checks", report_md)
 
     @unittest.skipUnless(HAS_MATPLOTLIB, "matplotlib not installed in test environment")
     def test_write_scenario_comparison_report_creates_html(self):
