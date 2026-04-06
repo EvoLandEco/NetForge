@@ -15,6 +15,7 @@ site/
 
 # Generated temporal_sbm run artifacts
 .stress_runs/
+experiments/
 graph_tool_out/
 *.gt
 *.pkl.gz
