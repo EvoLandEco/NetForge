@@ -4612,7 +4612,7 @@ def _simulation_figure_reading_notes(*, include_scenario_overview: bool = False)
             ),
             (
                 "Daily mean view",
-                "The daily mean figure shows the average trajectory across replicates. It is useful when the daily median stays at zero and hides timing or magnitude shifts that are still visible in the mean.",
+                "The daily mean figure shows the average trajectory across replicates. It is useful when the daily median stays at zero and hides timing or magnitude shifts that are visible in the mean.",
             ),
             (
                 "Distribution and parity views",
@@ -7192,7 +7192,7 @@ def write_scientific_validation_report(
         "<section class='hero'>",
         "<div class='eyebrow'>Hybrid transmission validation</div>",
         f"<h1>{html.escape(title)}</h1>",
-        "<p class='subtitle'>This report compares farm-focused epidemic outcomes on the observed temporal panel with outcomes on synthetic panels drawn from the fitted temporal block model. In addition to the aggregate epidemic trajectories, it now surfaces hybrid-channel diagnostics, detailed farm-space risk agreement, regional spatial and temporal fit, and a coverage matrix that checks whether the expected figures and key tables are actually present in the final report bundle.</p>",
+        "<p class='subtitle'>This report compares farm-focused epidemic outcomes on the observed temporal panel with outcomes on synthetic panels drawn from the fitted temporal block model. In addition to the aggregate epidemic trajectories, it includes hybrid-channel diagnostics, detailed farm-space risk agreement, regional spatial and temporal fit, and a coverage matrix that checks whether the expected figures and key tables are present in the final report bundle.</p>",
         "<div class='summary-grid'>",
         "<div class='summary-card'><h3>Settings</h3><div class='metric-value'>" + str(int(len(headline_rows))) + "</div></div>",
         "<div class='summary-card'><h3>Run details</h3><div class='metric-value'>" + str(int(len(detail_rows))) + "</div></div>",
@@ -8054,7 +8054,7 @@ def _scenario_interpretation(row: pd.Series) -> str:
     if prevalence_corr < 0.98 or duration_w1 >= 0.80:
         return "This scenario creates moderate separation from the observed panel while keeping the trajectories interpretable."
     if attack_w1 <= 0.001 and peak_w1 <= 0.05:
-        return "This remains a close-fit scenario, though not as tight as the strongest seed-pool variants."
+        return "This is a close-fit scenario, though not as tight as the strongest seed-pool variants."
     return "This scenario sits near the middle of the sweep. Read it with the delta and distribution figures before drawing conclusions."
 
 

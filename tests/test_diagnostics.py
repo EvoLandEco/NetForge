@@ -9,8 +9,10 @@ import pandas as pd
 
 from temporal_sbm.diagnostics import (
     _build_hybrid_network_summary_table,
+    _aggregate_grouped_numeric_frames,
     _write_daily_network_snapshot_assets,
     _complete_entity_time_series,
+    _compute_temporal_reachability_diagnostics,
     _compute_pi_mass_time_series,
     _load_sweep_summary_rows,
     _merge_entity_time_series,
@@ -40,6 +42,39 @@ except ModuleNotFoundError:
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_aggregate_grouped_numeric_frames_preserves_numeric_and_label_fields(self):
+        first = pd.DataFrame(
+            {
+                "ts": [0, 0],
+                "node_id": [10, 11],
+                "edge_count": [1.0, 2.0],
+                "tag": ["farm", "region"],
+            }
+        )
+        second = pd.DataFrame(
+            {
+                "ts": [0, 0],
+                "node_id": [10, 11],
+                "edge_count": [3.0, 4.0],
+                "tag": ["farm", "region"],
+            }
+        )
+
+        aggregated = _aggregate_grouped_numeric_frames(
+            [first, second],
+            group_keys=["ts", "node_id"],
+            run_labels=["sample_0000", "sample_0001"],
+        )
+
+        row = aggregated.loc[(aggregated["ts"] == 0) & (aggregated["node_id"] == 10)].iloc[0]
+        self.assertEqual(int(row["posterior_num_runs"]), 2)
+        self.assertEqual(row["tag"], "farm")
+        self.assertAlmostEqual(float(row["edge_count"]), 2.0, places=6)
+        self.assertAlmostEqual(float(row["edge_count_mean"]), 2.0, places=6)
+        self.assertAlmostEqual(float(row["edge_count_std"]), 1.0, places=6)
+        self.assertAlmostEqual(float(row["edge_count_q05"]), 1.1, places=6)
+        self.assertAlmostEqual(float(row["edge_count_q95"]), 2.9, places=6)
+
     def test_compute_pi_mass_time_series_marks_singleton_lazy_component_as_missing(self):
         frame = pd.DataFrame(
             {
@@ -152,6 +187,53 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertAlmostEqual(summary["mean_snapshot_edge_jaccard"], 1.0)
         self.assertAlmostEqual(summary["unique_edge_jaccard"], 1.0)
 
+    def test_temporal_reachability_blocks_same_snapshot_multihop(self):
+        frame = pd.DataFrame(
+            {
+                "u": [0, 1],
+                "i": [1, 2],
+                "ts": [0, 0],
+            }
+        )
+
+        result = _compute_temporal_reachability_diagnostics(
+            frame,
+            node_universe=[0, 1, 2],
+            directed=True,
+        )
+
+        self.assertEqual(result["per_snapshot"]["reachable_pair_count"].tolist(), [2])
+        self.assertEqual(result["per_snapshot"]["new_reachable_pair_count"].tolist(), [2])
+        self.assertEqual(int(result["global_summary"]["reachable_pair_count"]), 2)
+        self.assertAlmostEqual(float(result["global_summary"]["reachability_ratio"]), 2.0 / 6.0, places=6)
+        node_zero = result["source_summary"].loc[result["source_summary"]["node_id"] == 0].iloc[0]
+        self.assertEqual(int(node_zero["forward_reach_count"]), 1)
+        self.assertEqual(int(node_zero["static_forward_reach_count"]), 2)
+
+    def test_temporal_reachability_allows_waiting_across_snapshots(self):
+        frame = pd.DataFrame(
+            {
+                "u": [0, 1],
+                "i": [1, 2],
+                "ts": [0, 2],
+            }
+        )
+
+        result = _compute_temporal_reachability_diagnostics(
+            frame,
+            node_universe=[0, 1, 2],
+            directed=True,
+        )
+
+        self.assertEqual(result["per_snapshot"]["reachable_pair_count"].tolist(), [1, 3])
+        self.assertEqual(result["per_snapshot"]["new_reachable_pair_count"].tolist(), [1, 2])
+        self.assertAlmostEqual(float(result["global_summary"]["reachability_ratio"]), 0.5, places=6)
+        self.assertAlmostEqual(float(result["global_summary"]["causal_fidelity"]), 1.0, places=6)
+        self.assertAlmostEqual(float(result["global_summary"]["temporal_efficiency"]), 5.0 / 18.0, places=6)
+        self.assertAlmostEqual(float(result["global_summary"]["mean_arrival_time_reached"]), 7.0 / 3.0, places=6)
+        node_zero = result["source_summary"].loc[result["source_summary"]["node_id"] == 0].iloc[0]
+        self.assertEqual(int(node_zero["forward_reach_count"]), 2)
+
     def test_compare_panels_detailed_returns_block_and_node_outputs(self):
         original = pd.DataFrame(
             {
@@ -190,6 +272,34 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("tea_new_ratio_correlation", comparison["summary"])
         self.assertIn("pi_mass_mean_correlation", comparison["summary"])
         self.assertIn("magnetic_spectrum_mean_correlation", comparison["summary"])
+
+    def test_compare_panels_detailed_returns_temporal_reachability_outputs(self):
+        original = pd.DataFrame(
+            {
+                "u": [0, 1],
+                "i": [1, 2],
+                "ts": [0, 2],
+                "weight": [1.0, 1.0],
+            }
+        )
+        synthetic = original.copy()
+
+        comparison = compare_panels_detailed(
+            original_df=original,
+            synthetic_df=synthetic,
+            directed=True,
+            weight_col="weight",
+            node_types={0: "Farm", 1: "Farm", 2: "Region"},
+        )
+
+        self.assertFalse(comparison["details"]["temporal_reachability_per_snapshot"].empty)
+        self.assertFalse(comparison["details"]["temporal_reachability_summary"].empty)
+        self.assertFalse(comparison["details"]["temporal_reachability_source_summary"].empty)
+        self.assertIn("temporal_reachability_ratio_correlation", comparison["summary"])
+        self.assertIn("temporal_efficiency_correlation", comparison["summary"])
+        self.assertIn("temporal_forward_reach_node_correlation", comparison["summary"])
+        self.assertIn("original_causal_fidelity", comparison["summary"])
+        self.assertIn("synthetic_causal_fidelity", comparison["summary"])
 
     def test_compare_panels_detailed_completes_node_activity_over_full_snapshot_span(self):
         original = pd.DataFrame(
@@ -719,11 +829,37 @@ class DiagnosticsTests(unittest.TestCase):
                 "temporal_sbm.diagnostics._write_daily_network_snapshot_assets",
                 return_value={"network_compare_html": viewer_path},
             ):
-                output_path = write_scientific_validation_report(run_dir)
+                output_path = write_scientific_validation_report(run_dir, include_daily_network_snapshots=True)
 
             html_text = Path(output_path).read_text()
             self.assertIn("Daily Network Snapshots", html_text)
             self.assertIn("Interactive daily network comparison in forced and geographic layouts", html_text)
+
+    def test_write_scientific_validation_report_skips_daily_network_viewer_by_default(self):
+        with TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            diagnostics_dir = run_dir / "diagnostics"
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+            (run_dir / "input_edges_filtered.csv").write_text("u,i,ts,weight\n0,1,10,2\n1,2,11,3\n")
+            (run_dir / "manifest.json").write_text(
+                '{"dataset":"demo","filtered_input_edges_path":"%s","fit_covariates":["dist_km"],"input_summary":{"node_count":3,"edge_count":2},"weight_model":{"candidate_label":"weight:demo"},"directed":true}'  # noqa: E501
+                % (run_dir / "input_edges_filtered.csv")
+            )
+            (diagnostics_dir / "all_samples_summary.csv").write_text(
+                "sample_label,sample_class,sample_mode,rewire_mode,posterior_num_runs,mean_snapshot_edge_jaccard,mean_snapshot_node_jaccard,mean_synthetic_novel_edge_rate,edge_count_correlation,weight_total_correlation,reciprocity_correlation\n"
+                "maxent_micro__rewire_none,posterior_predictive,maxent_micro,none,2,0.32,0.88,0.41,0.98,0.97,0.9\n"
+            )
+            (diagnostics_dir / "maxent_micro__rewire_none_summary.json").write_text(
+                '{"posterior_num_runs":2,"posterior_run_labels":["maxent_micro__rewire_none__sample_0000","maxent_micro__rewire_none__sample_0001"],"mean_snapshot_edge_jaccard":0.32,"mean_snapshot_node_jaccard":0.88,"mean_synthetic_novel_edge_rate":0.41,"edge_count_correlation":0.98,"weight_total_correlation":0.97,"reciprocity_correlation":0.9}'  # noqa: E501
+            )
+
+            with patch("temporal_sbm.diagnostics._write_daily_network_snapshot_assets") as network_assets:
+                output_path = write_scientific_validation_report(run_dir)
+
+            network_assets.assert_not_called()
+            html_text = Path(output_path).read_text()
+            self.assertNotIn("Daily Network Snapshots", html_text)
 
     def test_load_sweep_summary_rows_prefers_setting_summary_csv_over_run_jsons(self):
         with TemporaryDirectory() as tmpdir:

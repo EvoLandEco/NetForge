@@ -25,7 +25,7 @@ Generate the source files first:
 python examples/toy_nl/build_toy_nl_dataset.py
 ```
 
-That command writes `examples/toy_nl/processed_data/TOY_NL/`. The directory is ignored, so the generated files stay local.
+That command refreshes `examples/toy_nl/processed_data/TOY_NL/`.
 
 ## What the toy data encode
 
@@ -44,10 +44,12 @@ The example is designed to show three signals clearly:
 
 The same files also feed the metadata layer used by the default fit:
 
-- `corop` becomes a region tag
-- `num_farms` and `total_animals` become quantile-bin tags
-- coordinates become centroid-grid tags
-- `count_ft_*` columns become farm-type token tags
+- node-map columns such as `corop`, `coord_source`, `priority`, `CR_code`, `trade_species`, `diersoort`, `diergroep`, `diergroeplang`, `BtypNL`, and `bedrtype`
+- `num_farms` and `total_animals` as quantile-bin tags
+- coordinates as centroid-grid tags
+- multi-value text fields, where `|` and `;` split one cell into several tag links
+
+The matrix includes `count_ft_*` columns. They feed `ft_cosine`, and they also become `ft_tokens` when you add that field to `--metadata-fields`.
 
 The basemap for geographic plots is stored at `examples/public/nl_corop.geojson`.
 
@@ -61,12 +63,13 @@ netforge fit \
   --weight-col trade \
   --weight-model discrete-poisson \
   --weight-transform none \
-  --metadata-fields corop num_farms_bin total_animals_bin centroid_grid ft_tokens \
   --date-start 2019-12-16 \
   --date-end 2020-01-12
 ```
 
-This fit keeps the daily trade layers and adds a `__metadata__` layer made of data-to-tag edges. Use `--metadata-fields none` or `--no-joint-metadata-model` if you want a trade-only run.
+This fit keeps the daily trade layers and adds a `__metadata__` layer made of data-to-tag edges. The default toy run uses the richer node-map metadata set together with size-bin and centroid-grid tags. Use `--metadata-fields none` or `--no-joint-metadata-model` if you want a trade-only run.
+
+Because `--fit-covariates` is not set here, the default fit is topology only across the trade edges and metadata links. Add `--fit-covariates dist_km mass_grav anim_grav ft_cosine` when you want the built in realized-edge annotations in the SBM fit.
 
 By default, the run directory is:
 
@@ -85,7 +88,7 @@ netforge generate \
   --posterior-partition-sweep-niter 10
 ```
 
-This writes generated panels under `generated/` inside the run directory.
+This writes generated panels under `generated/markov_turnover__proposal_sbm__micro__rewire_none/` inside the run directory, with one `sample_####/` directory per draw.
 
 ## Step 3: write diagnostics
 
@@ -97,7 +100,7 @@ netforge report \
   --html-report
 ```
 
-The report stage writes tables and figures under `diagnostics/`, including the HTML report.
+The report stage writes tables and figures under `diagnostics/`, including the HTML report and the cross-sample summary CSV files built from the saved generation batches.
 
 ## Before you swap in your own data
 

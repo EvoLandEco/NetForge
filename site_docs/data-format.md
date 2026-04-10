@@ -28,7 +28,9 @@ The edge table must contain:
 
 For weighted runs, the weight column you pass to `--weight-col` must also be present in `edges.csv`, unless you supply weights through `--weight-npy`.
 
-Extra columns are fine. NetForge ignores them unless a command line flag points at them.
+Extra columns are fine. NetForge ignores them unless a command line flag points at them. The built in fit covariates are derived inside the pipeline from timestamps and the node matrix rather than read from extra edge-table columns.
+
+When you use `--weight-npy`, the weight vector is aligned to the input edge rows and may include one leading padding entry.
 
 ### Example
 
@@ -50,7 +52,12 @@ The indexing rule is strict:
 
 If the dataset has `N` nodes, the matrix must have `N` rows. NetForge does not read padded node matrices.
 
-With the default metadata settings, NetForge also reads `num_farms`, `total_animals`, the coordinate pair, and any `count_ft_*` columns from this matrix to build metadata tag nodes.
+The pipeline also derives several built in annotations from this matrix:
+
+- coordinates feed `dist_km` and `centroid_grid`
+- `num_farms` feeds `mass_grav` and `num_farms_bin`
+- `total_animals` or `total_diergroep_*` feeds `anim_grav` and `total_animals_bin`
+- positive `count_ft_*` columns feed `ft_cosine` and, when requested, `ft_tokens`
 
 ## `node_schema.json`
 
@@ -70,7 +77,7 @@ The schema file records the feature order used by `node_features.npy`.
 
 `node_row_offset` must be `0`.
 
-For geographic diagnostics, include either:
+The schema must include either:
 
 - `xco` and `yco`
 - `centroid_x` and `centroid_y`
@@ -82,37 +89,50 @@ The node map must include:
 - `node_id`
 - `type`
 
-You may also include labels, region codes, external ids, or any other metadata you want to keep next to the node ids.
+You may also include labels, region codes, external ids, species fields, or any other metadata you want to keep next to the node ids.
 
 ### Example
 
 ```csv
-node_id,node_label,type,ubn,corop,corop_name
-0,CR17_farm_1,Farm,TOYNL0000,CR17,Utrecht
-1,CR17_farm_2,Farm,TOYNL0001,CR17,Utrecht
-2,CR17_farm_3,Farm,TOYNL0002,CR17,Utrecht
+node_id,node_label,type,ubn,corop,coord_source,priority,trade_species,BtypNL
+0,CR17_farm_1,Farm,TOYNL0000,CR17,registry_point,standard,cattle,Melkvee
+1,CR17_farm_2,Farm,TOYNL0001,CR17,survey_offset,high,cattle|pig,Gemengd
+2,CR17_farm_3,Farm,TOYNL0002,CR17,survey_offset,medium,pig,Varkens
 ```
 
-The `type` column marks the partition role of each data node. Extra metadata columns can also be named in `--metadata-fields` so NetForge can turn them into metadata tag vertices.
+The `type` column marks the partition role of each data node. Extra metadata columns can also be named in `--metadata-fields` so NetForge can turn them into metadata tag vertices. Text fields split on `|` and `;`. Numeric fields with many distinct values are binned into quantile labels.
 
 ## Metadata tag layer
 
 With the default fit settings, NetForge builds a joint data-metadata multilayer graph. It creates one metadata tag vertex per token and stores the data-to-tag edges in a layer named `__metadata__`.
 
+When the joint metadata model is active and `--fit-covariates` is not set, the fit is topology only over the trade and metadata edges. Set `--fit-covariates` when you want the realized-edge annotations in the SBM fit.
+
 The default metadata fields are:
 
 - `corop`
+- `coord_source`
+- `priority`
+- `CR_code`
 - `num_farms_bin`
 - `total_animals_bin`
 - `centroid_grid`
-- `ft_tokens`
+- `trade_species`
+- `diersoort`
+- `diergroep`
+- `diergroeplang`
+- `BtypNL`
+- `bedrtype`
 
 Those tags come from these inputs:
 
-- `corop` reads from `node_map.csv`
+- `corop`, `coord_source`, `priority`, `CR_code`, `trade_species`, `diersoort`, `diergroep`, `diergroeplang`, `BtypNL`, and `bedrtype` read from `node_map.csv`
 - `num_farms_bin` and `total_animals_bin` read from numeric columns in `node_features.npy`
 - `centroid_grid` reads from `xco` and `yco` or `centroid_x` and `centroid_y`
-- `ft_tokens` reads from positive `count_ft_*` columns in `node_features.npy`
+
+`trade_species`, `diersoort`, `diergroep`, and `diergroeplang` may contain a `|` or `;` separated list of tokens. NetForge splits those cells into one data-to-tag edge per token.
+
+You can request `ft_tokens`. It reads positive `count_ft_*` columns in `node_features.npy`.
 
 Use `--metadata-fields` to choose a different set of metadata tags, `--metadata-fields none` to skip metadata tags while keeping the flag in the command, or `--no-joint-metadata-model` to fit the trade graph without the metadata layer.
 

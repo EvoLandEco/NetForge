@@ -27,7 +27,7 @@ Generate the toy dataset first:
 python examples/toy_nl/build_toy_nl_dataset.py
 ```
 
-That command writes the files under [`examples/toy_nl/processed_data/TOY_NL/`](examples/toy_nl/processed_data/TOY_NL/). The directory is ignored, so the generated files stay local.
+That command refreshes the files under [`examples/toy_nl/processed_data/TOY_NL/`](examples/toy_nl/processed_data/TOY_NL/).
 
 ## 2. Match the required input structure
 
@@ -50,7 +50,7 @@ All four files are required.
 
 The edge table must contain source, target, and timestamp columns. The default names are `u`, `i`, and `ts`. If you fit weights, the weight column must be present as well or supplied through `--weight-npy`.
 
-This example keeps a few extra inspection columns. The pipeline ignores them unless you point a CLI flag at them.
+This example keeps a few extra inspection columns. The fit stage does not read them as covariates. Distance, calendar, and gravity-style annotations are built inside the pipeline from timestamps and the node matrix.
 
 ```csv
 u,i,ts,date,trade,distance_km,gravity_mean,is_weekend,is_public_holiday
@@ -69,11 +69,13 @@ The node matrix must be a two-dimensional numeric array. Row `n` must match `nod
 - Node id `11` is stored in row `11`
 - With 12 nodes, the toy matrix has shape `(12, 8)`
 
-The toy schema also supplies the inputs used by the default metadata layer:
+The toy schema also supplies the inputs used by the default metadata layer and the built in edge annotations:
 
-- `num_farms` and `total_animals` for quantile-bin tags
-- `xco` and `yco` for centroid-grid tags
-- `count_ft_*` columns for farm-type token tags
+- `xco` and `yco` for `dist_km` and centroid-grid tags
+- `num_farms` for `mass_grav` and quantile-bin tags
+- `total_animals` for `anim_grav` and quantile-bin tags
+
+The matrix includes `count_ft_*` columns. They feed `ft_cosine`, and they also become `ft_tokens` when you add that field to `--metadata-fields`.
 
 ### Node schema JSON
 
@@ -97,16 +99,16 @@ The schema JSON must list the node feature columns in the exact order used by `n
 
 ### Node map CSV
 
-The node map should contain `node_id` and `type`. In this example it also stores `ubn`, `corop`, and a readable label.
+The node map should contain `node_id` and `type`. In this example it also stores `ubn`, region fields, species labels, and business-type labels.
 
 ```csv
-node_id,node_label,type,ubn,corop,corop_name
-0,CR17_farm_1,Farm,TOYNL0000,CR17,Utrecht
-1,CR17_farm_2,Farm,TOYNL0001,CR17,Utrecht
-2,CR17_farm_3,Farm,TOYNL0002,CR17,Utrecht
+node_id,node_label,type,ubn,corop,coord_source,priority,trade_species,BtypNL
+0,CR17_farm_1,Farm,TOYNL0000,CR17,registry_point,standard,cattle,Melkvee
+1,CR17_farm_2,Farm,TOYNL0001,CR17,survey_offset,high,cattle|pig,Gemengd
+2,CR17_farm_3,Farm,TOYNL0002,CR17,survey_offset,medium,pig,Varkens
 ```
 
-`type` marks the partition role of each data node. Fields such as `corop` can also be named in `--metadata-fields`. NetForge then creates one metadata tag vertex per token and links the matching data nodes to it in the `__metadata__` layer.
+`type` marks the partition role of each data node. Fields such as `corop`, `coord_source`, `priority`, `trade_species`, `diersoort`, `diergroep`, `diergroeplang`, `BtypNL`, and `bedrtype` can also be named in `--metadata-fields`. NetForge creates one metadata tag vertex per token and links the matching data nodes to it in the `__metadata__` layer. Text fields split on `|` and `;`, so a value like `cattle|pig` becomes two tag links.
 
 For the NL map view, this repository keeps the basemap at [`examples/public/nl_corop.geojson`](examples/public/nl_corop.geojson). The bundled example looks for the basemap there.
 
@@ -137,10 +139,12 @@ This gives the example three clear trade signals:
 
 The same files also support the metadata layer used by the default fit:
 
-- `corop` becomes a region tag
+- `corop`, `coord_source`, `priority`, `CR_code`, `trade_species`, `diersoort`, `diergroep`, `diergroeplang`, `BtypNL`, and `bedrtype` become node-map tag families
 - `num_farms` and `total_animals` become quantile-bin tags
 - coordinates become centroid-grid tags
-- `count_ft_*` columns become farm-type token tags
+- multi-value fields such as `trade_species` and `diersoort` split into one tag per token
+
+If you want farm-type token tags, add `ft_tokens` to `--metadata-fields`.
 
 ## 4. Fit the model
 
@@ -154,12 +158,13 @@ netforge fit \
   --weight-col trade \
   --weight-model discrete-poisson \
   --weight-transform none \
-  --metadata-fields corop num_farms_bin total_animals_bin centroid_grid ft_tokens \
   --date-start 2019-12-16 \
   --date-end 2020-01-12
 ```
 
-This run fits the trade panel together with a metadata layer named `__metadata__`. Each distinct metadata token becomes its own tag vertex, and NetForge adds data-to-tag edges in that layer. Use `--metadata-fields none` or `--no-joint-metadata-model` to skip those vertices and fit the trade graph alone.
+This run fits the trade panel together with a metadata layer named `__metadata__`. Each distinct metadata token becomes its own tag vertex, and NetForge adds data-to-tag edges in that layer. The default toy run uses the richer node-map metadata shown above, plus size-bin and centroid-grid tags from the node matrix. Use `--metadata-fields none` or `--no-joint-metadata-model` to skip those vertices and fit the trade graph alone.
+
+Because `--fit-covariates` is not set here, the default fit is topology only across the trade edges and metadata links. Add `--fit-covariates dist_km mass_grav anim_grav ft_cosine` when you want the built in realized-edge annotations in the SBM fit.
 
 By default this writes the run to:
 
@@ -180,6 +185,14 @@ netforge generate \
   --posterior-partition-sweep-niter 10
 ```
 
+The default generation label is `markov_turnover__proposal_sbm__micro__rewire_none`, so the samples land under:
+
+```text
+examples/toy_nl/processed_data/TOY_NL/graph_tool_out/netforge/generated/markov_turnover__proposal_sbm__micro__rewire_none/
+```
+
+Each `sample_####/` directory contains `synthetic_edges.csv` and `sample_manifest.json`.
+
 ## 6. Write reports
 
 Use the saved run directory to produce diagnostics:
@@ -192,7 +205,7 @@ netforge report \
   --html-report
 ```
 
-The report stage writes figures and tables under `diagnostics/`. With the bundled basemap in place, the HTML report can include the NL map view for the toy nodes.
+The report stage writes figures and tables under `diagnostics/`. Without `--synthetic-edges-csv`, it scans every saved sample under `generated/`, reports them one by one, and also writes setting-level summary tables such as `all_sample_runs_summary.csv`, `all_samples_summary.csv`, and `setting_posterior_summary.csv`. With the bundled basemap in place, the HTML report can include the NL map view for the toy nodes.
 
 ## 7. Apply the same structure to your own data
 
@@ -204,6 +217,6 @@ To swap in a real dataset, keep the same contract:
 - store the feature order in `node_schema.json`
 - store node metadata in `node_map.csv`
 
-If you plan to use the joint metadata fit, make sure the files also carry the metadata you want to turn into tags.
+If you plan to use the joint metadata fit, make sure the files also carry the metadata you want to turn into tags. For text metadata, use `|` or `;` when one node should carry more than one tag. For numeric metadata, NetForge can bin fields with many distinct values into quantile labels.
 
 Start from the toy example and swap pieces one at a time.

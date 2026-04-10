@@ -181,6 +181,11 @@ def _default_output_dir(data_root: str, dataset: str) -> Path:
     return Path(data_root).expanduser().resolve() / dataset / "graph_tool_out" / "netforge"
 
 
+def _parser_has_any_option(parser: argparse.ArgumentParser, *option_strings: str) -> bool:
+    existing = {option for action in parser._actions for option in action.option_strings}
+    return any(option in existing for option in option_strings)
+
+
 def add_input_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-root", required=True, help="Root directory containing dataset folders.")
     parser.add_argument("--dataset", required=True, help="Dataset folder name under --data-root.")
@@ -285,6 +290,32 @@ def add_fit_arguments(
         "--allow-mixed-node-types",
         action="store_true",
         help="Allow farm and region nodes to share communities during SBM fitting.",
+    )
+    temporal_transition_group = parser.add_mutually_exclusive_group()
+    temporal_transition_group.add_argument(
+        "--temporal-transition",
+        dest="temporal_transition_enabled",
+        action="store_true",
+        default=None,
+        help="Carry temporal transition settings through the fit stage.",
+    )
+    temporal_transition_group.add_argument(
+        "--no-temporal-transition",
+        dest="temporal_transition_enabled",
+        action="store_false",
+        help="Disable temporal transition settings in the fit stage.",
+    )
+    parser.add_argument(
+        "--temporal-transition-partition-policy",
+        default=None,
+        choices=["fixed", "align_sampled", "sampled"],
+        help="Partition policy used by temporal transition settings during fitting.",
+    )
+    parser.add_argument(
+        "--temporal-transition-prior-strength",
+        type=float,
+        default=None,
+        help="Pseudo-count strength used by temporal transition settings during fitting.",
     )
     parser.add_argument("--no-deg-corr", action="store_true", help="Disable degree correction in the fitted SBM.")
     parser.add_argument("--overlap", action="store_true", help="Fit an overlapping base partition.")
@@ -423,6 +454,89 @@ def add_generation_arguments(
         action="store_true",
         help="Use only the saved parametric weight generator during weighted generation and forbid empirical weight backoff.",
     )
+    if not _parser_has_any_option(parser, "--temporal-transition", "--no-temporal-transition"):
+        temporal_transition_group = parser.add_mutually_exclusive_group()
+        temporal_transition_group.add_argument(
+            "--temporal-transition",
+            dest="temporal_transition_enabled",
+            action="store_true",
+            default=None,
+            help="Carry temporal transition settings through the generation stage.",
+        )
+        temporal_transition_group.add_argument(
+            "--no-temporal-transition",
+            dest="temporal_transition_enabled",
+            action="store_false",
+            help="Disable temporal transition settings in the generation stage.",
+        )
+    if not _parser_has_any_option(parser, "--temporal-transition-partition-policy"):
+        parser.add_argument(
+            "--temporal-transition-partition-policy",
+            default=None,
+            choices=["fixed", "align_sampled", "sampled"],
+            help="Partition policy used by temporal transition settings during generation.",
+        )
+    if not _parser_has_any_option(parser, "--temporal-transition-prior-strength"):
+        parser.add_argument(
+            "--temporal-transition-prior-strength",
+            type=float,
+            default=None,
+            help="Pseudo-count strength used by temporal transition settings during generation.",
+        )
+    parser.add_argument(
+        "--temporal-generator-mode",
+        default="markov_turnover",
+        choices=["markov_turnover", "markov_turnover_random", "none"],
+        help="Temporal generator used for snapshot sampling. 'markov_turnover' uses SBM proposals, 'markov_turnover_random' uses random proposals, and 'none' uses the older independent-layer sampler.",
+    )
+    parser.add_argument(
+        "--temporal-activity-level",
+        default="auto",
+        choices=["auto", "node", "block"],
+        help="Level used by the temporal activity model. 'auto' uses blocks when block labels are available and falls back to nodes otherwise.",
+    )
+    parser.add_argument(
+        "--temporal-group-mode",
+        default="auto",
+        choices=["auto", "block_pair", "type_pair", "global"],
+        help="Grouping used for temporal turnover targets. 'auto' prefers block pairs, then type pairs, then a single global pool.",
+    )
+    parser.add_argument(
+        "--temporal-activity-count-constraint",
+        default="observed",
+        choices=["observed", "model"],
+        help="Keep the observed active-entity count in each snapshot or let the Markov activity model sample counts on its own.",
+    )
+    parser.add_argument(
+        "--temporal-activity-initial",
+        default="observed",
+        choices=["observed", "model"],
+        help="Start the activity process from the observed first snapshot or sample the initial active set from the fitted activity model.",
+    )
+    parser.add_argument(
+        "--temporal-proposal-rounds",
+        type=int,
+        default=3,
+        help="Minimum number of SBM proposal rounds drawn per snapshot before turnover matching is checked.",
+    )
+    parser.add_argument(
+        "--temporal-proposal-rounds-max",
+        type=int,
+        default=12,
+        help="Maximum number of SBM proposal rounds drawn per snapshot before turnover matching stops.",
+    )
+    parser.add_argument(
+        "--temporal-proposal-mode",
+        default="auto",
+        choices=["auto", "sbm", "random"],
+        help="Proposal source used by the temporal generator. 'auto' follows the selected temporal generator mode.",
+    )
+    parser.add_argument(
+        "--temporal-random-proposal-multiplier",
+        type=float,
+        default=1.0,
+        help="Proposal-pool multiplier used when the temporal generator draws random edge proposals.",
+    )
     parser.add_argument(
         "--rewire-model",
         default="none",
@@ -459,6 +573,11 @@ def add_report_arguments(parser: argparse.ArgumentParser) -> None:
         "--html-report",
         action="store_true",
         help="Write a formatted HTML validation report for the run directory.",
+    )
+    parser.add_argument(
+        "--include-daily-network-snapshots",
+        action="store_true",
+        help="Add the daily network snapshot viewer to the HTML report. This renders per-day PDFs and can take a long time.",
     )
     parser.add_argument(
         "--html-report-path",
@@ -883,6 +1002,7 @@ def run_report_stage(args: argparse.Namespace) -> list[dict]:
             run_dir=run_dir,
             output_path=Path(args.html_report_path).expanduser().resolve() if getattr(args, "html_report_path", None) else None,
             skip_spectral_metrics=bool(getattr(args, "skip_spectral_metrics", False)),
+            include_daily_network_snapshots=bool(getattr(args, "include_daily_network_snapshots", False)),
         )
         manifest["scientific_validation_report_html"] = str(html_report_path)
     save_json(manifest, Path(manifest["manifest_path"]))

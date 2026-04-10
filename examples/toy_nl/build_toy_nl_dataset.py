@@ -80,11 +80,76 @@ PUBLIC_HOLIDAYS = {
 
 DEFAULT_METADATA_FIELDS = (
     "corop",
+    "coord_source",
+    "priority",
+    "CR_code",
     "num_farms_bin",
     "total_animals_bin",
     "centroid_grid",
-    "ft_tokens",
+    "trade_species",
+    "diersoort",
+    "diergroep",
+    "diergroeplang",
+    "BtypNL",
+    "bedrtype",
 )
+
+DEFAULT_NODE_MAP_METADATA_FIELDS = (
+    "corop",
+    "coord_source",
+    "priority",
+    "CR_code",
+    "trade_species",
+    "diersoort",
+    "diergroep",
+    "diergroeplang",
+    "BtypNL",
+    "bedrtype",
+)
+
+
+def build_node_metadata(seed: CoropSeed, farm_index: int, total_animals: float) -> dict[str, str]:
+    if farm_index == 1:
+        trade_species = "cattle"
+        diersoort = "RUNDVEE"
+        diergroep = "herkauwers"
+        diergroeplang = "Herkauwers"
+        business_type = "Melkvee"
+        farm_type = "Dairy"
+    elif farm_index == 2:
+        trade_species = "cattle|pig"
+        diersoort = "RUNDVEE;VARKENS"
+        diergroep = "herkauwers;varkens"
+        diergroeplang = "Herkauwers;Varkens"
+        business_type = "Gemengd"
+        farm_type = "Mixed"
+    else:
+        trade_species = "pig"
+        diersoort = "VARKENS"
+        diergroep = "varkens"
+        diergroeplang = "Varkens"
+        business_type = "Varkens"
+        farm_type = "Pig"
+
+    if total_animals >= 430.0:
+        priority = "high"
+    elif total_animals >= 330.0:
+        priority = "medium"
+    else:
+        priority = "standard"
+
+    coord_source = "registry_point" if farm_index == 1 else "survey_offset"
+    return {
+        "coord_source": coord_source,
+        "priority": priority,
+        "CR_code": seed.code,
+        "trade_species": trade_species,
+        "diersoort": diersoort,
+        "diergroep": diergroep,
+        "diergroeplang": diergroeplang,
+        "BtypNL": business_type,
+        "bedrtype": farm_type,
+    }
 
 
 def build_nodes() -> pd.DataFrame:
@@ -94,6 +159,8 @@ def build_nodes() -> pd.DataFrame:
         for farm_index, (offset_x, offset_y) in enumerate(seed.offsets, start=1):
             cattle = seed.cattle[farm_index - 1]
             pigs = seed.pigs[farm_index - 1]
+            total_animals = float(cattle + pigs)
+            metadata = build_node_metadata(seed, farm_index, total_animals)
             rows.append(
                 {
                     "node_id": node_id,
@@ -105,11 +172,12 @@ def build_nodes() -> pd.DataFrame:
                     "xco": seed.center_x + offset_x,
                     "yco": seed.center_y + offset_y,
                     "num_farms": 1.0,
-                    "total_animals": float(cattle + pigs),
+                    "total_animals": total_animals,
                     "count_ft_cattle": 1.0,
                     "count_ft_pig": 1.0,
                     "count_animal_cattle": float(cattle),
                     "count_animal_pig": float(pigs),
+                    **metadata,
                 }
             )
             node_id += 1
@@ -209,7 +277,25 @@ def write_dataset(node_frame: pd.DataFrame, edge_frame: pd.DataFrame) -> None:
     np.save(NODE_PATH, node_matrix)
 
     edge_frame.to_csv(EDGE_PATH, index=False)
-    node_frame[["node_id", "node_label", "type", "ubn", "corop", "corop_name"]].to_csv(
+    node_frame[
+        [
+            "node_id",
+            "node_label",
+            "type",
+            "ubn",
+            "corop",
+            "corop_name",
+            "coord_source",
+            "priority",
+            "CR_code",
+            "trade_species",
+            "diersoort",
+            "diergroep",
+            "diergroeplang",
+            "BtypNL",
+            "bedrtype",
+        ]
+    ].to_csv(
         NODE_MAP_PATH,
         index=False,
     )
@@ -228,7 +314,7 @@ def write_dataset(node_frame: pd.DataFrame, edge_frame: pd.DataFrame) -> None:
                     "enabled_by_default": True,
                     "layer_name": "__metadata__",
                     "metadata_fields": list(DEFAULT_METADATA_FIELDS),
-                    "node_map_fields": ["corop"],
+                    "node_map_fields": list(DEFAULT_NODE_MAP_METADATA_FIELDS),
                     "node_feature_columns": [
                         "xco",
                         "yco",

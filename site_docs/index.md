@@ -50,6 +50,7 @@ The main command line interface is `netforge`:
 netforge fit ...
 netforge generate ...
 netforge report ...
+netforge sweep --config sweep.json
 ```
 
 The simulation entry point is exposed as a Python module:
@@ -60,12 +61,14 @@ python -m temporal_sbm.simulation ...
 
 ## Included example
 
-The repository includes a Dutch toy dataset builder at `examples/toy_nl/build_toy_nl_dataset.py`. Run it to create `examples/toy_nl/processed_data/TOY_NL/` locally. The example uses the NL COROP basemap and encodes:
+The repository includes a Dutch toy dataset builder at `examples/toy_nl/build_toy_nl_dataset.py`. Run it to refresh `examples/toy_nl/processed_data/TOY_NL/`. The example uses the NL COROP basemap and encodes:
 
 - distance decay in edge weights
 - higher activity among larger farms
 - lower activity on weekends
 - lower activity on Dutch public holidays
-- metadata tag inputs from COROP codes, size bins, grid cells, and `count_ft_*` columns
+- metadata tag inputs from region codes, node-map categories, size bins, centroid-grid cells, and multi-value species fields
 
 Use the [quickstart](quickstart.md) to run the full example.
+
+When the joint metadata model is active and `--fit-covariates` is left unset, the default fit is topology only over the trade and metadata edges. Add `--fit-covariates` when you want the built in realized-edge annotations in the SBM fit.

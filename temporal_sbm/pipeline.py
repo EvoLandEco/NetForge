@@ -2154,6 +2154,15 @@ def _generation_setting_label(args: argparse.Namespace) -> str:
     output_subdir = getattr(args, "output_subdir", None)
     if output_subdir:
         return str(output_subdir)
+
+    temporal_mode = _temporal_generator_mode_name(args)
+    if temporal_mode != "none":
+        proposal_mode = _temporal_proposal_mode_name(args, temporal_mode=temporal_mode)
+        if proposal_mode == "random":
+            return "markov_turnover__proposal_random"
+        rewire_model = str(getattr(args, "rewire_model", "none")).replace("-", "_")
+        return f"markov_turnover__proposal_sbm__{_generation_sample_mode_label(args)}__rewire_{rewire_model}"
+
     rewire_model = str(getattr(args, "rewire_model", "none")).replace("-", "_")
     return f"{_generation_sample_mode_label(args)}__rewire_{rewire_model}"
 
@@ -2237,6 +2246,7 @@ def _posterior_partition_state(
 
 WEIGHT_GENERATOR_PAYLOAD_FORMAT = "parametric_weight_generator_v2"
 WEIGHT_GENERATOR_PAYLOAD_FORMAT_LEGACY = "parametric_weight_generator_v1"
+TEMPORAL_GENERATOR_PAYLOAD_FORMAT = "temporal_generator_model_v1"
 
 
 def _canonical_weight_channel(
@@ -3281,7 +3291,2458 @@ class EdgeWeightSampler:
 
 
 
-def sample_synthetic_panel(
+
+def _temporal_generator_mode_name(args: argparse.Namespace) -> str:
+    raw_value = str(getattr(args, "temporal_generator_mode", "markov_turnover")).strip().lower()
+    aliases = {
+        "true": "markov_turnover",
+        "on": "markov_turnover",
+        "enabled": "markov_turnover",
+        "false": "none",
+        "off": "none",
+        "disabled": "none",
+        "random": "markov_turnover_random",
+        "uniform": "markov_turnover_random",
+        "random_proposal": "markov_turnover_random",
+        "uniform_proposal": "markov_turnover_random",
+        "temporal_random": "markov_turnover_random",
+        "markov_turnover_uniform": "markov_turnover_random",
+    }
+    return aliases.get(raw_value, raw_value)
+
+
+def _temporal_proposal_mode_name(
+    args: argparse.Namespace,
+    *,
+    temporal_mode: Optional[str] = None,
+) -> str:
+    if temporal_mode is None:
+        temporal_mode = _temporal_generator_mode_name(args)
+
+    raw_value = str(getattr(args, "temporal_proposal_mode", "auto")).strip().lower()
+    aliases = {
+        "uniform": "random",
+        "uniform_random": "random",
+        "random_uniform": "random",
+        "randomized": "random",
+        "layered_sbm": "sbm",
+        "model": "sbm",
+        "graph_tool": "sbm",
+    }
+    raw_value = aliases.get(raw_value, raw_value)
+    if raw_value == "auto":
+        return "random" if temporal_mode == "markov_turnover_random" else "sbm"
+    if raw_value not in {"sbm", "random"}:
+        raise ValueError("Unknown temporal_proposal_mode. Use 'sbm', 'random', or 'auto'.")
+    return raw_value
+
+
+def _temporal_random_proposal_multiplier(args: argparse.Namespace) -> float:
+    return max(1.0, float(getattr(args, "temporal_random_proposal_multiplier", 1.0)))
+
+
+def _active_dyad_capacity(
+    active_node_count: int,
+    *,
+    directed: bool,
+) -> int:
+    active_node_count = max(int(active_node_count), 0)
+    if directed:
+        return max(active_node_count * max(active_node_count - 1, 0), 0)
+    return max((active_node_count * max(active_node_count - 1, 0)) // 2, 0)
+
+
+def _random_proposal_edge_budget(
+    desired_total: int,
+    active_node_count: int,
+    *,
+    directed: bool,
+    multiplier: float,
+) -> int:
+    capacity = _active_dyad_capacity(active_node_count, directed=directed)
+    if capacity <= 0 or int(desired_total) <= 0:
+        return 0
+    requested = max(1, int(math.ceil(float(multiplier) * float(desired_total))))
+    return min(int(capacity), int(requested))
+
+
+def _sample_uniform_active_edge_candidates(
+    active_nodes: set[int],
+    *,
+    directed: bool,
+    sample_size: int,
+    rng: np.random.Generator,
+) -> list[tuple[int, int]]:
+    node_array = np.asarray(sorted({int(node_id) for node_id in active_nodes}), dtype=np.int64)
+    node_count = int(node_array.size)
+    if node_count <= 1 or int(sample_size) <= 0:
+        return []
+
+    capacity = _active_dyad_capacity(node_count, directed=directed)
+    draw_count = min(int(sample_size), int(capacity))
+    if draw_count <= 0:
+        return []
+
+    sampled_indices = np.asarray(
+        rng.choice(int(capacity), size=int(draw_count), replace=False),
+        dtype=np.int64,
+    ).reshape(-1)
+
+    if directed:
+        u_index = sampled_indices // max(node_count - 1, 1)
+        offset = sampled_indices % max(node_count - 1, 1)
+        v_index = offset + (offset >= u_index)
+    else:
+        row_starts = np.zeros(max(node_count - 1, 1), dtype=np.int64)
+        if node_count > 2:
+            row_starts[1:] = np.cumsum(
+                (node_count - 1) - np.arange(0, node_count - 2, dtype=np.int64)
+            )
+        u_index = np.searchsorted(row_starts, sampled_indices, side="right") - 1
+        u_index = np.clip(u_index, 0, node_count - 2)
+        offset = sampled_indices - row_starts[u_index]
+        v_index = u_index + 1 + offset
+
+    return [
+        (int(node_array[int(u_idx)]), int(node_array[int(v_idx)]))
+        for u_idx, v_idx in zip(u_index.tolist(), v_index.tolist())
+    ]
+
+
+def _temporal_generator_enabled(args: argparse.Namespace) -> bool:
+    return _temporal_generator_mode_name(args) not in {"none", "legacy"}
+
+
+def _temporal_activity_level_name(
+    args: argparse.Namespace,
+    *,
+    has_blocks: bool,
+) -> str:
+    raw_value = str(getattr(args, "temporal_activity_level", "auto")).strip().lower()
+    aliases = {
+        "nodes": "node",
+        "blocks": "block",
+        "vertex": "node",
+        "vertices": "node",
+    }
+    raw_value = aliases.get(raw_value, raw_value)
+    if raw_value == "auto":
+        return "block" if has_blocks else "node"
+    if raw_value not in {"node", "block"}:
+        raise ValueError("Unknown temporal_activity_level. Use 'node', 'block', or 'auto'.")
+    if raw_value == "block" and not has_blocks:
+        return "node"
+    return raw_value
+
+
+def _temporal_group_mode_name(
+    args: argparse.Namespace,
+    *,
+    has_blocks: bool,
+    has_types: bool,
+    activity_level: str,
+) -> str:
+    raw_value = str(getattr(args, "temporal_group_mode", "auto")).strip().lower()
+    aliases = {
+        "blocks": "block_pair",
+        "block": "block_pair",
+        "types": "type_pair",
+        "type": "type_pair",
+        "global_only": "global",
+    }
+    raw_value = aliases.get(raw_value, raw_value)
+    if raw_value == "auto":
+        if activity_level == "block" and has_blocks:
+            return "block_pair"
+        if has_types:
+            return "type_pair"
+        if has_blocks:
+            return "block_pair"
+        return "global"
+    if raw_value == "block_pair" and not has_blocks:
+        return "type_pair" if has_types else "global"
+    if raw_value == "type_pair" and not has_types:
+        return "global"
+    if raw_value not in {"block_pair", "type_pair", "global"}:
+        raise ValueError("Unknown temporal_group_mode. Use 'block_pair', 'type_pair', 'global', or 'auto'.")
+    return raw_value
+
+
+def _canonical_edge_pair(
+    u_value: int,
+    v_value: int,
+    *,
+    directed: bool,
+) -> tuple[int, int]:
+    u_out = int(u_value)
+    v_out = int(v_value)
+    if not directed and u_out > v_out:
+        u_out, v_out = v_out, u_out
+    return u_out, v_out
+
+
+def _canonical_temporal_edge_frame(
+    observed_edges: Optional[pd.DataFrame],
+    *,
+    directed: bool,
+) -> pd.DataFrame:
+    columns = ["u", "i", "ts"]
+    if observed_edges is None or len(observed_edges) == 0:
+        return pd.DataFrame(columns=columns)
+
+    missing = [column for column in columns if column not in observed_edges.columns]
+    if missing:
+        raise ValueError(f"Observed edge table is missing required columns for temporal generation: {missing}")
+
+    frame = observed_edges[columns].copy()
+    frame["u"] = pd.to_numeric(frame["u"], errors="raise").astype(np.int64)
+    frame["i"] = pd.to_numeric(frame["i"], errors="raise").astype(np.int64)
+    frame["ts"] = pd.to_numeric(frame["ts"], errors="raise").astype(np.int64)
+    if not directed:
+        uv = np.sort(frame[["u", "i"]].to_numpy(dtype=np.int64, copy=False), axis=1)
+        frame["u"] = uv[:, 0]
+        frame["i"] = uv[:, 1]
+    frame = frame.drop_duplicates(["u", "i", "ts"]).sort_values(["ts", "u", "i"]).reset_index(drop=True)
+    return frame
+
+
+def _canonical_group_pair(
+    left_value: Any,
+    right_value: Any,
+    *,
+    directed: bool,
+) -> tuple[Any, Any]:
+    left_out = left_value
+    right_out = right_value
+    if not directed:
+        try:
+            should_swap = bool(left_out > right_out)
+        except Exception:
+            should_swap = str(left_out) > str(right_out)
+        if should_swap:
+            left_out, right_out = right_out, left_out
+    return left_out, right_out
+
+
+def _edge_group_key(
+    edge: tuple[int, int],
+    *,
+    node_id_to_block: dict[int, int],
+    node_id_to_type: Optional[dict[int, int]],
+    group_mode: str,
+    directed: bool,
+) -> tuple[Any, ...]:
+    u_value, v_value = edge
+    if group_mode == "block_pair":
+        block_u = node_id_to_block.get(int(u_value))
+        block_v = node_id_to_block.get(int(v_value))
+        if block_u is not None and block_v is not None:
+            left_value, right_value = _canonical_group_pair(int(block_u), int(block_v), directed=directed)
+            return (left_value, right_value)
+        if node_id_to_type:
+            group_mode = "type_pair"
+        else:
+            group_mode = "global"
+
+    if group_mode == "type_pair":
+        if node_id_to_type:
+            type_u = node_id_to_type.get(int(u_value))
+            type_v = node_id_to_type.get(int(v_value))
+            if type_u is not None and type_v is not None:
+                left_value, right_value = _canonical_group_pair(int(type_u), int(type_v), directed=directed)
+                return (left_value, right_value)
+        group_mode = "global"
+
+    if group_mode == "global":
+        return ("__all__",)
+
+    raise ValueError(f"Unsupported temporal grouping mode: {group_mode}")
+
+
+def _serialise_temporal_group_key(group_key: tuple[Any, ...]) -> str:
+    if not isinstance(group_key, tuple):
+        return str(group_key)
+    return "|".join("" if value is None else str(value) for value in group_key)
+
+
+def _deserialise_temporal_group_key(text_value: str) -> tuple[Any, ...]:
+    parts = str(text_value).split("|")
+    if len(parts) == 1 and parts[0] == "__all__":
+        return ("__all__",)
+    parsed: list[Any] = []
+    for part in parts:
+        if part == "":
+            parsed.append(None)
+            continue
+        try:
+            parsed.append(int(part))
+        except ValueError:
+            parsed.append(part)
+    return tuple(parsed)
+
+
+def _activity_snapshot_sets(
+    observed_edges: pd.DataFrame,
+    timeline: list[int],
+    *,
+    level: str,
+    node_id_to_block: dict[int, int],
+) -> dict[int, set[int]]:
+    snapshot_sets: dict[int, set[int]] = {int(ts_value): set() for ts_value in timeline}
+    if observed_edges.empty:
+        return snapshot_sets
+
+    for ts_value, snapshot in observed_edges.groupby("ts", sort=True):
+        ts_int = int(ts_value)
+        if level == "node":
+            active_entities = set(snapshot["u"].astype(np.int64).tolist()) | set(snapshot["i"].astype(np.int64).tolist())
+        elif level == "block":
+            active_entities = set()
+            for edge in snapshot[["u", "i"]].itertuples(index=False, name=None):
+                block_u = node_id_to_block.get(int(edge[0]))
+                block_v = node_id_to_block.get(int(edge[1]))
+                if block_u is not None:
+                    active_entities.add(int(block_u))
+                if block_v is not None:
+                    active_entities.add(int(block_v))
+        else:
+            raise ValueError(f"Unsupported temporal activity level: {level}")
+        snapshot_sets[ts_int] = active_entities
+    return snapshot_sets
+
+
+
+def _fit_temporal_activity_counts_from_snapshot_sets(
+    snapshot_sets: dict[int, set[int]],
+    timeline: list[int],
+    entity_universe: Iterable[int],
+) -> dict[str, Any]:
+    entity_list = sorted({int(entity) for entity in entity_universe})
+    if not timeline:
+        return {
+            "timeline": [],
+            "entities": entity_list,
+            "initial_active_entities": [],
+            "observed_active_counts": {},
+            "entity_counts": {},
+        }
+
+    first_ts = int(timeline[0])
+    observed_active_counts = {
+        int(ts_value): int(len(snapshot_sets.get(int(ts_value), set())))
+        for ts_value in timeline
+    }
+
+    entity_counts: dict[int, dict[str, int]] = {}
+    for entity in entity_list:
+        initial_active = int(entity in snapshot_sets.get(first_ts, set()))
+        to_on = 0
+        stay_on = 0
+        prev_off = 0
+        prev_on = 0
+        previous_active = bool(initial_active)
+        for ts_value in timeline[1:]:
+            current_active = bool(entity in snapshot_sets.get(int(ts_value), set()))
+            if previous_active:
+                prev_on += 1
+                if current_active:
+                    stay_on += 1
+            else:
+                prev_off += 1
+                if current_active:
+                    to_on += 1
+            previous_active = current_active
+        entity_counts[int(entity)] = {
+            "initial_active": int(initial_active),
+            "to_on": int(to_on),
+            "stay_on": int(stay_on),
+            "prev_off": int(prev_off),
+            "prev_on": int(prev_on),
+        }
+
+    return {
+        "timeline": [int(ts_value) for ts_value in timeline],
+        "entities": entity_list,
+        "initial_active_entities": sorted(int(entity) for entity in snapshot_sets.get(first_ts, set())),
+        "observed_active_counts": {str(int(ts_value)): int(count) for ts_value, count in observed_active_counts.items()},
+        "entity_counts": {
+            str(int(entity)): {
+                "initial_active": int(counts["initial_active"]),
+                "to_on": int(counts["to_on"]),
+                "stay_on": int(counts["stay_on"]),
+                "prev_off": int(counts["prev_off"]),
+                "prev_on": int(counts["prev_on"]),
+            }
+            for entity, counts in sorted(entity_counts.items())
+        },
+    }
+
+
+def _build_temporal_activity_model_from_counts(
+    activity_counts: dict[str, Any],
+    *,
+    level: str,
+    prior_strength: float,
+) -> dict[str, Any]:
+    timeline = [int(ts_value) for ts_value in activity_counts.get("timeline", [])]
+    entity_list = [int(entity) for entity in activity_counts.get("entities", [])]
+    observed_active_counts = {
+        int(ts_value): int(count)
+        for ts_value, count in dict(activity_counts.get("observed_active_counts", {})).items()
+    }
+    initial_active_set = {
+        int(entity)
+        for entity in activity_counts.get("initial_active_entities", [])
+    }
+    raw_entity_counts = {
+        int(entity): {
+            "initial_active": int(counts.get("initial_active", 0)),
+            "to_on": int(counts.get("to_on", 0)),
+            "stay_on": int(counts.get("stay_on", 0)),
+            "prev_off": int(counts.get("prev_off", 0)),
+            "prev_on": int(counts.get("prev_on", 0)),
+        }
+        for entity, counts in dict(activity_counts.get("entity_counts", {})).items()
+    }
+
+    if not timeline:
+        return {
+            "level": level,
+            "timeline": [],
+            "entities": entity_list,
+            "params": {},
+            "initial_active_set": set(),
+            "observed_active_counts": observed_active_counts,
+            "global_initial_prob": 0.0,
+            "global_p01": 0.0,
+            "global_p11": 0.0,
+        }
+
+    global_initial_active = 0
+    global_prev_off = 0
+    global_prev_on = 0
+    global_to_on = 0
+    global_stay_on = 0
+    entity_counts: dict[int, dict[str, int]] = {}
+
+    for entity in entity_list:
+        counts = raw_entity_counts.get(
+            int(entity),
+            {
+                "initial_active": 0,
+                "to_on": 0,
+                "stay_on": 0,
+                "prev_off": 0,
+                "prev_on": 0,
+            },
+        )
+        entity_counts[int(entity)] = counts
+        global_initial_active += int(counts["initial_active"])
+        global_prev_off += int(counts["prev_off"])
+        global_prev_on += int(counts["prev_on"])
+        global_to_on += int(counts["to_on"])
+        global_stay_on += int(counts["stay_on"])
+
+    prior_strength = max(float(prior_strength), 0.0)
+    global_initial_prob = float((global_initial_active + 1.0) / (len(entity_list) + 2.0)) if entity_list else 0.0
+    global_p01 = (
+        float((global_to_on + 1.0) / (global_prev_off + 2.0))
+        if global_prev_off > 0
+        else global_initial_prob
+    )
+    global_p11 = (
+        float((global_stay_on + 1.0) / (global_prev_on + 2.0))
+        if global_prev_on > 0
+        else global_initial_prob
+    )
+
+    params: dict[int, dict[str, float]] = {}
+    for entity in entity_list:
+        counts = entity_counts[int(entity)]
+        params[int(entity)] = {
+            "p_init": float(
+                (counts["initial_active"] + prior_strength * global_initial_prob)
+                / (1.0 + prior_strength)
+            ),
+            "p01": float(
+                (counts["to_on"] + prior_strength * global_p01)
+                / (counts["prev_off"] + prior_strength)
+            )
+            if counts["prev_off"] > 0 or prior_strength > 0
+            else global_p01,
+            "p11": float(
+                (counts["stay_on"] + prior_strength * global_p11)
+                / (counts["prev_on"] + prior_strength)
+            )
+            if counts["prev_on"] > 0 or prior_strength > 0
+            else global_p11,
+            "initial_active": float(counts["initial_active"]),
+            "prev_off": float(counts["prev_off"]),
+            "prev_on": float(counts["prev_on"]),
+        }
+
+    return {
+        "level": level,
+        "timeline": [int(ts_value) for ts_value in timeline],
+        "entities": entity_list,
+        "params": params,
+        "initial_active_set": initial_active_set,
+        "observed_active_counts": observed_active_counts,
+        "global_initial_prob": float(global_initial_prob),
+        "global_p01": float(global_p01),
+        "global_p11": float(global_p11),
+    }
+
+
+def _fit_temporal_activity_model(
+    observed_edges: pd.DataFrame,
+    timeline: list[int],
+    *,
+    level: str,
+    entity_universe: Iterable[int],
+    node_id_to_block: dict[int, int],
+    prior_strength: float,
+) -> dict[str, Any]:
+    entity_list = sorted({int(entity) for entity in entity_universe})
+    snapshot_sets = _activity_snapshot_sets(
+        observed_edges,
+        timeline,
+        level=level,
+        node_id_to_block=node_id_to_block,
+    )
+    activity_counts = _fit_temporal_activity_counts_from_snapshot_sets(
+        snapshot_sets,
+        timeline,
+        entity_list,
+    )
+    model = _build_temporal_activity_model_from_counts(
+        activity_counts,
+        level=level,
+        prior_strength=prior_strength,
+    )
+    model["observed_snapshot_sets"] = snapshot_sets
+    return model
+
+
+def _temporal_activity_composition_mode_name(
+
+    args: argparse.Namespace,
+    *,
+    has_types: bool,
+) -> str:
+    raw_value = str(getattr(args, "temporal_activity_composition_mode", "auto")).strip().lower()
+    aliases = {
+        "off": "none",
+        "disabled": "none",
+        "false": "none",
+        "total_count": "total",
+        "count": "total",
+        "counts": "total",
+        "type": "type_count",
+        "types": "type_count",
+    }
+    raw_value = aliases.get(raw_value, raw_value)
+    if raw_value == "auto":
+        return "type_count" if has_types else "total"
+    if raw_value == "type_count" and not has_types:
+        return "total"
+    if raw_value not in {"none", "total", "type_count"}:
+        raise ValueError(
+            "Unknown temporal_activity_composition_mode. Use 'none', 'total', 'type_count', or 'auto'."
+        )
+    return raw_value
+
+
+def _temporal_realized_activity_mode_name(
+    args: argparse.Namespace,
+    *,
+    has_types: bool,
+) -> str:
+    raw_value = str(getattr(args, "temporal_realized_activity_mode", "auto")).strip().lower()
+    aliases = {
+        "off": "none",
+        "disabled": "none",
+        "false": "none",
+        "total_count": "total",
+        "count": "total",
+        "counts": "total",
+        "type": "type_count",
+        "types": "type_count",
+    }
+    raw_value = aliases.get(raw_value, raw_value)
+    if raw_value == "auto":
+        return "type_count" if has_types else "total"
+    if raw_value == "type_count" and not has_types:
+        return "total"
+    if raw_value not in {"none", "total", "type_count"}:
+        raise ValueError(
+            "Unknown temporal_realized_activity_mode. Use 'none', 'total', 'type_count', or 'auto'."
+        )
+    return raw_value
+
+
+def _count_nodes_by_type(
+    node_ids: Iterable[int],
+    node_id_to_type: Optional[dict[int, int]],
+) -> dict[int, int]:
+    if not node_id_to_type:
+        return {}
+    counts: Counter[int] = Counter()
+    for node_id in node_ids:
+        type_id = node_id_to_type.get(int(node_id))
+        if type_id is None:
+            continue
+        counts[int(type_id)] += 1
+    return {int(type_id): int(count) for type_id, count in counts.items()}
+
+
+def _fit_temporal_realized_activity_targets(
+    observed_edges: pd.DataFrame,
+    timeline: list[int],
+    *,
+    node_id_to_type: Optional[dict[int, int]],
+) -> dict[str, Any]:
+    by_ts: dict[int, dict[str, Any]] = {}
+    snapshot_nodes: dict[int, set[int]] = {int(ts_value): set() for ts_value in timeline}
+    if not observed_edges.empty:
+        for ts_value, snapshot in observed_edges.groupby("ts", sort=True):
+            ts_int = int(ts_value)
+            snapshot_nodes[ts_int] = set(snapshot["u"].astype(np.int64).tolist()) | set(
+                snapshot["i"].astype(np.int64).tolist()
+            )
+
+    for ts_value in timeline:
+        ts_int = int(ts_value)
+        active_nodes = snapshot_nodes.get(ts_int, set())
+        by_ts[ts_int] = {
+            "total": int(len(active_nodes)),
+            "by_type": _count_nodes_by_type(active_nodes, node_id_to_type),
+        }
+
+    type_values = (
+        sorted({int(type_id) for type_id in node_id_to_type.values()})
+        if node_id_to_type
+        else []
+    )
+    return {
+        "by_ts": by_ts,
+        "types": type_values,
+    }
+
+
+def _build_activity_entity_compositions(
+    entities: Iterable[int],
+    *,
+    level: str,
+    block_to_nodes: dict[int, set[int]],
+    node_id_to_type: Optional[dict[int, int]],
+) -> dict[int, dict[str, Any]]:
+    compositions: dict[int, dict[str, Any]] = {}
+    for entity in entities:
+        entity_int = int(entity)
+        if level == "node":
+            nodes = {entity_int}
+        elif level == "block":
+            nodes = {int(node_id) for node_id in block_to_nodes.get(entity_int, set())}
+        else:
+            raise ValueError(f"Unsupported temporal activity level: {level}")
+        compositions[entity_int] = {
+            "total": int(len(nodes)),
+            "by_type": _count_nodes_by_type(nodes, node_id_to_type),
+        }
+    return compositions
+
+
+def _activity_target_deficit(
+    *,
+    current_total: int,
+    current_by_type: dict[int, int] | Counter[int],
+    target_total: Optional[int],
+    target_by_type: Optional[dict[int, int]],
+    mode: str,
+    total_weight: float = 1.0,
+    type_weight: float = 1.0,
+) -> float:
+    if mode == "none":
+        return 0.0
+
+    deficit = 0.0
+    if mode in {"total", "type_count"} and target_total is not None:
+        deficit += float(total_weight) * max(0, int(target_total) - int(current_total))
+    if mode == "type_count" and target_by_type:
+        for type_id, target_count in target_by_type.items():
+            deficit += float(type_weight) * max(
+                0,
+                int(target_count) - int(current_by_type.get(int(type_id), 0)),
+            )
+    return float(deficit)
+
+
+def _activity_target_gain(
+    *,
+    current_total: int,
+    current_by_type: dict[int, int] | Counter[int],
+    add_total: int,
+    add_by_type: Optional[dict[int, int]],
+    target_total: Optional[int],
+    target_by_type: Optional[dict[int, int]],
+    mode: str,
+    total_weight: float = 1.0,
+    type_weight: float = 1.0,
+) -> float:
+    if mode == "none":
+        return 0.0
+
+    before = _activity_target_deficit(
+        current_total=current_total,
+        current_by_type=current_by_type,
+        target_total=target_total,
+        target_by_type=target_by_type,
+        mode=mode,
+        total_weight=total_weight,
+        type_weight=type_weight,
+    )
+    updated_by_type: Counter[int] = Counter({int(key): int(value) for key, value in dict(current_by_type).items()})
+    for type_id, count in (add_by_type or {}).items():
+        updated_by_type[int(type_id)] += int(count)
+    after = _activity_target_deficit(
+        current_total=int(current_total) + int(add_total),
+        current_by_type=updated_by_type,
+        target_total=target_total,
+        target_by_type=target_by_type,
+        mode=mode,
+        total_weight=total_weight,
+        type_weight=type_weight,
+    )
+    return float(before - after)
+
+
+def _sample_fixed_count_state(
+    entities: list[int],
+    probabilities: np.ndarray,
+    target_count: int,
+    rng: np.random.Generator,
+    *,
+    composition_mode: str = "none",
+    composition_targets: Optional[dict[str, Any]] = None,
+    composition_by_entity: Optional[dict[int, dict[str, Any]]] = None,
+    composition_weight: float = 0.0,
+) -> set[int]:
+    if target_count <= 0 or not entities:
+        return set()
+    target_count = min(int(target_count), len(entities))
+    if target_count >= len(entities):
+        return {int(entity) for entity in entities}
+
+    clipped = np.clip(np.asarray(probabilities, dtype=float), 1e-9, 1.0 - 1e-9)
+    logits = np.log(clipped) - np.log1p(-clipped)
+    scores = logits + rng.gumbel(size=len(entities))
+
+    use_composition = bool(
+        composition_mode != "none"
+        and composition_targets
+        and composition_by_entity
+    )
+    if not use_composition:
+        chosen = np.argpartition(scores, -target_count)[-target_count:]
+        return {int(entities[int(index)]) for index in chosen.tolist()}
+
+    target_total = None if composition_targets is None else composition_targets.get("total")
+    target_by_type = (
+        None
+        if composition_targets is None
+        else {
+            int(type_id): int(count)
+            for type_id, count in dict(composition_targets.get("by_type", {})).items()
+        }
+    )
+    chosen_indices: set[int] = set()
+    current_total = 0
+    current_by_type: Counter[int] = Counter()
+
+    for _ in range(target_count):
+        best_index: Optional[int] = None
+        best_key: Optional[tuple[float, float, float, float]] = None
+        for index, entity in enumerate(entities):
+            if index in chosen_indices:
+                continue
+            composition = dict(composition_by_entity.get(int(entity), {}))
+            gain = _activity_target_gain(
+                current_total=current_total,
+                current_by_type=current_by_type,
+                add_total=int(composition.get("total", 1)),
+                add_by_type={
+                    int(type_id): int(count)
+                    for type_id, count in dict(composition.get("by_type", {})).items()
+                },
+                target_total=None if target_total is None else int(target_total),
+                target_by_type=target_by_type,
+                mode=composition_mode,
+                total_weight=1.0,
+                type_weight=1.0,
+            )
+            composite_score = float(scores[index]) + float(composition_weight) * float(gain)
+            key = (
+                composite_score,
+                float(scores[index]),
+                float(gain),
+                -float(index),
+            )
+            if best_key is None or key > best_key:
+                best_key = key
+                best_index = int(index)
+        if best_index is None:
+            break
+        chosen_indices.add(int(best_index))
+        chosen_entity = int(entities[int(best_index)])
+        chosen_composition = dict(composition_by_entity.get(chosen_entity, {}))
+        current_total += int(chosen_composition.get("total", 1))
+        for type_id, count in dict(chosen_composition.get("by_type", {})).items():
+            current_by_type[int(type_id)] += int(count)
+
+    if len(chosen_indices) < target_count:
+        for index in np.argsort(scores)[::-1]:
+            if int(index) in chosen_indices:
+                continue
+            chosen_indices.add(int(index))
+            if len(chosen_indices) >= target_count:
+                break
+
+    return {int(entities[int(index)]) for index in sorted(chosen_indices)}
+
+
+
+
+def _sample_temporal_activity_states(
+    activity_model: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+    composition_targets: Optional[dict[int, dict[str, Any]]] = None,
+    composition_by_entity: Optional[dict[int, dict[str, Any]]] = None,
+    composition_mode: str = "none",
+    composition_weight: float = 0.0,
+) -> dict[int, set[int]]:
+    timeline = [int(ts_value) for ts_value in activity_model.get("timeline", [])]
+    entities = [int(entity) for entity in activity_model.get("entities", [])]
+    params = activity_model.get("params", {})
+    if not timeline or not entities:
+        return {int(ts_value): set() for ts_value in timeline}
+
+    count_constraint = str(getattr(args, "temporal_activity_count_constraint", "observed")).strip().lower()
+    initial_mode = str(getattr(args, "temporal_activity_initial", "observed")).strip().lower()
+    observed_snapshot_sets = activity_model.get("observed_snapshot_sets", {})
+    observed_active_counts = activity_model.get("observed_active_counts", {})
+    initial_active_set = {
+        int(entity)
+        for entity in activity_model.get("initial_active_set", [])
+    }
+
+    use_composition = bool(
+        count_constraint == "observed"
+        and composition_mode != "none"
+        and composition_targets
+        and composition_by_entity
+    )
+
+    states: dict[int, set[int]] = {}
+    first_ts = int(timeline[0])
+    if initial_mode == "observed":
+        if isinstance(observed_snapshot_sets, dict) and observed_snapshot_sets:
+            current_state = set(int(entity) for entity in observed_snapshot_sets.get(first_ts, set()))
+        else:
+            current_state = set(int(entity) for entity in initial_active_set)
+    else:
+        init_probabilities = np.asarray([float(params[int(entity)]["p_init"]) for entity in entities], dtype=float)
+        if count_constraint == "observed":
+            target_count = int(
+                observed_active_counts.get(
+                    first_ts,
+                    len(initial_active_set) if initial_active_set else 0,
+                )
+            )
+            current_state = _sample_fixed_count_state(
+                entities,
+                init_probabilities,
+                target_count,
+                rng,
+                composition_mode=composition_mode if use_composition else "none",
+                composition_targets=composition_targets.get(first_ts) if use_composition and composition_targets else None,
+                composition_by_entity=composition_by_entity if use_composition else None,
+                composition_weight=float(composition_weight),
+            )
+        else:
+            current_state = {
+                int(entity)
+                for entity, probability in zip(entities, init_probabilities)
+                if rng.random() < float(probability)
+            }
+    states[first_ts] = current_state
+
+    for ts_value in timeline[1:]:
+        probabilities = np.asarray(
+            [
+                float(params[int(entity)]["p11"] if int(entity) in current_state else params[int(entity)]["p01"])
+                for entity in entities
+            ],
+            dtype=float,
+        )
+        if count_constraint == "observed":
+            next_state = _sample_fixed_count_state(
+                entities,
+                probabilities,
+                int(observed_active_counts.get(int(ts_value), 0)),
+                rng,
+                composition_mode=composition_mode if use_composition else "none",
+                composition_targets=composition_targets.get(int(ts_value)) if use_composition and composition_targets else None,
+                composition_by_entity=composition_by_entity if use_composition else None,
+                composition_weight=float(composition_weight),
+            )
+        else:
+            next_state = {
+                int(entity)
+                for entity, probability in zip(entities, probabilities)
+                if rng.random() < float(probability)
+            }
+        states[int(ts_value)] = next_state
+        current_state = next_state
+    return states
+
+
+def _activity_nodes_for_timestamp(
+
+    ts_value: int,
+    *,
+    activity_level: str,
+    activity_states: dict[int, set[int]],
+    block_to_nodes: dict[int, set[int]],
+    node_id_to_block: dict[int, int],
+) -> tuple[set[int], set[int]]:
+    current_entities = set(int(entity) for entity in activity_states.get(int(ts_value), set()))
+    if activity_level == "node":
+        active_nodes = current_entities
+        active_blocks = {
+            int(node_id_to_block[int(node_id)])
+            for node_id in active_nodes
+            if int(node_id) in node_id_to_block
+        }
+        return active_nodes, active_blocks
+
+    active_blocks = current_entities
+    active_nodes: set[int] = set()
+    for block_id in active_blocks:
+        active_nodes |= set(int(node_id) for node_id in block_to_nodes.get(int(block_id), set()))
+    return active_nodes, active_blocks
+
+
+def _fit_temporal_turnover_targets(
+    observed_edges: pd.DataFrame,
+    timeline: list[int],
+    *,
+    node_id_to_block: dict[int, int],
+    node_id_to_type: Optional[dict[int, int]],
+    group_mode: str,
+    directed: bool,
+) -> dict[str, Any]:
+    by_ts: dict[int, dict[tuple[Any, ...], dict[str, int]]] = {}
+    totals_by_ts: dict[int, dict[str, int]] = {}
+    seen_edges: set[tuple[int, int]] = set()
+    previous_edges: set[tuple[int, int]] = set()
+
+    snapshot_lookup: dict[int, set[tuple[int, int]]] = {int(ts_value): set() for ts_value in timeline}
+    for ts_value, snapshot in observed_edges.groupby("ts", sort=True):
+        snapshot_edges = {
+            _canonical_edge_pair(int(edge.u), int(edge.i), directed=directed)
+            for edge in snapshot.itertuples(index=False)
+        }
+        snapshot_lookup[int(ts_value)] = snapshot_edges
+
+    for ts_value in timeline:
+        ts_int = int(ts_value)
+        current_edges = snapshot_lookup.get(ts_int, set())
+        group_counts: dict[tuple[Any, ...], dict[str, int]] = defaultdict(
+            lambda: {"persist": 0, "reactivated": 0, "new": 0, "total": 0}
+        )
+        totals = {"persist": 0, "reactivated": 0, "new": 0, "total": 0}
+        for edge in sorted(current_edges):
+            if edge in previous_edges:
+                category = "persist"
+            elif edge in seen_edges:
+                category = "reactivated"
+            else:
+                category = "new"
+            group_key = _edge_group_key(
+                edge,
+                node_id_to_block=node_id_to_block,
+                node_id_to_type=node_id_to_type,
+                group_mode=group_mode,
+                directed=directed,
+            )
+            group_counts[group_key][category] += 1
+            group_counts[group_key]["total"] += 1
+            totals[category] += 1
+            totals["total"] += 1
+        by_ts[ts_int] = {group_key: dict(counts) for group_key, counts in group_counts.items()}
+        totals_by_ts[ts_int] = dict(totals)
+        previous_edges = current_edges
+        seen_edges |= current_edges
+
+    return {
+        "group_mode": group_mode,
+        "by_ts": by_ts,
+        "totals_by_ts": totals_by_ts,
+    }
+
+
+def _edge_is_activity_allowed(
+    edge: tuple[int, int],
+    *,
+    activity_level: str,
+    active_nodes: set[int],
+    active_blocks: set[int],
+    node_id_to_block: dict[int, int],
+) -> bool:
+    u_value, v_value = edge
+    if activity_level == "node":
+        return int(u_value) in active_nodes and int(v_value) in active_nodes
+    block_u = node_id_to_block.get(int(u_value))
+    block_v = node_id_to_block.get(int(v_value))
+    return (
+        block_u is not None
+        and block_v is not None
+        and int(block_u) in active_blocks
+        and int(block_v) in active_blocks
+    )
+
+
+def _build_turnover_candidate_pools(
+    *,
+    proposal_counts: Counter[tuple[int, int]],
+    previous_edges: set[tuple[int, int]],
+    seen_edges: set[tuple[int, int]],
+    activity_level: str,
+    active_nodes: set[int],
+    active_blocks: set[int],
+    node_id_to_block: dict[int, int],
+    node_id_to_type: Optional[dict[int, int]],
+    group_mode: str,
+    directed: bool,
+) -> dict[tuple[Any, ...], dict[str, list[tuple[tuple[int, int], float]]]]:
+    pools: dict[tuple[Any, ...], dict[str, list[tuple[tuple[int, int], float]]]] = defaultdict(
+        lambda: {"persist": [], "reactivated": [], "new": []}
+    )
+
+    def _append(edge: tuple[int, int], category: str) -> None:
+        if not _edge_is_activity_allowed(
+            edge,
+            activity_level=activity_level,
+            active_nodes=active_nodes,
+            active_blocks=active_blocks,
+            node_id_to_block=node_id_to_block,
+        ):
+            return
+        group_key = _edge_group_key(
+            edge,
+            node_id_to_block=node_id_to_block,
+            node_id_to_type=node_id_to_type,
+            group_mode=group_mode,
+            directed=directed,
+        )
+        pools[group_key][category].append((edge, float(proposal_counts.get(edge, 0.0))))
+
+    for edge in sorted(previous_edges):
+        _append(edge, "persist")
+    for edge in sorted(seen_edges - previous_edges):
+        _append(edge, "reactivated")
+    for edge in sorted(proposal_counts):
+        if edge in seen_edges:
+            continue
+        _append(edge, "new")
+
+    for group_key in list(pools):
+        for category in ("persist", "reactivated", "new"):
+            pools[group_key][category].sort(
+                key=lambda item: (-float(item[1]), int(item[0][0]), int(item[0][1]))
+            )
+    return pools
+
+
+def _turnover_pool_shortfalls(
+    pools: dict[tuple[Any, ...], dict[str, list[tuple[tuple[int, int], float]]]],
+    target_by_group: dict[tuple[Any, ...], dict[str, int]],
+) -> dict[str, int]:
+    shortfalls = {"persist": 0, "reactivated": 0, "new": 0}
+    for group_key, target in target_by_group.items():
+        group_pools = pools.get(group_key, {})
+        for category in shortfalls:
+            shortfalls[category] += max(
+                0,
+                int(target.get(category, 0)) - int(len(group_pools.get(category, []))),
+            )
+    return shortfalls
+
+
+def _resolve_feasible_turnover_counts(
+    desired: dict[str, int],
+    capacities: dict[str, int],
+) -> dict[str, int]:
+    categories = ("persist", "reactivated", "new")
+    desired_total = int(desired.get("total", sum(int(desired.get(category, 0)) for category in categories)))
+    capacity_total = int(sum(int(capacities.get(category, 0)) for category in categories))
+    target_total = min(desired_total, capacity_total)
+
+    actual = {
+        category: min(int(desired.get(category, 0)), int(capacities.get(category, 0)))
+        for category in categories
+    }
+    assigned_total = int(sum(actual.values()))
+    if assigned_total > target_total:
+        for category in sorted(categories, key=lambda value: actual[value], reverse=True):
+            while assigned_total > target_total and actual[category] > 0:
+                actual[category] -= 1
+                assigned_total -= 1
+
+    needed = target_total - assigned_total
+    if needed > 0:
+        while needed > 0:
+            spares = {
+                category: int(capacities.get(category, 0)) - int(actual.get(category, 0))
+                for category in categories
+            }
+            available = [(spare, category) for category, spare in spares.items() if spare > 0]
+            if not available:
+                break
+            _, category = max(available, key=lambda item: (item[0], -categories.index(item[1])))
+            actual[category] += 1
+            needed -= 1
+
+    actual["total"] = int(sum(actual.values()))
+    return actual
+
+
+
+def _edge_activity_delta(
+    edge: tuple[int, int],
+    *,
+    active_nodes: set[int],
+    node_id_to_type: Optional[dict[int, int]],
+) -> tuple[list[int], dict[int, int]]:
+    new_nodes: list[int] = []
+    add_by_type: Counter[int] = Counter()
+    seen_local: set[int] = set()
+    for node_id in edge:
+        node_int = int(node_id)
+        if node_int in seen_local or node_int in active_nodes:
+            continue
+        seen_local.add(node_int)
+        new_nodes.append(node_int)
+        if node_id_to_type:
+            type_id = node_id_to_type.get(node_int)
+            if type_id is not None:
+                add_by_type[int(type_id)] += 1
+    return new_nodes, {int(type_id): int(count) for type_id, count in add_by_type.items()}
+
+
+def _edge_activity_selection_key(
+    edge: tuple[int, int],
+    score: float,
+    *,
+    selected_active_nodes: set[int],
+    selected_type_counts: Counter[int],
+    target_total: Optional[int],
+    target_by_type: Optional[dict[int, int]],
+    activity_mode: str,
+    activity_weight: float,
+    node_id_to_type: Optional[dict[int, int]],
+    category_bonus: float = 0.0,
+) -> tuple[tuple[float, float, float, float, float, float], list[int], dict[int, int], float]:
+    new_nodes, add_by_type = _edge_activity_delta(
+        edge,
+        active_nodes=selected_active_nodes,
+        node_id_to_type=node_id_to_type,
+    )
+    gain = _activity_target_gain(
+        current_total=len(selected_active_nodes),
+        current_by_type=selected_type_counts,
+        add_total=len(new_nodes),
+        add_by_type=add_by_type,
+        target_total=target_total,
+        target_by_type=target_by_type,
+        mode=activity_mode,
+        total_weight=1.0,
+        type_weight=1.0,
+    )
+    key = (
+        float(gain),
+        float(category_bonus),
+        float(score) + float(activity_weight) * float(gain),
+        float(len(new_nodes)),
+        float(score),
+        -float(edge[0]) - 1e-6 * float(edge[1]),
+    )
+    return key, new_nodes, add_by_type, float(gain)
+
+
+def _select_edges_from_candidate_pool(
+    candidates: list[tuple[tuple[int, int], float]],
+    *,
+    keep_count: int,
+    selected_set: set[tuple[int, int]],
+    selected_active_nodes: set[int],
+    selected_type_counts: Counter[int],
+    target_total: Optional[int],
+    target_by_type: Optional[dict[int, int]],
+    activity_mode: str,
+    activity_weight: float,
+    node_id_to_type: Optional[dict[int, int]],
+    category_bonus: float = 0.0,
+) -> list[tuple[int, int]]:
+    chosen: list[tuple[int, int]] = []
+    available = [(edge, float(score)) for edge, score in candidates if edge not in selected_set]
+    while len(chosen) < int(keep_count) and available:
+        best_index: Optional[int] = None
+        best_key: Optional[tuple[float, float, float, float, float, float]] = None
+        best_nodes: list[int] = []
+        best_type_counts: dict[int, int] = {}
+        for index, (edge, score) in enumerate(available):
+            key, new_nodes, add_by_type, _gain = _edge_activity_selection_key(
+                edge,
+                float(score),
+                selected_active_nodes=selected_active_nodes,
+                selected_type_counts=selected_type_counts,
+                target_total=target_total,
+                target_by_type=target_by_type,
+                activity_mode=activity_mode,
+                activity_weight=activity_weight,
+                node_id_to_type=node_id_to_type,
+                category_bonus=category_bonus,
+            )
+            if best_key is None or key > best_key:
+                best_key = key
+                best_index = int(index)
+                best_nodes = new_nodes
+                best_type_counts = add_by_type
+        if best_index is None:
+            break
+        edge, _score = available.pop(best_index)
+        if edge in selected_set:
+            continue
+        chosen.append(edge)
+        selected_set.add(edge)
+        for node_id in best_nodes:
+            selected_active_nodes.add(int(node_id))
+        for type_id, count in best_type_counts.items():
+            selected_type_counts[int(type_id)] += int(count)
+    return chosen
+
+
+def _select_edges_from_turnover_pools(
+    pools: dict[tuple[Any, ...], dict[str, list[tuple[tuple[int, int], float]]]],
+    target_by_group: dict[tuple[Any, ...], dict[str, int]],
+    *,
+    desired_total: int,
+    activity_target: Optional[dict[str, Any]] = None,
+    activity_mode: str = "none",
+    activity_weight: float = 0.0,
+    node_id_to_type: Optional[dict[int, int]] = None,
+) -> tuple[list[tuple[int, int]], dict[tuple[Any, ...], dict[str, int]], dict[tuple[Any, ...], dict[str, int]]]:
+    categories = ("persist", "reactivated", "new")
+    selected_edges: list[tuple[int, int]] = []
+    selected_set: set[tuple[int, int]] = set()
+    selected_active_nodes: set[int] = set()
+    selected_type_counts: Counter[int] = Counter()
+    achieved_by_group: dict[tuple[Any, ...], dict[str, int]] = {}
+    capacities_by_group: dict[tuple[Any, ...], dict[str, int]] = {}
+
+    target_total = None
+    target_by_type = None
+    if activity_target:
+        if activity_target.get("total") is not None:
+            target_total = int(activity_target.get("total", 0))
+        target_by_type = {
+            int(type_id): int(count)
+            for type_id, count in dict(activity_target.get("by_type", {})).items()
+        }
+
+    all_groups = sorted(
+        set(target_by_group) | set(pools),
+        key=lambda group_key: _serialise_temporal_group_key(group_key),
+    )
+
+    category_order = {"persist": 0, "reactivated": 1, "new": 2}
+    selection_plan: list[tuple[float, int, str, tuple[Any, ...], str, int]] = []
+
+    for group_key in all_groups:
+        group_pools = pools.get(group_key, {"persist": [], "reactivated": [], "new": []})
+        capacities = {category: int(len(group_pools.get(category, []))) for category in categories}
+        capacities_by_group[group_key] = dict(capacities)
+        target = target_by_group.get(group_key, {"persist": 0, "reactivated": 0, "new": 0, "total": 0})
+        achieved = _resolve_feasible_turnover_counts(target, capacities)
+        achieved_by_group[group_key] = dict(achieved)
+        for category in categories:
+            keep_count = int(achieved.get(category, 0))
+            if keep_count <= 0:
+                continue
+            pool_size = int(len(group_pools.get(category, [])))
+            scarcity = float(pool_size) / float(max(keep_count, 1))
+            selection_plan.append(
+                (
+                    scarcity,
+                    int(category_order[category]),
+                    _serialise_temporal_group_key(group_key),
+                    group_key,
+                    category,
+                    keep_count,
+                )
+            )
+
+    selection_plan.sort()
+
+    for _scarcity, _category_order, _group_text, group_key, category, keep_count in selection_plan:
+        group_pools = pools.get(group_key, {"persist": [], "reactivated": [], "new": []})
+        chosen = _select_edges_from_candidate_pool(
+            group_pools.get(category, []),
+            keep_count=int(keep_count),
+            selected_set=selected_set,
+            selected_active_nodes=selected_active_nodes,
+            selected_type_counts=selected_type_counts,
+            target_total=target_total,
+            target_by_type=target_by_type,
+            activity_mode=activity_mode,
+            activity_weight=float(activity_weight),
+            node_id_to_type=node_id_to_type,
+            category_bonus=0.0,
+        )
+        selected_edges.extend(chosen)
+
+    if len(selected_edges) < int(desired_total):
+        category_bonus = {"new": 2.0, "reactivated": 1.0, "persist": 0.0}
+        remaining: list[tuple[tuple[int, int], float, tuple[Any, ...], str]] = []
+        for group_key in all_groups:
+            group_pools = pools.get(group_key, {"persist": [], "reactivated": [], "new": []})
+            achieved = achieved_by_group.get(group_key, {"persist": 0, "reactivated": 0, "new": 0, "total": 0})
+            for category in categories:
+                start_index = int(achieved.get(category, 0))
+                for edge, score in group_pools.get(category, [])[start_index:]:
+                    if edge in selected_set:
+                        continue
+                    remaining.append((edge, float(score), group_key, category))
+
+        while len(selected_edges) < int(desired_total) and remaining:
+            best_index: Optional[int] = None
+            best_key: Optional[tuple[float, float, float, float, float, float]] = None
+            best_nodes: list[int] = []
+            best_type_counts: dict[int, int] = {}
+            best_group_key: Optional[tuple[Any, ...]] = None
+            best_category: Optional[str] = None
+            for index, (edge, score, group_key, category) in enumerate(remaining):
+                key, new_nodes, add_by_type, _gain = _edge_activity_selection_key(
+                    edge,
+                    float(score),
+                    selected_active_nodes=selected_active_nodes,
+                    selected_type_counts=selected_type_counts,
+                    target_total=target_total,
+                    target_by_type=target_by_type,
+                    activity_mode=activity_mode,
+                    activity_weight=float(activity_weight),
+                    node_id_to_type=node_id_to_type,
+                    category_bonus=float(category_bonus[category]),
+                )
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_index = int(index)
+                    best_nodes = new_nodes
+                    best_type_counts = add_by_type
+                    best_group_key = group_key
+                    best_category = category
+            if best_index is None or best_group_key is None or best_category is None:
+                break
+            edge, _score, group_key, category = remaining.pop(best_index)
+            if edge in selected_set:
+                continue
+            selected_edges.append(edge)
+            selected_set.add(edge)
+            for node_id in best_nodes:
+                selected_active_nodes.add(int(node_id))
+            for type_id, count in best_type_counts.items():
+                selected_type_counts[int(type_id)] += int(count)
+            group_counts = achieved_by_group.setdefault(
+                group_key,
+                {"persist": 0, "reactivated": 0, "new": 0, "total": 0},
+            )
+            group_counts[category] = int(group_counts.get(category, 0)) + 1
+            group_counts["total"] = int(group_counts.get("total", 0)) + 1
+
+    for group_key, counts in achieved_by_group.items():
+        counts["total"] = int(sum(int(counts.get(category, 0)) for category in categories))
+    return selected_edges, achieved_by_group, capacities_by_group
+
+
+def _aggregate_turnover_totals(
+    counts_by_group: dict[tuple[Any, ...], dict[str, int]],
+) -> dict[str, int]:
+    totals = {"persist": 0, "reactivated": 0, "new": 0, "total": 0}
+    for counts in counts_by_group.values():
+        for category in ("persist", "reactivated", "new"):
+            totals[category] += int(counts.get(category, 0))
+            totals["total"] += int(counts.get(category, 0))
+    return totals
+
+
+def _build_snapshot_gt_graph(
+    gt: Any,
+    edges: list[tuple[int, int]],
+    *,
+    directed: bool,
+    weight_col: Optional[str] = None,
+    weight_values: Optional[list[float]] = None,
+) -> Any:
+    graph = gt.Graph(directed=directed)
+    node_ids = sorted({int(node_id) for edge in edges for node_id in edge})
+    graph.add_vertex(len(node_ids))
+    node_id_prop = graph.new_vp("int64_t")
+    node_index = {int(node_id): index for index, node_id in enumerate(node_ids)}
+    for node_id, index in node_index.items():
+        node_id_prop[graph.vertex(index)] = int(node_id)
+    graph.vp["node_id"] = node_id_prop
+
+    edge_weight_prop = graph.new_ep("double") if weight_col is not None and weight_values is not None else None
+    for edge_index, (u_value, v_value) in enumerate(edges):
+        edge = graph.add_edge(graph.vertex(node_index[int(u_value)]), graph.vertex(node_index[int(v_value)]))
+        if edge_weight_prop is not None and weight_values is not None:
+            edge_weight_prop[edge] = float(weight_values[edge_index])
+    if edge_weight_prop is not None and weight_col is not None:
+        graph.ep[str(weight_col)] = edge_weight_prop
+    return graph
+
+
+def _proposal_round_settings(args: argparse.Namespace) -> tuple[int, int]:
+    min_rounds = max(1, int(getattr(args, "temporal_proposal_rounds", 3)))
+    max_rounds = max(min_rounds, int(getattr(args, "temporal_proposal_rounds_max", 12)))
+    return min_rounds, max_rounds
+
+
+def _build_generation_node_maps(
+    base: Any,
+    blocks: np.ndarray,
+    node_id_prop: Any,
+    type_prop: Any,
+) -> tuple[dict[int, int], dict[int, int], dict[int, int], dict[int, set[int]]]:
+    node_id_to_base: dict[int, int] = {}
+    node_id_to_block: dict[int, int] = {}
+    node_id_to_type: dict[int, int] = {}
+    block_to_nodes: dict[int, set[int]] = defaultdict(set)
+
+    metadata_prop = base.g.vp["is_metadata_tag"] if "is_metadata_tag" in base.g.vp else None
+    for index in range(int(base.g.num_vertices())):
+        vertex = base.g.vertex(index)
+        if metadata_prop is not None and bool(metadata_prop[vertex]):
+            continue
+        node_id = int(node_id_prop[vertex])
+        if node_id < 0:
+            continue
+        node_id_to_base[node_id] = int(index)
+        node_id_to_block[node_id] = int(blocks[index])
+        block_to_nodes[int(blocks[index])].add(node_id)
+        if type_prop is not None:
+            node_id_to_type[node_id] = int(type_prop[vertex])
+    return node_id_to_base, node_id_to_block, node_id_to_type, block_to_nodes
+
+
+
+def _serialise_temporal_activity_counts_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "timeline": [int(ts_value) for ts_value in payload.get("timeline", [])],
+        "entities": [int(entity) for entity in payload.get("entities", [])],
+        "initial_active_entities": [int(entity) for entity in payload.get("initial_active_entities", [])],
+        "observed_active_counts": {
+            str(int(ts_value)): int(count)
+            for ts_value, count in dict(payload.get("observed_active_counts", {})).items()
+        },
+        "entity_counts": {
+            str(int(entity)): {
+                "initial_active": int(counts.get("initial_active", 0)),
+                "to_on": int(counts.get("to_on", 0)),
+                "stay_on": int(counts.get("stay_on", 0)),
+                "prev_off": int(counts.get("prev_off", 0)),
+                "prev_on": int(counts.get("prev_on", 0)),
+            }
+            for entity, counts in dict(payload.get("entity_counts", {})).items()
+        },
+    }
+
+
+def _serialise_temporal_realized_activity_targets(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "by_ts": {
+            str(int(ts_value)): {
+                "total": int(targets.get("total", 0)),
+                "by_type": {
+                    str(int(type_id)): int(count)
+                    for type_id, count in dict(targets.get("by_type", {})).items()
+                },
+            }
+            for ts_value, targets in dict(payload.get("by_ts", {})).items()
+        },
+        "types": [int(type_id) for type_id in payload.get("types", [])],
+    }
+
+
+def _deserialise_temporal_realized_activity_targets(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "by_ts": {
+            int(ts_value): {
+                "total": int(targets.get("total", 0)),
+                "by_type": {
+                    int(type_id): int(count)
+                    for type_id, count in dict(targets.get("by_type", {})).items()
+                },
+            }
+            for ts_value, targets in dict(payload.get("by_ts", {})).items()
+        },
+        "types": [int(type_id) for type_id in payload.get("types", [])],
+    }
+
+
+def _serialise_temporal_turnover_target_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "group_mode": str(payload.get("group_mode", "global")),
+        "by_ts": {
+            str(int(ts_value)): {
+                _serialise_temporal_group_key(group_key): {
+                    "persist": int(counts.get("persist", 0)),
+                    "reactivated": int(counts.get("reactivated", 0)),
+                    "new": int(counts.get("new", 0)),
+                    "total": int(counts.get("total", 0)),
+                }
+                for group_key, counts in dict(group_targets).items()
+            }
+            for ts_value, group_targets in dict(payload.get("by_ts", {})).items()
+        },
+        "totals_by_ts": {
+            str(int(ts_value)): {
+                "persist": int(counts.get("persist", 0)),
+                "reactivated": int(counts.get("reactivated", 0)),
+                "new": int(counts.get("new", 0)),
+                "total": int(counts.get("total", 0)),
+            }
+            for ts_value, counts in dict(payload.get("totals_by_ts", {})).items()
+        },
+    }
+
+
+def _deserialise_temporal_turnover_target_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "group_mode": str(payload.get("group_mode", "global")),
+        "by_ts": {
+            int(ts_value): {
+                _deserialise_temporal_group_key(group_key): {
+                    "persist": int(counts.get("persist", 0)),
+                    "reactivated": int(counts.get("reactivated", 0)),
+                    "new": int(counts.get("new", 0)),
+                    "total": int(counts.get("total", 0)),
+                }
+                for group_key, counts in dict(group_targets).items()
+            }
+            for ts_value, group_targets in dict(payload.get("by_ts", {})).items()
+        },
+        "totals_by_ts": {
+            int(ts_value): {
+                "persist": int(counts.get("persist", 0)),
+                "reactivated": int(counts.get("reactivated", 0)),
+                "new": int(counts.get("new", 0)),
+                "total": int(counts.get("total", 0)),
+            }
+            for ts_value, counts in dict(payload.get("totals_by_ts", {})).items()
+        },
+    }
+
+
+def _fit_temporal_generator_model(
+    prepared: PreparedData,
+    nested_state: Any,
+    *,
+    directed: bool,
+) -> dict[str, Any]:
+    base = _base_state(nested_state)
+    node_id_prop = base.g.vp["node_id"] if "node_id" in base.g.vp else None
+    if node_id_prop is None:
+        raise RuntimeError("Fitted graph is missing the vertex property 'node_id' required for temporal model export.")
+
+    blocks = _node_blocks_from_state(nested_state)
+    type_prop = base.g.vp["type"] if "type" in base.g.vp else None
+    _node_id_to_base, node_id_to_block, node_id_to_type, _block_to_nodes = _build_generation_node_maps(
+        base,
+        blocks,
+        node_id_prop,
+        type_prop,
+    )
+
+    timeline = [int(ts_value) for ts_value, _ in sorted(prepared.layer_map.items(), key=lambda item: item[1])]
+    observed_frame = _canonical_temporal_edge_frame(prepared.original_edges, directed=directed)
+
+    node_snapshot_sets = _activity_snapshot_sets(
+        observed_frame,
+        timeline,
+        level="node",
+        node_id_to_block=node_id_to_block,
+    )
+    block_snapshot_sets = _activity_snapshot_sets(
+        observed_frame,
+        timeline,
+        level="block",
+        node_id_to_block=node_id_to_block,
+    )
+
+    activity_models = {
+        "node": _serialise_temporal_activity_counts_payload(
+            _fit_temporal_activity_counts_from_snapshot_sets(
+                node_snapshot_sets,
+                timeline,
+                sorted(node_id_to_block.keys()),
+            )
+        ),
+        "block": _serialise_temporal_activity_counts_payload(
+            _fit_temporal_activity_counts_from_snapshot_sets(
+                block_snapshot_sets,
+                timeline,
+                sorted(set(node_id_to_block.values())),
+            )
+        ),
+    }
+
+    realized_activity_targets = _serialise_temporal_realized_activity_targets(
+        _fit_temporal_realized_activity_targets(
+            observed_frame,
+            timeline,
+            node_id_to_type=node_id_to_type or None,
+        )
+    )
+
+    turnover_targets: dict[str, Any] = {
+        "global": _serialise_temporal_turnover_target_payload(
+            _fit_temporal_turnover_targets(
+                observed_frame,
+                timeline,
+                node_id_to_block=node_id_to_block,
+                node_id_to_type=node_id_to_type or None,
+                group_mode="global",
+                directed=directed,
+            )
+        ),
+        "block_pair": _serialise_temporal_turnover_target_payload(
+            _fit_temporal_turnover_targets(
+                observed_frame,
+                timeline,
+                node_id_to_block=node_id_to_block,
+                node_id_to_type=node_id_to_type or None,
+                group_mode="block_pair",
+                directed=directed,
+            )
+        ),
+    }
+    if node_id_to_type:
+        turnover_targets["type_pair"] = _serialise_temporal_turnover_target_payload(
+            _fit_temporal_turnover_targets(
+                observed_frame,
+                timeline,
+                node_id_to_block=node_id_to_block,
+                node_id_to_type=node_id_to_type or None,
+                group_mode="type_pair",
+                directed=directed,
+            )
+        )
+
+    return {
+        "format": TEMPORAL_GENERATOR_PAYLOAD_FORMAT,
+        "mode": "markov_turnover",
+        "directed": bool(directed),
+        "timeline": [int(ts_value) for ts_value in timeline],
+        "partition_source": "fitted_state",
+        "supports_posterior_refresh": False,
+        "activity_models": activity_models,
+        "realized_activity_targets": realized_activity_targets,
+        "turnover_targets": turnover_targets,
+        "summary": {
+            "timeline_length": int(len(timeline)),
+            "node_activity_entity_count": int(len(activity_models["node"].get("entities", []))),
+            "block_activity_entity_count": int(len(activity_models["block"].get("entities", []))),
+            "available_turnover_group_modes": sorted(turnover_targets.keys()),
+            "has_node_types": bool(node_id_to_type),
+            "fitted_block_count": int(len(set(node_id_to_block.values()))),
+            "fitted_node_count": int(len(node_id_to_block)),
+            "full_generative_topology_supported": True,
+            "posterior_refresh_requires_observed_edges": True,
+        },
+    }
+
+
+def _prepare_temporal_targets_for_generation(
+    *,
+    timeline: list[int],
+    observed_edges: Optional[pd.DataFrame],
+    temporal_generator_model: Optional[dict[str, Any]],
+    directed: bool,
+    activity_level: str,
+    group_mode: str,
+    node_id_to_block: dict[int, int],
+    node_id_to_type: Optional[dict[int, int]],
+    prior_strength: float,
+    posterior_partition_sweeps: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]:
+    if temporal_generator_model is not None and int(posterior_partition_sweeps) <= 0:
+        if str(temporal_generator_model.get("format")) != TEMPORAL_GENERATOR_PAYLOAD_FORMAT:
+            raise ValueError(
+                "Unsupported temporal generator payload format: "
+                f"{temporal_generator_model.get('format')!r}"
+            )
+        stored_timeline = [int(ts_value) for ts_value in temporal_generator_model.get("timeline", [])]
+        if stored_timeline != [int(ts_value) for ts_value in timeline]:
+            raise ValueError(
+                "The saved temporal generator timeline does not match the fitted layer map. "
+                "Regenerate the run artifacts or use the matching model bundle."
+            )
+        activity_payload = dict((temporal_generator_model.get("activity_models") or {}).get(activity_level, {}))
+        if not activity_payload:
+            raise ValueError(
+                f"The saved temporal generator model does not include activity payloads for level {activity_level!r}."
+            )
+        turnover_payload = dict((temporal_generator_model.get("turnover_targets") or {}).get(group_mode, {}))
+        if not turnover_payload:
+            raise ValueError(
+                f"The saved temporal generator model does not include turnover targets for mode {group_mode!r}."
+            )
+        return (
+            _deserialise_temporal_realized_activity_targets(
+                dict(temporal_generator_model.get("realized_activity_targets", {}))
+            ),
+            _build_temporal_activity_model_from_counts(
+                activity_payload,
+                level=activity_level,
+                prior_strength=float(prior_strength),
+            ),
+            _deserialise_temporal_turnover_target_payload(turnover_payload),
+            "stored_temporal_model",
+        )
+
+    if observed_edges is None:
+        if int(posterior_partition_sweeps) > 0:
+            raise ValueError(
+                "temporal_generator_mode='markov_turnover' with posterior_partition_sweeps > 0 "
+                "requires the filtered observed edge panel, because turnover quotas must be "
+                "recomputed on the refreshed partition."
+            )
+        raise ValueError(
+            "temporal_generator_mode='markov_turnover' requires observed_edges or a saved temporal "
+            "generator model in the fitted run artifacts."
+        )
+
+    observed_frame = _canonical_temporal_edge_frame(observed_edges, directed=directed)
+    entity_universe = (
+        sorted(node_id_to_block.values()) if activity_level == "block" else sorted(node_id_to_block.keys())
+    )
+    return (
+        _fit_temporal_realized_activity_targets(
+            observed_frame,
+            timeline,
+            node_id_to_type=node_id_to_type or None,
+        ),
+        _fit_temporal_activity_model(
+            observed_frame,
+            timeline,
+            level=activity_level,
+            entity_universe=entity_universe,
+            node_id_to_block=node_id_to_block,
+            prior_strength=float(prior_strength),
+        ),
+        _fit_temporal_turnover_targets(
+            observed_frame,
+            timeline,
+            node_id_to_block=node_id_to_block,
+            node_id_to_type=node_id_to_type or None,
+            group_mode=group_mode,
+            directed=directed,
+        ),
+        "observed_refit_posterior_refresh" if int(posterior_partition_sweeps) > 0 else "observed_refit",
+    )
+
+
+def _serialise_temporal_generation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    serialised: list[dict[str, Any]] = []
+    for row in rows:
+        out = dict(row)
+        if "target_by_group" in out:
+            out["target_by_group"] = {
+                _serialise_temporal_group_key(group_key): _json_ready(group_counts)
+                for group_key, group_counts in out["target_by_group"].items()
+            }
+        if "achieved_by_group" in out:
+            out["achieved_by_group"] = {
+                _serialise_temporal_group_key(group_key): _json_ready(group_counts)
+                for group_key, group_counts in out["achieved_by_group"].items()
+            }
+        if "capacity_by_group" in out:
+            out["capacity_by_group"] = {
+                _serialise_temporal_group_key(group_key): _json_ready(group_counts)
+                for group_key, group_counts in out["capacity_by_group"].items()
+            }
+        serialised.append(_json_ready(out))
+    return serialised
+
+
+def _sample_synthetic_panel_markov_turnover(
+    graph: Any,
+    nested_state: Any,
+    layer_map: dict[int, int],
+    output_dir: Path,
+    directed: bool,
+    seed: int,
+    args: argparse.Namespace,
+    observed_edges: Optional[pd.DataFrame] = None,
+    weight_model: Optional[dict] = None,
+    weight_generator_model: Optional[dict] = None,
+    temporal_generator_model: Optional[dict[str, Any]] = None,
+) -> dict:
+    gt = _require_graph_tool()
+    gt.seed_rng(int(seed))
+    weight_partition_policy = str(getattr(args, "weight_parametric_partition_policy", "fixed")).strip().lower()
+    pure_generative_weights = _pure_generative_weight_mode(args)
+    if pure_generative_weights and weight_partition_policy == "refit_on_refresh":
+        raise ValueError(
+            "weight_pure_generative=True is incompatible with weight_parametric_partition_policy='refit_on_refresh'."
+        )
+
+    LOGGER.debug(
+        "Sampling temporal-generator synthetic panel | output_dir=%s | directed=%s | seed=%s | layer_count=%s | temporal_mode=%s | proposal_mode=%s",
+        output_dir,
+        directed,
+        seed,
+        len(layer_map),
+        _temporal_generator_mode_name(args),
+        _temporal_proposal_mode_name(args, temporal_mode=_temporal_generator_mode_name(args)),
+    )
+
+    sampled_state = _posterior_partition_state(nested_state, seed=seed, args=args)
+    base = _base_state(sampled_state)
+    lid_to_state = map_graph_lid_to_state_lid(sampled_state)
+    LOGGER.debug("Sampled state ready for temporal generator | %s", _state_summary_text(sampled_state))
+
+    node_id_prop = base.g.vp["node_id"] if "node_id" in base.g.vp else None
+    if node_id_prop is None:
+        raise RuntimeError("Fitted graph is missing the vertex property 'node_id'.")
+
+    blocks = _node_blocks_from_state(sampled_state)
+    type_prop = base.g.vp["type"] if "type" in base.g.vp else None
+    node_id_to_base, node_id_to_block, node_id_to_type, block_to_nodes = _build_generation_node_maps(
+        base,
+        blocks,
+        node_id_prop,
+        type_prop,
+    )
+
+    active_weight_generator = weight_generator_model
+    weight_generation_mode = "none"
+    if weight_model is not None and observed_edges is not None and weight_partition_policy == "refit_on_refresh":
+        active_weight_generator = _fit_parametric_weight_generator_model(
+            observed_edges=observed_edges,
+            base=base,
+            weight_model=weight_model,
+            directed=directed,
+            args=args,
+            blocks=blocks,
+        )
+        weight_generation_mode = "parametric_refit"
+    elif active_weight_generator is not None:
+        weight_generation_mode = "parametric_fixed"
+
+    if pure_generative_weights and weight_model is not None and active_weight_generator is None:
+        raise ValueError(
+            "weight_pure_generative=True requires a fitted parametric weight generator. "
+            "Generation cannot proceed with empirical weight backoff."
+        )
+
+    weight_blocks = blocks
+    if active_weight_generator is not None and weight_partition_policy != "refit_on_refresh":
+        if pure_generative_weights:
+            stored_weight_blocks = _stored_weight_reference_blocks(
+                base=base,
+                blocks=blocks,
+                node_id_prop=node_id_prop,
+                weight_generator_model=active_weight_generator,
+            )
+            if stored_weight_blocks is None:
+                raise ValueError(
+                    "weight_pure_generative=True requires node_blocks in the saved parametric weight generator."
+                )
+            weight_blocks = stored_weight_blocks
+            LOGGER.debug(
+                "Using stored node blocks from the saved parametric weight generator | unique_blocks=%s",
+                int(np.unique(weight_blocks).size),
+            )
+        else:
+            weight_blocks = _aligned_blocks_for_weight_generation(
+                gt=gt,
+                base=base,
+                blocks=blocks,
+                node_id_prop=node_id_prop,
+                weight_generator_model=active_weight_generator,
+            )
+
+    partition_records = []
+    include_weight_blocks = active_weight_generator is not None and not np.array_equal(weight_blocks, blocks)
+    active_prop = base.g.vp["active_in_window"] if "active_in_window" in base.g.vp else None
+    metadata_prop = base.g.vp["is_metadata_tag"] if "is_metadata_tag" in base.g.vp else None
+    for index in range(int(base.g.num_vertices())):
+        vertex = base.g.vertex(index)
+        if metadata_prop is not None and bool(metadata_prop[vertex]):
+            continue
+        node_id = int(node_id_prop[vertex])
+        if node_id < 0:
+            continue
+        record = {
+            "node_id": node_id,
+            "block_id": int(blocks[index]),
+        }
+        if active_prop is not None:
+            record["active_in_window"] = int(active_prop[vertex])
+        if include_weight_blocks:
+            record["weight_block_id"] = int(weight_blocks[index])
+        partition_records.append(record)
+
+    partition_frame = pd.DataFrame(partition_records).sort_values(
+        ["node_id", "block_id"] + (["weight_block_id"] if include_weight_blocks else [])
+    ).reset_index(drop=True)
+    partition_path = Path(output_dir) / "sample_node_partition.csv"
+    partition_path.parent.mkdir(parents=True, exist_ok=True)
+    partition_frame.to_csv(partition_path, index=False)
+
+    weight_col = None
+    weight_sampler = None
+    if active_weight_generator is not None:
+        weight_col = str(active_weight_generator["output_column"])
+        weight_sampler = ParametricWeightSampler(
+            weight_generator_model=active_weight_generator,
+            directed=directed,
+            rng=np.random.default_rng(int(seed)),
+        )
+    elif weight_model and observed_edges is not None:
+        if pure_generative_weights:
+            raise ValueError(
+                "weight_pure_generative=True forbids empirical weight backoff. "
+                "Fit and load a parametric weight generator instead."
+            )
+        weight_col = str(weight_model.get("output_column") or weight_model.get("input_column"))
+        weight_sampler = EdgeWeightSampler(
+            observed_edges=observed_edges,
+            node_id_to_base=node_id_to_base,
+            blocks=blocks,
+            weight_model=weight_model,
+            directed=directed,
+            min_cell_count=max(1, int(getattr(args, "weight_min_cell_count", 3))),
+            rng=np.random.default_rng(int(seed)),
+            node_id_to_type=node_id_to_type or None,
+        )
+        weight_generation_mode = "empirical_backoff"
+
+    output_dir = Path(output_dir)
+    snapshot_dir = output_dir / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    timeline = [int(ts_value) for ts_value, _ in sorted(layer_map.items(), key=lambda item: item[1])]
+    activity_level = _temporal_activity_level_name(args, has_blocks=bool(node_id_to_block))
+    group_mode = _temporal_group_mode_name(
+        args,
+        has_blocks=bool(node_id_to_block),
+        has_types=bool(node_id_to_type),
+        activity_level=activity_level,
+    )
+    activity_prior_strength = max(0.0, float(getattr(args, "temporal_activity_prior_strength", 8.0)))
+    activity_composition_mode = _temporal_activity_composition_mode_name(
+        args,
+        has_types=bool(node_id_to_type),
+    )
+    activity_composition_weight = max(
+        0.0,
+        float(getattr(args, "temporal_activity_composition_weight", 0.15)),
+    )
+    realized_activity_mode = _temporal_realized_activity_mode_name(
+        args,
+        has_types=bool(node_id_to_type),
+    )
+    realized_activity_weight = max(
+        0.0,
+        float(getattr(args, "temporal_realized_activity_weight", 2.0)),
+    )
+    posterior_partition_sweeps = max(0, int(getattr(args, "posterior_partition_sweeps", 0)))
+    observed_realized_activity_targets, activity_model, turnover_targets, temporal_target_source = _prepare_temporal_targets_for_generation(
+        timeline=timeline,
+        observed_edges=observed_edges,
+        temporal_generator_model=temporal_generator_model,
+        directed=directed,
+        activity_level=activity_level,
+        group_mode=group_mode,
+        node_id_to_block=node_id_to_block,
+        node_id_to_type=node_id_to_type or None,
+        prior_strength=activity_prior_strength,
+        posterior_partition_sweeps=posterior_partition_sweeps,
+    )
+    activity_entity_universe = (
+        sorted(node_id_to_block.values()) if activity_level == "block" else sorted(node_id_to_block.keys())
+    )
+    activity_entity_compositions = _build_activity_entity_compositions(
+        activity_entity_universe,
+        level=activity_level,
+        block_to_nodes=block_to_nodes,
+        node_id_to_type=node_id_to_type or None,
+    )
+    activity_rng = np.random.default_rng(int(seed) + 7919)
+    activity_states = _sample_temporal_activity_states(
+        activity_model,
+        rng=activity_rng,
+        args=args,
+        composition_targets=observed_realized_activity_targets.get("by_ts"),
+        composition_by_entity=activity_entity_compositions,
+        composition_mode=activity_composition_mode,
+        composition_weight=float(activity_composition_weight),
+    )
+
+    sample_records: list[dict[str, Any]] = []
+    record_columns = ["u", "i", "ts", "snapshot"] + ([weight_col] if weight_col else [])
+    rewire_summaries: list[dict[str, Any]] = []
+    temporal_rows: list[dict[str, Any]] = []
+    sample_kwargs = _sample_kwargs(args)
+    proposal_rounds_min, proposal_rounds_max = _proposal_round_settings(args)
+    proposal_mode = _temporal_proposal_mode_name(
+        args,
+        temporal_mode=_temporal_generator_mode_name(args),
+    )
+    random_proposal_multiplier = _temporal_random_proposal_multiplier(args)
+    proposal_rng = np.random.default_rng(int(seed) + 15485863)
+
+    if proposal_mode == "random" and str(getattr(args, "rewire_model", "none")).strip().lower() != "none":
+        raise ValueError(
+            "Temporal random proposals do not support rewire_model because no SBM proposal graph is sampled. "
+            "Set rewire_model='none' for temporal_proposal_mode='random'."
+        )
+
+    previous_edges: set[tuple[int, int]] = set()
+    seen_edges: set[tuple[int, int]] = set()
+
+    for ts_value, graph_lid in sorted(layer_map.items(), key=lambda item: item[1]):
+        ts_int = int(ts_value)
+        state_lid = lid_to_state[int(graph_lid)]
+        layer_state = base.layer_states[state_lid]
+        active_nodes, active_blocks = _activity_nodes_for_timestamp(
+            ts_int,
+            activity_level=activity_level,
+            activity_states=activity_states,
+            block_to_nodes=block_to_nodes,
+            node_id_to_block=node_id_to_block,
+        )
+        target_by_group = turnover_targets["by_ts"].get(ts_int, {})
+        desired_totals = turnover_targets["totals_by_ts"].get(
+            ts_int,
+            {"persist": 0, "reactivated": 0, "new": 0, "total": 0},
+        )
+        desired_total = int(desired_totals.get("total", 0))
+        observed_activity_target = observed_realized_activity_targets.get("by_ts", {}).get(
+            ts_int,
+            {"total": 0, "by_type": {}},
+        )
+
+        proposal_counts: Counter[tuple[int, int]] = Counter()
+        rounds_used = 0
+        shortfalls = {"persist": 0, "reactivated": 0, "new": 0}
+
+        if desired_total > 0 and active_nodes:
+            while rounds_used < proposal_rounds_max:
+                rounds_used += 1
+                if proposal_mode == "sbm":
+                    sampled_graph = layer_state.sample_graph(**sample_kwargs)
+                    rewire_summary = _maybe_random_rewire_sample(sampled_graph, layer_state, blocks, args)
+                    if rewire_summary is not None:
+                        rewire_summary = dict(
+                            rewire_summary,
+                            ts=ts_int,
+                            graph_lid=int(graph_lid),
+                            state_lid=int(state_lid),
+                            proposal_round=int(rounds_used),
+                        )
+                        rewire_summaries.append(rewire_summary)
+
+                    vmap = layer_state.g.vp["vmap"] if "vmap" in layer_state.g.vp else None
+                    if vmap is None:
+                        raise RuntimeError("Layer state is missing the vertex property 'vmap'.")
+
+                    accepted_edge_count = 0
+                    for edge in sampled_graph.edges():
+                        u_layer = int(edge.source())
+                        v_layer = int(edge.target())
+                        u_base = int(vmap[layer_state.g.vertex(u_layer)])
+                        v_base = int(vmap[layer_state.g.vertex(v_layer)])
+                        u_original = int(node_id_prop[base.g.vertex(u_base)])
+                        v_original = int(node_id_prop[base.g.vertex(v_base)])
+                        if u_original < 0 or v_original < 0:
+                            continue
+                        edge_key = _canonical_edge_pair(u_original, v_original, directed=directed)
+                        if not _edge_is_activity_allowed(
+                            edge_key,
+                            activity_level=activity_level,
+                            active_nodes=active_nodes,
+                            active_blocks=active_blocks,
+                            node_id_to_block=node_id_to_block,
+                        ):
+                            continue
+                        proposal_counts[edge_key] += 1
+                        accepted_edge_count += 1
+                else:
+                    proposal_budget = _random_proposal_edge_budget(
+                        desired_total,
+                        len(active_nodes),
+                        directed=directed,
+                        multiplier=float(random_proposal_multiplier),
+                    )
+                    proposed_edges = _sample_uniform_active_edge_candidates(
+                        active_nodes,
+                        directed=directed,
+                        sample_size=proposal_budget,
+                        rng=proposal_rng,
+                    )
+                    accepted_edge_count = int(len(proposed_edges))
+                    for edge_key in proposed_edges:
+                        proposal_counts[edge_key] += 1
+
+                LOGGER.debug(
+                    "Temporal proposal round | ts=%s | round=%s/%s | proposal_mode=%s | accepted_edges=%s | candidate_edges=%s",
+                    ts_int,
+                    rounds_used,
+                    proposal_rounds_max,
+                    proposal_mode,
+                    accepted_edge_count,
+                    len(proposal_counts),
+                )
+
+                pools = _build_turnover_candidate_pools(
+                    proposal_counts=proposal_counts,
+                    previous_edges=previous_edges,
+                    seen_edges=seen_edges,
+                    activity_level=activity_level,
+                    active_nodes=active_nodes,
+                    active_blocks=active_blocks,
+                    node_id_to_block=node_id_to_block,
+                    node_id_to_type=node_id_to_type or None,
+                    group_mode=group_mode,
+                    directed=directed,
+                )
+                shortfalls = _turnover_pool_shortfalls(pools, target_by_group)
+                if rounds_used >= proposal_rounds_min and int(shortfalls.get("new", 0)) <= 0:
+                    break
+
+        pools = _build_turnover_candidate_pools(
+            proposal_counts=proposal_counts,
+            previous_edges=previous_edges,
+            seen_edges=seen_edges,
+            activity_level=activity_level,
+            active_nodes=active_nodes,
+            active_blocks=active_blocks,
+            node_id_to_block=node_id_to_block,
+            node_id_to_type=node_id_to_type or None,
+            group_mode=group_mode,
+            directed=directed,
+        )
+        selected_edges, achieved_by_group, capacities_by_group = _select_edges_from_turnover_pools(
+            pools,
+            target_by_group,
+            desired_total=desired_total,
+            activity_target=observed_activity_target,
+            activity_mode=realized_activity_mode,
+            activity_weight=float(realized_activity_weight),
+            node_id_to_type=node_id_to_type or None,
+        )
+        selected_edges = sorted(selected_edges)
+        achieved_totals = _aggregate_turnover_totals(achieved_by_group)
+
+        records: list[dict[str, Any]] = []
+        weight_values_for_graph: list[float] = []
+        for edge_key in selected_edges:
+            u_original, v_original = edge_key
+            record: dict[str, Any] = {
+                "u": int(u_original),
+                "i": int(v_original),
+                "ts": ts_int,
+                "snapshot": int(graph_lid),
+            }
+            if weight_sampler is not None and weight_col is not None:
+                u_base = int(node_id_to_base[int(u_original)])
+                v_base = int(node_id_to_base[int(v_original)])
+                src_type = node_id_to_type.get(int(u_original)) if node_id_to_type else None
+                dst_type = node_id_to_type.get(int(v_original)) if node_id_to_type else None
+                if weight_generation_mode.startswith("parametric"):
+                    weight_value = weight_sampler.sample(
+                        ts_value=ts_int,
+                        r=int(weight_blocks[u_base]),
+                        s=int(weight_blocks[v_base]),
+                        src_type=src_type,
+                        dst_type=dst_type,
+                    )
+                else:
+                    weight_value = weight_sampler.sample(
+                        ts_value=ts_int,
+                        r=int(blocks[u_base]),
+                        s=int(blocks[v_base]),
+                        src_type=src_type,
+                        dst_type=dst_type,
+                    )
+                record[weight_col] = weight_value
+                weight_values_for_graph.append(float(weight_value))
+            if not directed and record["u"] > record["i"]:
+                record["u"], record["i"] = record["i"], record["u"]
+            records.append(record)
+            sample_records.append(record)
+
+        snapshot_frame = pd.DataFrame.from_records(records, columns=record_columns)
+        snapshot_path = snapshot_dir / f"snapshot_{ts_int}.csv"
+        snapshot_frame.to_csv(snapshot_path, index=False)
+        realized_active_nodes = {int(node_id) for edge in selected_edges for node_id in edge}
+        eligible_type_counts = _count_nodes_by_type(active_nodes, node_id_to_type or None)
+        realized_type_counts = _count_nodes_by_type(realized_active_nodes, node_id_to_type or None)
+        observed_type_targets = {
+            int(type_id): int(count)
+            for type_id, count in dict(observed_activity_target.get("by_type", {})).items()
+        }
+        realized_type_shortfalls = {
+            int(type_id): max(0, int(target_count) - int(realized_type_counts.get(int(type_id), 0)))
+            for type_id, target_count in observed_type_targets.items()
+        }
+        LOGGER.debug(
+            "Temporal synthetic snapshot | ts=%s | graph_lid=%s | state_lid=%s | proposal_mode=%s | desired_edges=%s | achieved_edges=%s | eligible_active_nodes=%s | realized_active_nodes=%s%s",
+            ts_int,
+            graph_lid,
+            state_lid,
+            proposal_mode,
+            desired_total,
+            len(snapshot_frame),
+            len(active_nodes),
+            len(realized_active_nodes),
+            (
+                f" | weight_total={float(snapshot_frame[weight_col].sum()):.6f}"
+                if weight_col and weight_col in snapshot_frame.columns and len(snapshot_frame)
+                else ""
+            ),
+        )
+        if args.save_graph_tool_snapshots:
+            output_graph = _build_snapshot_gt_graph(
+                gt,
+                selected_edges,
+                directed=directed,
+                weight_col=weight_col,
+                weight_values=weight_values_for_graph if weight_col else None,
+            )
+            output_graph.save(str(snapshot_dir / f"snapshot_{ts_int}.gt"))
+
+        previous_edges = set(selected_edges)
+        seen_edges |= previous_edges
+
+        temporal_rows.append(
+            {
+                "ts": ts_int,
+                "proposal_mode": proposal_mode,
+                "proposal_rounds_used": int(rounds_used),
+                "proposal_candidate_edge_count": int(len(proposal_counts)),
+                "observed_active_entity_count": int(activity_model.get("observed_active_counts", {}).get(ts_int, 0)),
+                "sampled_active_entity_count": int(len(activity_states.get(ts_int, set()))),
+                "observed_active_node_count": int(observed_activity_target.get("total", 0)),
+                "sampled_active_node_count": int(len(active_nodes)),
+                "eligible_active_node_count": int(len(active_nodes)),
+                "realized_active_node_count": int(len(realized_active_nodes)),
+                "observed_active_node_count_by_type": observed_type_targets,
+                "eligible_active_node_count_by_type": eligible_type_counts,
+                "realized_active_node_count_by_type": realized_type_counts,
+                "realized_active_node_shortfall": max(
+                    0,
+                    int(observed_activity_target.get("total", 0)) - int(len(realized_active_nodes)),
+                ),
+                "realized_active_node_shortfall_by_type": realized_type_shortfalls,
+                "target_persist_count": int(desired_totals.get("persist", 0)),
+                "target_reactivated_count": int(desired_totals.get("reactivated", 0)),
+                "target_new_count": int(desired_totals.get("new", 0)),
+                "target_total_count": int(desired_totals.get("total", 0)),
+                "achieved_persist_count": int(achieved_totals.get("persist", 0)),
+                "achieved_reactivated_count": int(achieved_totals.get("reactivated", 0)),
+                "achieved_new_count": int(achieved_totals.get("new", 0)),
+                "achieved_total_count": int(achieved_totals.get("total", 0)),
+                "new_shortfall_after_proposals": int(shortfalls.get("new", 0)),
+                "target_by_group": target_by_group,
+                "achieved_by_group": achieved_by_group,
+                "capacity_by_group": capacities_by_group,
+            }
+        )
+
+    panel_frame = pd.DataFrame.from_records(sample_records, columns=record_columns)
+    pre_dedup_count = int(len(panel_frame))
+    panel_frame = panel_frame.drop_duplicates(["u", "i", "ts", "snapshot"]).reset_index(drop=True)
+    panel_path = output_dir / "synthetic_edges.csv"
+    panel_frame.to_csv(panel_path, index=False)
+
+    if weight_sampler is not None and hasattr(weight_sampler, "resolution_counts"):
+        LOGGER.debug("Weight sampling resolution counts | %s", dict(weight_sampler.resolution_counts))
+    LOGGER.debug(
+        "Temporal synthetic panel summary | rows_before_dedup=%s | rows_after_dedup=%s%s",
+        pre_dedup_count,
+        len(panel_frame),
+        (
+            f" | weight_total={float(panel_frame[weight_col].sum()):.6f}"
+            if weight_col and weight_col in panel_frame.columns and len(panel_frame)
+            else ""
+        ),
+    )
+
+    mean_edge_shortfall = (
+        float(
+            np.mean(
+                [
+                    int(row["target_total_count"]) - int(row["achieved_total_count"])
+                    for row in temporal_rows
+                ]
+            )
+        )
+        if temporal_rows
+        else 0.0
+    )
+    mean_active_node_shortfall = (
+        float(
+            np.mean(
+                [
+                    max(
+                        0,
+                        int(row.get("observed_active_node_count", 0))
+                        - int(row.get("realized_active_node_count", 0)),
+                    )
+                    for row in temporal_rows
+                ]
+            )
+        )
+        if temporal_rows
+        else 0.0
+    )
+    temporal_summary_path = output_dir / "temporal_generation_summary.json"
+    temporal_summary_payload = {
+        "mode": _temporal_generator_mode_name(args),
+        "proposal_mode": proposal_mode,
+        "target_source": temporal_target_source,
+        "activity_level": activity_level,
+        "group_mode": group_mode,
+        "activity_prior_strength": float(activity_prior_strength),
+        "activity_composition_mode": activity_composition_mode,
+        "activity_composition_weight": float(activity_composition_weight),
+        "realized_activity_mode": realized_activity_mode,
+        "realized_activity_weight": float(realized_activity_weight),
+        "activity_count_constraint": str(getattr(args, "temporal_activity_count_constraint", "observed")).strip().lower(),
+        "activity_initial": str(getattr(args, "temporal_activity_initial", "observed")).strip().lower(),
+        "proposal_rounds_min": int(proposal_rounds_min),
+        "proposal_rounds_max": int(proposal_rounds_max),
+        "random_proposal_multiplier": float(random_proposal_multiplier),
+        "activity_model": {
+            "entity_count": int(len(activity_model.get("entities", []))),
+            "global_initial_prob": float(activity_model.get("global_initial_prob", 0.0)),
+            "global_p01": float(activity_model.get("global_p01", 0.0)),
+            "global_p11": float(activity_model.get("global_p11", 0.0)),
+        },
+        "realized_activity_targets": {
+            "types": _json_ready(observed_realized_activity_targets.get("types", [])),
+            "mean_active_node_shortfall": float(mean_active_node_shortfall),
+        },
+        "per_snapshot": _serialise_temporal_generation_rows(temporal_rows),
+    }
+    save_json(temporal_summary_payload, temporal_summary_path)
+
+    rewire_model = str(getattr(args, "rewire_model", "none"))
+    sample_manifest_path = output_dir / "sample_manifest.json"
+    setting_dir = output_dir.parent
+    sample_class = (
+        "proposal_ablation"
+        if proposal_mode == "random"
+        else ("sensitivity_analysis" if rewire_model != "none" else "posterior_predictive")
+    )
+    payload = {
+        "sample_dir": str(output_dir),
+        "sample_manifest_path": str(sample_manifest_path),
+        "synthetic_edges_csv": str(panel_path),
+        "snapshot_dir": str(snapshot_dir),
+        "setting_label": _generation_setting_label(args),
+        "setting_dir": str(setting_dir),
+        "setting_manifest_path": str(setting_dir / "setting_manifest.json"),
+        "node_partition_path": str(partition_path),
+        "partition_source": "posterior_refresh" if int(getattr(args, "posterior_partition_sweeps", 0)) > 0 else "fitted_state",
+        "sample_class": sample_class,
+        "sample_seed": int(seed),
+        "edge_count": int(len(panel_frame)),
+        "generation_args": _serialise_generation_args(args),
+        "sample_settings": {
+            "sample_mode": _generation_sample_mode_label(args),
+            "sample_canonical": bool(getattr(args, "sample_canonical", False)),
+            "sample_max_ent": bool(getattr(args, "sample_max_ent", False)),
+            "sample_n_iter": int(getattr(args, "sample_n_iter", 20000)),
+            "sample_params": None if getattr(args, "sample_params", None) is None else bool(getattr(args, "sample_params")),
+            "rewire_model": rewire_model,
+            "rewire_n_iter": int(getattr(args, "rewire_n_iter", 10)),
+            "rewire_persist": bool(getattr(args, "rewire_persist", False)),
+            "is_sensitivity_analysis": bool(rewire_model != "none"),
+            "weight_sampler_channel_aware": bool(type_prop is not None and weight_sampler is not None),
+            "weight_generation_mode": weight_generation_mode,
+            "weight_parametric_partition_policy": weight_partition_policy,
+            "weight_pure_generative": pure_generative_weights,
+            "temporal_generator_mode": _temporal_generator_mode_name(args),
+            "temporal_proposal_mode": proposal_mode,
+            "temporal_target_source": temporal_target_source,
+            "temporal_activity_level": activity_level,
+            "temporal_group_mode": group_mode,
+            "temporal_activity_composition_mode": activity_composition_mode,
+            "temporal_activity_composition_weight": float(activity_composition_weight),
+            "temporal_realized_activity_mode": realized_activity_mode,
+            "temporal_realized_activity_weight": float(realized_activity_weight),
+            "temporal_activity_count_constraint": str(getattr(args, "temporal_activity_count_constraint", "observed")).strip().lower(),
+            "temporal_activity_initial": str(getattr(args, "temporal_activity_initial", "observed")).strip().lower(),
+            "temporal_proposal_rounds": int(proposal_rounds_min),
+            "temporal_proposal_rounds_max": int(proposal_rounds_max),
+            "temporal_random_proposal_multiplier": float(random_proposal_multiplier),
+        },
+        "temporal_generation_summary_path": str(temporal_summary_path),
+        "temporal_generation_summary": {
+            "mode": _temporal_generator_mode_name(args),
+            "proposal_mode": proposal_mode,
+            "activity_level": activity_level,
+            "group_mode": group_mode,
+            "activity_composition_mode": activity_composition_mode,
+            "realized_activity_mode": realized_activity_mode,
+            "proposal_rounds_min": int(proposal_rounds_min),
+            "proposal_rounds_max": int(proposal_rounds_max),
+            "random_proposal_multiplier": float(random_proposal_multiplier),
+            "mean_edge_shortfall": float(mean_edge_shortfall),
+            "mean_active_node_shortfall": float(mean_active_node_shortfall),
+        },
+    }
+    if weight_col and weight_col in panel_frame.columns:
+        payload["weight_column"] = weight_col
+        payload["weight_total"] = float(panel_frame[weight_col].sum()) if len(panel_frame) else 0.0
+    if active_weight_generator is not None:
+        payload["weight_generator_summary"] = _json_ready(active_weight_generator.get("summary", {}))
+        if active_weight_generator.get("family") is not None:
+            payload["weight_generator_family"] = str(active_weight_generator.get("family"))
+        families_by_channel = active_weight_generator.get("summary", {}).get("families_by_channel")
+        if isinstance(families_by_channel, dict) and families_by_channel:
+            payload["weight_generator_families_by_channel"] = _json_ready(families_by_channel)
+    if rewire_summaries:
+        payload["rewire_summaries"] = rewire_summaries
+    if weight_sampler is not None and hasattr(weight_sampler, "resolution_counts"):
+        payload["weight_sampling_resolution_counts"] = {
+            str(key): int(value) for key, value in sorted(weight_sampler.resolution_counts.items())
+        }
+    save_json(payload, sample_manifest_path)
+    return payload
+
+
+def _sample_synthetic_panel_independent_layers(
     graph: Any,
     nested_state: Any,
     layer_map: dict[int, int],
@@ -3592,6 +6053,59 @@ def sample_synthetic_panel(
     return payload
 
 
+
+
+
+def sample_synthetic_panel(
+    graph: Any,
+    nested_state: Any,
+    layer_map: dict[int, int],
+    output_dir: Path,
+    directed: bool,
+    seed: int,
+    args: argparse.Namespace,
+    observed_edges: Optional[pd.DataFrame] = None,
+    weight_model: Optional[dict] = None,
+    weight_generator_model: Optional[dict] = None,
+    temporal_generator_model: Optional[dict[str, Any]] = None,
+) -> dict:
+    temporal_mode = _temporal_generator_mode_name(args)
+    if temporal_mode == "none":
+        return _sample_synthetic_panel_independent_layers(
+            graph=graph,
+            nested_state=nested_state,
+            layer_map=layer_map,
+            output_dir=output_dir,
+            directed=directed,
+            seed=seed,
+            args=args,
+            observed_edges=observed_edges,
+            weight_model=weight_model,
+            weight_generator_model=weight_generator_model,
+        )
+    if temporal_mode not in {"markov_turnover", "markov_turnover_random"}:
+        raise ValueError(
+            "Unknown temporal_generator_mode. Use 'markov_turnover', 'markov_turnover_random', or 'none'."
+        )
+    if observed_edges is None and temporal_generator_model is None:
+        raise ValueError(
+            f"temporal_generator_mode={temporal_mode!r} requires observed_edges or a saved temporal generator model "
+            "so the activity and turnover targets can be prepared."
+        )
+    return _sample_synthetic_panel_markov_turnover(
+        graph=graph,
+        nested_state=nested_state,
+        layer_map=layer_map,
+        output_dir=output_dir,
+        directed=directed,
+        seed=seed,
+        args=args,
+        observed_edges=observed_edges,
+        weight_model=weight_model,
+        weight_generator_model=weight_generator_model,
+        temporal_generator_model=temporal_generator_model,
+    )
+
 def save_json(payload: dict, path: Path) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True))
@@ -3672,6 +6186,7 @@ def _merge_generated_setting_records(existing: list[dict], new_record: dict) -> 
 
 
 
+
 def write_fit_artifacts(
     prepared: PreparedData,
     graph: Any,
@@ -3681,6 +6196,7 @@ def write_fit_artifacts(
     fit_covariates: list[str],
     weight_model: Optional[dict] = None,
     weight_generator_model: Optional[dict] = None,
+    temporal_generator_model: Optional[dict[str, Any]] = None,
 ) -> dict:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3692,6 +6208,7 @@ def write_fit_artifacts(
     filtered_edges_path = output_dir / "input_edges_filtered.csv"
     node_attributes_path = output_dir / "node_attributes.csv"
     weight_generator_path = output_dir / "weight_generator_model.json" if weight_generator_model is not None else None
+    temporal_generator_path = output_dir / "temporal_generator_model.json" if temporal_generator_model is not None else None
 
     graph.save(str(graph_path))
     save_state(nested_state, state_path)
@@ -3700,6 +6217,8 @@ def write_fit_artifacts(
     write_node_attributes(prepared, node_attributes_path, node_blocks=extract_node_block_map(graph))
     if weight_generator_model is not None and weight_generator_path is not None:
         save_json(weight_generator_model, weight_generator_path)
+    if temporal_generator_model is not None and temporal_generator_path is not None:
+        save_json(temporal_generator_model, temporal_generator_path)
 
     input_summary = {
         "edge_count": int(len(prepared.original_edges)),
@@ -3757,6 +6276,13 @@ def write_fit_artifacts(
         "weight_model": weight_model,
         "weight_generator_path": str(weight_generator_path) if weight_generator_path is not None else None,
         "weight_generator_summary": weight_generator_model.get("summary") if weight_generator_model is not None else None,
+        "temporal_generator_path": str(temporal_generator_path) if temporal_generator_path is not None else None,
+        "temporal_generator_summary": temporal_generator_model.get("summary") if temporal_generator_model is not None else None,
+        "temporal_generation_mode": (
+            "stored_temporal_model"
+            if temporal_generator_model is not None
+            else None
+        ),
         "weight_generation_mode": (
             "parametric"
             if weight_generator_model is not None
@@ -3785,13 +6311,14 @@ def write_fit_artifacts(
     manifest["manifest_path"] = str(manifest_path)
     LOGGER.debug(
         "Fit artifacts written | graph_path=%s | state_path=%s | layer_map_path=%s | filtered_edges_path=%s | "
-        "node_attributes_path=%s | weight_generator_path=%s | manifest_path=%s",
+        "node_attributes_path=%s | weight_generator_path=%s | temporal_generator_path=%s | manifest_path=%s",
         graph_path,
         state_path,
         layer_map_path,
         filtered_edges_path,
         node_attributes_path,
         weight_generator_path,
+        temporal_generator_path,
         manifest_path,
     )
     return manifest
@@ -3876,6 +6403,12 @@ def fit_command(args: argparse.Namespace) -> dict:
             "weight_pure_generative=True requires fitting and saving a parametric weight generator."
         )
 
+    temporal_generator_model = _fit_temporal_generator_model(
+        prepared,
+        nested_state,
+        directed=bool(args.directed),
+    )
+
     manifest = write_fit_artifacts(
         prepared,
         graph,
@@ -3885,6 +6418,7 @@ def fit_command(args: argparse.Namespace) -> dict:
         fit_covariates=fit_covariates,
         weight_model=weight_model,
         weight_generator_model=weight_generator_model,
+        temporal_generator_model=temporal_generator_model,
     )
     LOGGER.info(
         "Fitted nested SBM in %s | run dir: %s",
@@ -3893,6 +6427,7 @@ def fit_command(args: argparse.Namespace) -> dict:
     )
     LOGGER.debug("Fit manifest summary | %s", manifest)
     return manifest
+
 
 
 
@@ -3914,6 +6449,7 @@ def generate_command(args: argparse.Namespace) -> list[dict]:
 
     weight_model = manifest.get("weight_model")
     weight_generator_model = None
+    temporal_generator_model = None
     observed_edges = None
     weight_partition_policy = str(getattr(args, "weight_parametric_partition_policy", "fixed")).strip().lower()
     pure_generative_weights = _pure_generative_weight_mode(args)
@@ -3926,24 +6462,62 @@ def generate_command(args: argparse.Namespace) -> list[dict]:
             None if weight_generator_model is None else weight_generator_model.get("summary"),
         )
 
+    if manifest.get("temporal_generator_path"):
+        temporal_generator_model = load_json(Path(manifest["temporal_generator_path"]))
+        LOGGER.debug(
+            "Loaded saved temporal generator model | path=%s | summary=%s",
+            manifest["temporal_generator_path"],
+            None if temporal_generator_model is None else temporal_generator_model.get("summary"),
+        )
+
     if pure_generative_weights and weight_model and weight_generator_model is None:
         raise ValueError(
             "weight_pure_generative=True requires a saved parametric weight generator in the fitted run artifacts."
         )
 
-    if weight_model and not pure_generative_weights and (weight_generator_model is None or weight_partition_policy == "refit_on_refresh"):
+    temporal_generator_enabled = _temporal_generator_enabled(args)
+    posterior_partition_sweeps = max(0, int(getattr(args, "posterior_partition_sweeps", 0)))
+    temporal_requires_observed_edges = bool(
+        temporal_generator_enabled
+        and (
+            temporal_generator_model is None
+            or posterior_partition_sweeps > 0
+        )
+    )
+    weight_requires_observed_edges = bool(
+        weight_model
+        and not pure_generative_weights
+        and (weight_generator_model is None or weight_partition_policy == "refit_on_refresh")
+    )
+    needs_observed_edges = bool(temporal_requires_observed_edges or weight_requires_observed_edges)
+    if needs_observed_edges:
         filtered_input_edges_path = manifest.get("filtered_input_edges_path")
         if not filtered_input_edges_path:
+            if temporal_requires_observed_edges and posterior_partition_sweeps > 0:
+                raise ValueError(
+                    "Generation with posterior_partition_sweeps > 0 requires the filtered observed edge panel. "
+                    "The saved temporal generator model is tied to the fitted partition and is not used on the "
+                    "posterior-refresh research branch."
+                )
+            if temporal_requires_observed_edges:
+                raise ValueError(
+                    "Generation requested the filtered observed edge panel for temporal target fitting, but the run "
+                    "manifest does not expose filtered_input_edges_path."
+                )
             raise ValueError(
-                "Weighted generation requested observed edges for refitting or empirical sampling, but the run manifest "
-                "does not expose filtered_input_edges_path."
+                "Generation requested access to the filtered observed edge panel for weight generation, but the run "
+                "manifest does not expose filtered_input_edges_path."
             )
         observed_edges = pd.read_csv(filtered_input_edges_path)
         _log_edge_frame_debug(
-            "Observed edge frame for weighted generation",
+            "Observed edge frame for generation",
             observed_edges,
             directed=bool(manifest["directed"]),
-            weight_col=weight_model.get("output_column") or weight_model.get("input_column"),
+            weight_col=(
+                (weight_model.get("output_column") or weight_model.get("input_column"))
+                if isinstance(weight_model, dict)
+                else None
+            ),
         )
 
     generated_root = Path(manifest["run_dir"]) / "generated"
@@ -3966,6 +6540,7 @@ def generate_command(args: argparse.Namespace) -> list[dict]:
             observed_edges=observed_edges,
             weight_model=weight_model,
             weight_generator_model=weight_generator_model,
+            temporal_generator_model=temporal_generator_model,
         )
         sample_manifest["sample_index"] = int(sample_index)
         sample_manifest["sample_label"] = f"sample_{sample_index:04d}"

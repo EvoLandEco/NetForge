@@ -46,7 +46,22 @@ class ToyDatasetTests(unittest.TestCase):
     def test_default_metadata_inputs_are_present(self) -> None:
         feature_columns = set(self.schema["node_feature_columns_in_order"])
         self.assertTrue({"xco", "yco", "num_farms", "total_animals", "count_ft_cattle", "count_ft_pig"}.issubset(feature_columns))
-        self.assertTrue({"node_id", "type", "corop"}.issubset(self.node_map.columns))
+        self.assertTrue(
+            {
+                "node_id",
+                "type",
+                "corop",
+                "coord_source",
+                "priority",
+                "CR_code",
+                "trade_species",
+                "diersoort",
+                "diergroep",
+                "diergroeplang",
+                "BtypNL",
+                "bedrtype",
+            }.issubset(self.node_map.columns)
+        )
 
     def test_manifest_describes_default_metadata_layer(self) -> None:
         metadata = self.manifest["joint_metadata_model"]
@@ -54,9 +69,41 @@ class ToyDatasetTests(unittest.TestCase):
         self.assertEqual(metadata["layer_name"], "__metadata__")
         self.assertEqual(
             metadata["metadata_fields"],
-            ["corop", "num_farms_bin", "total_animals_bin", "centroid_grid", "ft_tokens"],
+            [
+                "corop",
+                "coord_source",
+                "priority",
+                "CR_code",
+                "num_farms_bin",
+                "total_animals_bin",
+                "centroid_grid",
+                "trade_species",
+                "diersoort",
+                "diergroep",
+                "diergroeplang",
+                "BtypNL",
+                "bedrtype",
+            ],
         )
-        self.assertEqual(metadata["node_map_fields"], ["corop"])
+        self.assertEqual(
+            metadata["node_map_fields"],
+            [
+                "corop",
+                "coord_source",
+                "priority",
+                "CR_code",
+                "trade_species",
+                "diersoort",
+                "diergroep",
+                "diergroeplang",
+                "BtypNL",
+                "bedrtype",
+            ],
+        )
+
+    def test_text_metadata_fields_include_multi_value_tokens(self) -> None:
+        self.assertTrue(self.node_map["trade_species"].astype(str).str.contains(r"\|", regex=True).any())
+        self.assertTrue(self.node_map["diersoort"].astype(str).str.contains(";", regex=False).any())
 
     def test_timestamps_match_ordinal_dates(self) -> None:
         ordinal_dates = pd.to_datetime(self.edge_frame["date"]).dt.date.map(date.toordinal)

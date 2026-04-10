@@ -102,6 +102,9 @@ POSTERIOR_DETAIL_GROUP_KEYS: dict[str, list[str]] = {
     "pi_mass_closed_summary": ["metric"],
     "pi_mass_pagerank_per_snapshot": ["ts"],
     "pi_mass_pagerank_summary": ["metric"],
+    "temporal_reachability_per_snapshot": ["ts"],
+    "temporal_reachability_summary": ["metric"],
+    "temporal_reachability_source_summary": ["node_id"],
     "magnetic_laplacian_per_snapshot": ["ts"],
     "magnetic_laplacian_summary": ["metric"],
     "magnetic_spectral_distance_per_snapshot": ["ts"],
@@ -902,6 +905,282 @@ def _compute_edge_type_time_series(
                 )
 
     return pd.DataFrame(rows, columns=columns)
+
+
+
+def _build_snapshot_out_bitsets(
+    df: pd.DataFrame,
+    node_index: Dict[int, int],
+    *,
+    directed: bool,
+    weight_col: Optional[str] = None,
+) -> list[tuple[int, list[int]]]:
+    if df.empty:
+        return []
+
+    node_count = int(len(node_index))
+    snapshots: list[tuple[int, list[int]]] = []
+    for ts_value, snapshot in df.groupby("ts", sort=True):
+        out_bits = [0] * node_count
+        if weight_col and weight_col in snapshot.columns:
+            edge_rows = snapshot[["u", "i", weight_col]].itertuples(index=False, name=None)
+        else:
+            edge_rows = snapshot[["u", "i"]].itertuples(index=False, name=None)
+        for edge in edge_rows:
+            if len(edge) == 3:
+                u_value, v_value, weight_value = edge
+                try:
+                    weight_numeric = float(weight_value)
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(weight_numeric) or weight_numeric <= 0:
+                    continue
+            else:
+                u_value, v_value = edge
+            u_index = node_index[int(u_value)]
+            v_index = node_index[int(v_value)]
+            out_bits[u_index] |= 1 << v_index
+            if not directed and u_index != v_index:
+                out_bits[v_index] |= 1 << u_index
+        snapshots.append((int(ts_value), out_bits))
+    return snapshots
+
+
+def _forward_reach_counts_from_target_sources(
+    target_sources: list[int],
+    node_count: int,
+) -> np.ndarray:
+    counts = np.zeros(node_count, dtype=np.int64)
+    for source_bits in target_sources:
+        remaining = int(source_bits)
+        while remaining:
+            least_significant = remaining & -remaining
+            source_index = int(least_significant.bit_length() - 1)
+            counts[source_index] += 1
+            remaining ^= least_significant
+    if node_count:
+        counts -= 1
+    return counts
+
+
+def _static_reachability_counts(
+    df: pd.DataFrame,
+    *,
+    node_universe: list[int],
+    directed: bool,
+    weight_col: Optional[str] = None,
+) -> np.ndarray:
+    node_count = int(len(node_universe))
+    if node_count == 0:
+        return np.zeros(0, dtype=np.int64)
+
+    node_index = {node_id: index for index, node_id in enumerate(node_universe)}
+    adjacency: list[list[int]] = [[] for _ in range(node_count)]
+    if not df.empty:
+        if weight_col and weight_col in df.columns:
+            edge_rows = df[["u", "i", weight_col]].itertuples(index=False, name=None)
+        else:
+            edge_rows = df[["u", "i"]].itertuples(index=False, name=None)
+        for edge in edge_rows:
+            if len(edge) == 3:
+                u_value, v_value, weight_value = edge
+                try:
+                    weight_numeric = float(weight_value)
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(weight_numeric) or weight_numeric <= 0:
+                    continue
+            else:
+                u_value, v_value = edge
+            u_index = node_index[int(u_value)]
+            v_index = node_index[int(v_value)]
+            adjacency[u_index].append(v_index)
+            if not directed and u_index != v_index:
+                adjacency[v_index].append(u_index)
+
+    counts = np.zeros(node_count, dtype=np.int64)
+    for source_index in range(node_count):
+        seen = np.zeros(node_count, dtype=bool)
+        stack = [source_index]
+        seen[source_index] = True
+        while stack:
+            current = stack.pop()
+            for neighbour in adjacency[current]:
+                if not seen[neighbour]:
+                    seen[neighbour] = True
+                    stack.append(neighbour)
+        counts[source_index] = int(seen.sum()) - 1
+    return counts
+
+
+def _compute_temporal_reachability_diagnostics(
+    df: pd.DataFrame,
+    *,
+    node_universe: list[int],
+    directed: bool,
+    weight_col: Optional[str] = None,
+    node_types: Optional[Dict[int, str]] = None,
+) -> dict[str, Any]:
+    per_snapshot_columns = [
+        "ts",
+        "reachable_pair_count",
+        "reachability_ratio",
+        "new_reachable_pair_count",
+        "temporal_efficiency",
+        "mean_arrival_time_reached",
+    ]
+    source_columns = [
+        "node_id",
+        "forward_reach_count",
+        "forward_reach_ratio",
+        "static_forward_reach_count",
+        "static_forward_reach_ratio",
+    ]
+    if node_types:
+        source_columns.append("type_label")
+
+    node_count = int(len(node_universe))
+    if node_count == 0:
+        return {
+            "per_snapshot": pd.DataFrame(columns=per_snapshot_columns),
+            "source_summary": pd.DataFrame(columns=source_columns),
+            "global_summary": {
+                "reachability_ratio": 0.0,
+                "reachable_pair_count": 0,
+                "temporal_efficiency": 0.0,
+                "mean_arrival_time_reached": np.nan,
+                "static_reachability_ratio": 0.0,
+                "causal_fidelity": 1.0,
+                "mean_forward_reach_ratio": 0.0,
+                "p95_forward_reach_ratio": 0.0,
+                "max_forward_reach_ratio": 0.0,
+            },
+        }
+
+    node_index = {node_id: index for index, node_id in enumerate(node_universe)}
+    snapshots = _build_snapshot_out_bitsets(df, node_index, directed=directed, weight_col=weight_col)
+    ordered_pair_denominator = max(node_count * max(node_count - 1, 0), 1)
+    static_counts = _static_reachability_counts(
+        df,
+        node_universe=node_universe,
+        directed=directed,
+        weight_col=weight_col,
+    )
+    static_reachability_ratio = float(static_counts.sum() / ordered_pair_denominator) if node_count > 1 else 0.0
+
+    if not snapshots:
+        source_summary = pd.DataFrame(
+            {
+                "node_id": node_universe,
+                "forward_reach_count": np.zeros(node_count, dtype=np.int64),
+                "forward_reach_ratio": np.zeros(node_count, dtype=float),
+                "static_forward_reach_count": static_counts,
+                "static_forward_reach_ratio": static_counts / max(node_count - 1, 1),
+            }
+        )
+        if node_types:
+            source_summary["type_label"] = source_summary["node_id"].map(lambda node_id: node_types.get(int(node_id), "Unknown"))
+        source_summary = source_summary[source_columns]
+        causal_fidelity = 1.0 if static_reachability_ratio <= 0 else 0.0
+        return {
+            "per_snapshot": pd.DataFrame(columns=per_snapshot_columns),
+            "source_summary": source_summary,
+            "global_summary": {
+                "reachability_ratio": 0.0,
+                "reachable_pair_count": 0,
+                "temporal_efficiency": 0.0,
+                "mean_arrival_time_reached": np.nan,
+                "static_reachability_ratio": static_reachability_ratio,
+                "causal_fidelity": float(causal_fidelity),
+                "mean_forward_reach_ratio": 0.0,
+                "p95_forward_reach_ratio": 0.0,
+                "max_forward_reach_ratio": 0.0,
+            },
+        }
+
+    first_ts = int(snapshots[0][0])
+    target_sources = [1 << index for index in range(node_count)]
+    arrival_time_weighted_sum = 0.0
+    inverse_arrival_time_sum = 0.0
+    rows: list[dict[str, float]] = []
+
+    for ts_value, out_bits in snapshots:
+        previous_sources = list(target_sources)
+        updated_sources = list(previous_sources)
+        new_reachable_pair_count = 0
+        for u_index, neighbour_bits in enumerate(out_bits):
+            if neighbour_bits == 0:
+                continue
+            source_bits = previous_sources[u_index]
+            if source_bits == 0:
+                continue
+            remaining = int(neighbour_bits)
+            while remaining:
+                least_significant = remaining & -remaining
+                v_index = int(least_significant.bit_length() - 1)
+                before_bits = updated_sources[v_index]
+                after_bits = before_bits | source_bits
+                if after_bits != before_bits:
+                    new_bits = after_bits ^ before_bits
+                    new_reachable_pair_count += int(new_bits.bit_count())
+                    updated_sources[v_index] = after_bits
+                remaining ^= least_significant
+        target_sources = updated_sources
+        reachable_pair_count = int(sum(int(bits).bit_count() for bits in target_sources) - node_count)
+        elapsed_days = int(ts_value - first_ts + 1)
+        inverse_arrival_time_sum += float(new_reachable_pair_count / max(elapsed_days, 1))
+        arrival_time_weighted_sum += float(new_reachable_pair_count * elapsed_days)
+        rows.append(
+            {
+                "ts": int(ts_value),
+                "reachable_pair_count": reachable_pair_count,
+                "reachability_ratio": float(reachable_pair_count / ordered_pair_denominator) if node_count > 1 else 0.0,
+                "new_reachable_pair_count": int(new_reachable_pair_count),
+                "temporal_efficiency": float(inverse_arrival_time_sum / ordered_pair_denominator) if node_count > 1 else 0.0,
+                "mean_arrival_time_reached": float(arrival_time_weighted_sum / reachable_pair_count) if reachable_pair_count > 0 else np.nan,
+            }
+        )
+
+    forward_counts = _forward_reach_counts_from_target_sources(target_sources, node_count)
+    reach_denominator = max(node_count - 1, 1)
+    source_summary = pd.DataFrame(
+        {
+            "node_id": node_universe,
+            "forward_reach_count": forward_counts,
+            "forward_reach_ratio": forward_counts / reach_denominator,
+            "static_forward_reach_count": static_counts,
+            "static_forward_reach_ratio": static_counts / reach_denominator,
+        }
+    )
+    if node_types:
+        source_summary["type_label"] = source_summary["node_id"].map(lambda node_id: node_types.get(int(node_id), "Unknown"))
+    source_summary = source_summary[source_columns].sort_values(
+        ["forward_reach_ratio", "forward_reach_count", "node_id"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+
+    final_reachability_ratio = float(forward_counts.sum() / ordered_pair_denominator) if node_count > 1 else 0.0
+    if static_reachability_ratio <= 0:
+        causal_fidelity = 1.0 if final_reachability_ratio <= 0 else np.nan
+    else:
+        causal_fidelity = float(final_reachability_ratio / static_reachability_ratio)
+
+    global_summary = {
+        "reachability_ratio": final_reachability_ratio,
+        "reachable_pair_count": int(forward_counts.sum()),
+        "temporal_efficiency": float(rows[-1]["temporal_efficiency"]) if rows else 0.0,
+        "mean_arrival_time_reached": float(rows[-1]["mean_arrival_time_reached"]) if rows else np.nan,
+        "static_reachability_ratio": static_reachability_ratio,
+        "causal_fidelity": causal_fidelity,
+        "mean_forward_reach_ratio": float(source_summary["forward_reach_ratio"].mean()) if len(source_summary) else 0.0,
+        "p95_forward_reach_ratio": float(np.percentile(source_summary["forward_reach_ratio"], 95)) if len(source_summary) else 0.0,
+        "max_forward_reach_ratio": float(source_summary["forward_reach_ratio"].max()) if len(source_summary) else 0.0,
+    }
+    return {
+        "per_snapshot": pd.DataFrame(rows, columns=per_snapshot_columns),
+        "source_summary": source_summary,
+        "global_summary": global_summary,
+    }
 
 
 
@@ -1825,6 +2104,14 @@ def _display_advanced_metric_name(metric_name: str) -> str:
         "active_farm_count": "Active farm nodes",
         "active_region_count": "Active regional supernodes",
         "pi_gini": "Pi gini",
+        "reachable_pair_count": "Reachable ordered pairs",
+        "reachability_ratio": "Reachability ratio",
+        "new_reachable_pair_count": "New reachable pairs",
+        "temporal_efficiency": "Temporal efficiency",
+        "mean_arrival_time_reached": "Mean arrival time",
+        "static_reachability_ratio": "Static reachability ratio",
+        "causal_fidelity": "Causal fidelity",
+        "forward_reach_ratio": "Forward reachable fraction",
         "spectral_wasserstein_distance": "Spectral Wasserstein distance",
         "spectral_mean_abs_delta": "Spectral mean absolute delta",
         "spectral_rmse": "Spectral RMSE",
@@ -2664,6 +2951,107 @@ def compare_panels_detailed(
             summary["edge_type_share_correlation"] = float(pd.to_numeric(edge_type_summary["edge_share_correlation"], errors="coerce").fillna(0.0).mean())
         if "weight_share_correlation" in edge_type_summary.columns and len(edge_type_summary):
             summary["edge_type_weight_share_correlation"] = float(pd.to_numeric(edge_type_summary["weight_share_correlation"], errors="coerce").fillna(0.0).mean())
+
+    reach_original = _compute_temporal_reachability_diagnostics(
+        original,
+        node_universe=node_universe,
+        directed=directed,
+        weight_col=effective_weight_col,
+        node_types=node_types,
+    )
+    reach_synthetic = _compute_temporal_reachability_diagnostics(
+        synthetic,
+        node_universe=node_universe,
+        directed=directed,
+        weight_col=effective_weight_col,
+        node_types=node_types,
+    )
+    reach_merged = _merge_entity_time_series(
+        reach_original["per_snapshot"],
+        reach_synthetic["per_snapshot"],
+        ["ts"],
+        fill_value=None,
+    )
+    reach_metrics = [
+        "reachable_pair_count",
+        "reachability_ratio",
+        "new_reachable_pair_count",
+        "temporal_efficiency",
+        "mean_arrival_time_reached",
+    ]
+    reach_summary = _summarise_metric_time_series(
+        reach_merged,
+        reach_metrics,
+        treat_missing_as_zero=False,
+    )
+    source_summary = pd.DataFrame({"node_id": node_universe})
+    if node_types:
+        source_summary["type_label"] = source_summary["node_id"].map(lambda node_id: node_types.get(int(node_id), "Unknown"))
+    source_summary = source_summary.merge(
+        reach_original["source_summary"].rename(
+            columns={
+                "forward_reach_count": "original_forward_reach_count",
+                "forward_reach_ratio": "original_forward_reach_ratio",
+                "static_forward_reach_count": "original_static_forward_reach_count",
+                "static_forward_reach_ratio": "original_static_forward_reach_ratio",
+            }
+        ),
+        on=[column for column in ("node_id", "type_label") if column in source_summary.columns],
+        how="left",
+    ).merge(
+        reach_synthetic["source_summary"].rename(
+            columns={
+                "forward_reach_count": "synthetic_forward_reach_count",
+                "forward_reach_ratio": "synthetic_forward_reach_ratio",
+                "static_forward_reach_count": "synthetic_static_forward_reach_count",
+                "static_forward_reach_ratio": "synthetic_static_forward_reach_ratio",
+            }
+        ),
+        on=[column for column in ("node_id", "type_label") if column in source_summary.columns],
+        how="left",
+    )
+    for metric_name in ("forward_reach_count", "forward_reach_ratio", "static_forward_reach_count", "static_forward_reach_ratio"):
+        original_column = f"original_{metric_name}"
+        synthetic_column = f"synthetic_{metric_name}"
+        if original_column in source_summary.columns and synthetic_column in source_summary.columns:
+            source_summary[f"{metric_name}_delta"] = pd.to_numeric(
+                source_summary[synthetic_column],
+                errors="coerce",
+            ) - pd.to_numeric(source_summary[original_column], errors="coerce")
+    if len(source_summary):
+        sort_columns = [column for column in ("original_forward_reach_ratio", "original_forward_reach_count", "node_id") if column in source_summary.columns]
+        ascending = [False, False, True][: len(sort_columns)]
+        source_summary = source_summary.sort_values(sort_columns, ascending=ascending).reset_index(drop=True)
+
+    if not reach_merged.empty:
+        details["temporal_reachability_per_snapshot"] = reach_merged
+        details["temporal_reachability_summary"] = reach_summary
+        details["temporal_reachability_source_summary"] = source_summary
+        summary["temporal_reachability_ratio_correlation"] = _metric_lookup(reach_summary, "reachability_ratio", "correlation") or 0.0
+        summary["temporal_efficiency_correlation"] = _metric_lookup(reach_summary, "temporal_efficiency", "correlation") or 0.0
+        summary["temporal_new_reachable_pair_count_correlation"] = _metric_lookup(reach_summary, "new_reachable_pair_count", "correlation") or 0.0
+        summary["temporal_mean_arrival_time_correlation"] = _metric_lookup(reach_summary, "mean_arrival_time_reached", "correlation") or 0.0
+        if "original_forward_reach_ratio" in source_summary.columns and "synthetic_forward_reach_ratio" in source_summary.columns:
+            summary["temporal_forward_reach_node_correlation"] = _safe_correlation(
+                source_summary["original_forward_reach_ratio"],
+                source_summary["synthetic_forward_reach_ratio"],
+            )
+        else:
+            summary["temporal_forward_reach_node_correlation"] = 0.0
+        summary["original_temporal_reachability_ratio"] = float(reach_original["global_summary"].get("reachability_ratio", 0.0))
+        summary["synthetic_temporal_reachability_ratio"] = float(reach_synthetic["global_summary"].get("reachability_ratio", 0.0))
+        summary["original_temporal_efficiency"] = float(reach_original["global_summary"].get("temporal_efficiency", 0.0))
+        summary["synthetic_temporal_efficiency"] = float(reach_synthetic["global_summary"].get("temporal_efficiency", 0.0))
+        summary["original_static_reachability_ratio"] = float(reach_original["global_summary"].get("static_reachability_ratio", 0.0))
+        summary["synthetic_static_reachability_ratio"] = float(reach_synthetic["global_summary"].get("static_reachability_ratio", 0.0))
+        summary["original_causal_fidelity"] = float(reach_original["global_summary"].get("causal_fidelity", np.nan))
+        summary["synthetic_causal_fidelity"] = float(reach_synthetic["global_summary"].get("causal_fidelity", np.nan))
+        summary["original_mean_arrival_time_reached"] = float(reach_original["global_summary"].get("mean_arrival_time_reached", np.nan))
+        summary["synthetic_mean_arrival_time_reached"] = float(reach_synthetic["global_summary"].get("mean_arrival_time_reached", np.nan))
+        summary["mean_forward_reach_ratio_original"] = float(reach_original["global_summary"].get("mean_forward_reach_ratio", 0.0))
+        summary["mean_forward_reach_ratio_synthetic"] = float(reach_synthetic["global_summary"].get("mean_forward_reach_ratio", 0.0))
+        summary["max_forward_reach_ratio_original"] = float(reach_original["global_summary"].get("max_forward_reach_ratio", 0.0))
+        summary["max_forward_reach_ratio_synthetic"] = float(reach_synthetic["global_summary"].get("max_forward_reach_ratio", 0.0))
 
     # Pi-Mass variants: lazy walk on the largest SCC, lazy walk on the largest
     # closed SCC, and teleporting PageRank on the active snapshot.
@@ -4336,6 +4724,169 @@ def _write_edge_type_figure(
     return output_path
 
 
+def _write_temporal_reachability_figure(
+    per_snapshot: pd.DataFrame,
+    source_summary: pd.DataFrame,
+    summary: dict[str, Any],
+    *,
+    output_dir: Path,
+    sample_label: str,
+) -> Optional[Path]:
+    if per_snapshot.empty:
+        return None
+
+    plt = _load_matplotlib()
+    if plt is None:
+        return None
+
+    fig, axes = plt.subplots(2, 2, figsize=(15.8, 10.8), constrained_layout=True)
+    _style_figure(fig, axes)
+    fig.suptitle(f"Temporal Reachability / Transmission Potential: {sample_label}", fontsize=17, fontweight="bold", color=PLOT_COLORS["text"])
+
+    ts_values = per_snapshot["ts"].to_numpy(dtype=float)
+
+    ax = axes[0, 0]
+    _plot_line_with_band(
+        ax,
+        ts_values=ts_values,
+        values=pd.to_numeric(per_snapshot.get("original_reachability_ratio", np.nan), errors="coerce").to_numpy(dtype=float),
+        label="Observed",
+        color=PLOT_COLORS["original"],
+        linewidth=2.2,
+        marker_size=4.0,
+    )
+    _plot_line_with_band(
+        ax,
+        ts_values=ts_values,
+        values=pd.to_numeric(per_snapshot.get("synthetic_reachability_ratio", np.nan), errors="coerce").to_numpy(dtype=float),
+        label="Synthetic",
+        color=PLOT_COLORS["synthetic"],
+        linewidth=2.0,
+        marker_size=3.8,
+        linestyle="--",
+        alpha=0.92,
+        lower=_posterior_interval_from_frame(per_snapshot, "synthetic_reachability_ratio")[0],
+        upper=_posterior_interval_from_frame(per_snapshot, "synthetic_reachability_ratio")[1],
+    )
+    ax.set_title("Reachability ratio through time", loc="left")
+    ax.set_ylabel("Fraction of ordered pairs")
+    ax.set_ylim(0.0, 1.05)
+    _set_timestamp_ticks(ax, ts_values)
+    _style_axis(ax, grid_axis="both")
+    _style_legend(ax.legend(loc="best"))
+    annotation_lines = []
+    if summary.get("original_static_reachability_ratio") is not None and summary.get("synthetic_static_reachability_ratio") is not None:
+        annotation_lines.append(
+            f"Static reach: {float(summary.get('original_static_reachability_ratio', 0.0)):.3f} / {float(summary.get('synthetic_static_reachability_ratio', 0.0)):.3f}"
+        )
+    if summary.get("original_causal_fidelity") is not None and summary.get("synthetic_causal_fidelity") is not None:
+        annotation_lines.append(
+            f"Causal fidelity: {float(summary.get('original_causal_fidelity', np.nan)):.3f} / {float(summary.get('synthetic_causal_fidelity', np.nan)):.3f}"
+        )
+    if annotation_lines:
+        ax.text(
+            0.02,
+            0.96,
+            "\n".join(annotation_lines),
+            transform=ax.transAxes,
+            va="top",
+            fontsize=8.7,
+            color=PLOT_COLORS["text"],
+            bbox={"boxstyle": "round,pad=0.28", "facecolor": "#ffffff", "edgecolor": PLOT_COLORS["grid_strong"], "linewidth": 0.8},
+        )
+
+    ax = axes[0, 1]
+    _plot_line_with_band(
+        ax,
+        ts_values=ts_values,
+        values=pd.to_numeric(per_snapshot.get("original_temporal_efficiency", np.nan), errors="coerce").to_numpy(dtype=float),
+        label="Observed",
+        color=PLOT_COLORS["accent"],
+        linewidth=2.2,
+        marker_size=4.0,
+    )
+    _plot_line_with_band(
+        ax,
+        ts_values=ts_values,
+        values=pd.to_numeric(per_snapshot.get("synthetic_temporal_efficiency", np.nan), errors="coerce").to_numpy(dtype=float),
+        label="Synthetic",
+        color=PLOT_COLORS["delta"],
+        linewidth=2.0,
+        marker_size=3.8,
+        linestyle="--",
+        alpha=0.92,
+        lower=_posterior_interval_from_frame(per_snapshot, "synthetic_temporal_efficiency")[0],
+        upper=_posterior_interval_from_frame(per_snapshot, "synthetic_temporal_efficiency")[1],
+    )
+    ax.set_title("Temporal efficiency through time", loc="left")
+    ax.set_ylabel("Average inverse arrival time")
+    ax.set_ylim(bottom=0.0)
+    _set_timestamp_ticks(ax, ts_values)
+    _style_axis(ax, grid_axis="both")
+    _style_legend(ax.legend(loc="best"))
+    if summary.get("original_mean_arrival_time_reached") is not None and summary.get("synthetic_mean_arrival_time_reached") is not None:
+        ax.text(
+            0.02,
+            0.96,
+            (
+                f"Final mean arrival time: "
+                f"{float(summary.get('original_mean_arrival_time_reached', np.nan)):.2f} / "
+                f"{float(summary.get('synthetic_mean_arrival_time_reached', np.nan)):.2f}"
+            ),
+            transform=ax.transAxes,
+            va="top",
+            fontsize=8.7,
+            color=PLOT_COLORS["text"],
+            bbox={"boxstyle": "round,pad=0.28", "facecolor": "#ffffff", "edgecolor": PLOT_COLORS["grid_strong"], "linewidth": 0.8},
+        )
+
+    ax = axes[1, 0]
+    observed_new_pairs = pd.to_numeric(per_snapshot.get("original_new_reachable_pair_count", np.nan), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    synthetic_new_pairs = pd.to_numeric(per_snapshot.get("synthetic_new_reachable_pair_count", np.nan), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    synthetic_lower, synthetic_upper = _posterior_interval_from_frame(per_snapshot, "synthetic_new_reachable_pair_count")
+    width = 0.36 if len(ts_values) else 0.36
+    ax.bar(ts_values - width / 2.0, observed_new_pairs, width=width, color=PLOT_COLORS["original"], alpha=0.82, label="Observed")
+    ax.bar(ts_values + width / 2.0, synthetic_new_pairs, width=width, color=PLOT_COLORS["synthetic"], alpha=0.74, label="Synthetic")
+    if synthetic_lower is not None and synthetic_upper is not None:
+        ax.vlines(ts_values + width / 2.0, synthetic_lower, synthetic_upper, color=PLOT_COLORS["text"], linewidth=1.0, alpha=0.5, zorder=4)
+    ax.set_title("Newly reachable ordered pairs", loc="left")
+    ax.set_ylabel("Pairs first reached")
+    ax.set_ylim(bottom=0.0)
+    _set_timestamp_ticks(ax, ts_values)
+    _style_axis(ax, grid_axis="both")
+    _style_legend(ax.legend(loc="best"))
+
+    ax = axes[1, 1]
+    if source_summary is None or source_summary.empty or "original_forward_reach_ratio" not in source_summary.columns or "synthetic_forward_reach_ratio" not in source_summary.columns:
+        ax.axis("off")
+    else:
+        original_values = pd.to_numeric(source_summary["original_forward_reach_ratio"], errors="coerce").to_numpy(dtype=float)
+        synthetic_values = pd.to_numeric(source_summary["synthetic_forward_reach_ratio"], errors="coerce").to_numpy(dtype=float)
+        lower, upper = _posterior_interval_from_frame(source_summary, "synthetic_forward_reach_ratio")
+        ax.scatter(original_values, synthetic_values, s=48, color=PLOT_COLORS["accent"], edgecolors="white", linewidths=0.8, alpha=0.92)
+        if lower is not None and upper is not None:
+            ax.vlines(original_values, lower, upper, color=PLOT_COLORS["grid_strong"], linewidth=0.9, alpha=0.75, zorder=1)
+        limit = max(
+            float(np.nanmax(original_values)) if np.isfinite(original_values).any() else 0.0,
+            float(np.nanmax(synthetic_values)) if np.isfinite(synthetic_values).any() else 0.0,
+            1.0,
+        )
+        ax.plot([0.0, limit], [0.0, limit], linestyle="--", color=PLOT_COLORS["neutral"], linewidth=1.2)
+        correlation_value = float(summary.get("temporal_forward_reach_node_correlation", 0.0) or 0.0)
+        ax.set_title(f"Final forward reach by source (corr={correlation_value:.3f})", loc="left")
+        ax.set_xlabel("Observed forward reachable fraction")
+        ax.set_ylabel("Synthetic forward reachable fraction")
+        ax.set_xlim(0.0, limit * 1.03)
+        ax.set_ylim(0.0, limit * 1.03)
+        _style_axis(ax, grid_axis="both")
+
+    output_path = output_dir / f"{sample_label}_temporal_reachability.png"
+    _save_figure(fig, output_path)
+    plt.close(fig)
+    return output_path
+
+
+
 def _write_magnetic_laplacian_figure(
     merged: pd.DataFrame,
     summary_df: pd.DataFrame,
@@ -4568,6 +5119,9 @@ def _write_detailed_diagnostics_artifacts(
         "pi_mass_closed_summary": f"{sample_label}_pi_mass_closed_summary.csv",
         "pi_mass_pagerank_per_snapshot": f"{sample_label}_pi_mass_pagerank_per_snapshot.csv",
         "pi_mass_pagerank_summary": f"{sample_label}_pi_mass_pagerank_summary.csv",
+        "temporal_reachability_per_snapshot": f"{sample_label}_temporal_reachability_per_snapshot.csv",
+        "temporal_reachability_summary": f"{sample_label}_temporal_reachability_summary.csv",
+        "temporal_reachability_source_summary": f"{sample_label}_temporal_reachability_source_summary.csv",
         "magnetic_laplacian_per_snapshot": f"{sample_label}_magnetic_laplacian_per_snapshot.csv",
         "magnetic_laplacian_summary": f"{sample_label}_magnetic_laplacian_summary.csv",
         "magnetic_spectral_distance_per_snapshot": f"{sample_label}_magnetic_spectral_distance_per_snapshot.csv",
@@ -4700,6 +5254,16 @@ def _write_detailed_diagnostics_artifacts(
     )
     if edge_type_plot_path is not None:
         outputs["edge_type_plot"] = str(edge_type_plot_path)
+
+    temporal_reachability_plot_path = _write_temporal_reachability_figure(
+        details.get("temporal_reachability_per_snapshot", pd.DataFrame()),
+        details.get("temporal_reachability_source_summary", pd.DataFrame()),
+        details.get("summary", pd.DataFrame([{}])).iloc[0].to_dict() if isinstance(details.get("summary"), pd.DataFrame) and len(details.get("summary")) else {},
+        output_dir=output_dir,
+        sample_label=sample_label,
+    )
+    if temporal_reachability_plot_path is not None:
+        outputs["temporal_reachability_plot"] = str(temporal_reachability_plot_path)
 
     pi_mass_plot_path = _write_pi_mass_figure(
         details.get("pi_mass_per_snapshot", pd.DataFrame()),
@@ -5001,6 +5565,21 @@ def write_report(
         )
         if posterior_runs > 1 and "weight_total_pooled_correlation" in summary:
             lines.append(f"- Snapshot total-weight correlation (all runs pooled): {float(summary['weight_total_pooled_correlation']):.4f}")
+    if "original_temporal_reachability_ratio" in summary and "synthetic_temporal_reachability_ratio" in summary:
+        lines.extend(
+            [
+                f"- Final temporal reachability ratio (observed): {float(summary['original_temporal_reachability_ratio']):.4f}",
+                f"- Final temporal reachability ratio (synthetic): {float(summary['synthetic_temporal_reachability_ratio']):.4f}",
+                f"- Temporal reachability correlation: {float(summary.get('temporal_reachability_ratio_correlation', 0.0)):.4f}",
+                f"- Temporal efficiency correlation: {float(summary.get('temporal_efficiency_correlation', 0.0)):.4f}",
+                f"- Forward-reach node correlation: {float(summary.get('temporal_forward_reach_node_correlation', 0.0)):.4f}",
+                f"- Causal fidelity (observed / synthetic): {float(summary.get('original_causal_fidelity', np.nan)):.4f} / {float(summary.get('synthetic_causal_fidelity', np.nan)):.4f}",
+            ]
+        )
+        if posterior_runs > 1 and "temporal_reachability_ratio_pooled_correlation" in summary:
+            lines.append(
+                f"- Temporal reachability correlation (all runs pooled): {float(summary['temporal_reachability_ratio_pooled_correlation']):.4f}"
+            )
 
     lines.extend(
         [
@@ -5041,7 +5620,7 @@ def write_report(
                 "",
                 "## Detailed Diagnostics",
                 "",
-                "These files break the goodness-of-fit check down by block pair, by block activity, and by node activity through time.",
+                "These files break the goodness-of-fit check down by block pair, by block activity, by node activity, and by temporal reachability / transmission-potential summaries.",
             ]
         )
         for key in sorted(detailed_outputs):
@@ -7703,6 +8282,7 @@ def _selected_setting_evidence_tables(label: str, diagnostics_dir: Path, *, dire
     advanced_specs = {
         "tea": diagnostics_dir / f"{label}_tea_summary.csv",
         "tna": diagnostics_dir / f"{label}_tna_summary.csv",
+        "temporal_reachability": diagnostics_dir / f"{label}_temporal_reachability_summary.csv",
         "pi_mass": diagnostics_dir / f"{label}_pi_mass_summary.csv",
         "pi_mass_closed": diagnostics_dir / f"{label}_pi_mass_closed_summary.csv",
         "pi_mass_pagerank": diagnostics_dir / f"{label}_pi_mass_pagerank_summary.csv",
@@ -7730,6 +8310,29 @@ def _selected_setting_evidence_tables(label: str, diagnostics_dir: Path, *, dire
             frame = frame.copy()
             frame["type_label"] = frame["type_label"].map(_format_node_type_label)
         outputs[key] = frame
+
+    source_path = diagnostics_dir / f"{label}_temporal_reachability_source_summary.csv"
+    if source_path.exists():
+        source_frame = pd.read_csv(source_path)
+        if len(source_frame):
+            ordered_columns = [
+                column
+                for column in (
+                    "node_id",
+                    "type_label",
+                    "original_forward_reach_ratio",
+                    "synthetic_forward_reach_ratio",
+                    "forward_reach_ratio_delta",
+                    "original_static_forward_reach_ratio",
+                    "synthetic_static_forward_reach_ratio",
+                    "static_forward_reach_ratio_delta",
+                )
+                if column in source_frame.columns
+            ]
+            outputs["reachability_sources"] = source_frame[ordered_columns].sort_values(
+                [column for column in ("original_forward_reach_ratio", "node_id") if column in source_frame.columns],
+                ascending=[False, True][: len([column for column in ("original_forward_reach_ratio", "node_id") if column in source_frame.columns])],
+            ).head(12)
     return outputs
 
 
@@ -7927,7 +8530,7 @@ def _aggregate_grouped_numeric_frames(
     group_keys: list[str],
     run_labels: Optional[list[str]] = None,
 ) -> pd.DataFrame:
-    non_empty = [frame.copy() for frame in frames if frame is not None and not frame.empty]
+    non_empty = [frame for frame in frames if frame is not None and not frame.empty]
     if not non_empty:
         return pd.DataFrame(columns=group_keys)
 
@@ -7939,33 +8542,58 @@ def _aggregate_grouped_numeric_frames(
         tagged_frames.append(tagged)
     combined = pd.concat(tagged_frames, ignore_index=True, sort=False)
 
-    rows: list[dict[str, object]] = []
     value_columns = [column for column in combined.columns if column not in set(group_keys) | {"__run_label"}]
-    for group_values, group_frame in combined.groupby(group_keys, dropna=False, sort=True):
-        if not isinstance(group_values, tuple):
-            group_values = (group_values,)
-        row = {key: value for key, value in zip(group_keys, group_values)}
-        unique_runs = sorted(group_frame["__run_label"].astype(str).unique().tolist())
-        run_count = len(unique_runs)
-        row["posterior_num_runs"] = int(run_count)
-        for column in value_columns:
-            series = group_frame[column]
-            numeric = pd.to_numeric(series, errors="coerce")
-            finite = numeric[np.isfinite(numeric.to_numpy(dtype=float))]
-            if len(finite):
-                row[column] = float(finite.median())
-                if run_count > 1:
-                    row[f"{column}_q05"] = float(finite.quantile(0.05))
-                    row[f"{column}_q95"] = float(finite.quantile(0.95))
-                    row[f"{column}_mean"] = float(finite.mean())
-                    row[f"{column}_std"] = float(finite.std(ddof=0))
-                continue
-            non_null = series.dropna()
-            row[column] = non_null.iloc[0] if len(non_null) else None
-        rows.append(row)
+    grouped = combined.groupby(group_keys, dropna=False, sort=True)
+    output = grouped["__run_label"].nunique().rename("posterior_num_runs").reset_index()
 
-    output = pd.DataFrame(rows)
+    numeric_columns: list[str] = []
+    for column in value_columns:
+        numeric = pd.to_numeric(combined[column], errors="coerce")
+        if numeric.notna().any():
+            combined[column] = numeric.astype(float)
+            numeric_columns.append(column)
+
+    if numeric_columns:
+        numeric_grouped = combined.groupby(group_keys, dropna=False, sort=True)[numeric_columns]
+        output = output.merge(numeric_grouped.median().reset_index(), on=group_keys, how="left", sort=False)
+        output = output.merge(
+            numeric_grouped.quantile(0.05).add_suffix("_q05").reset_index(),
+            on=group_keys,
+            how="left",
+            sort=False,
+        )
+        output = output.merge(
+            numeric_grouped.quantile(0.95).add_suffix("_q95").reset_index(),
+            on=group_keys,
+            how="left",
+            sort=False,
+        )
+        output = output.merge(
+            numeric_grouped.mean().add_suffix("_mean").reset_index(),
+            on=group_keys,
+            how="left",
+            sort=False,
+        )
+        output = output.merge(
+            numeric_grouped.std(ddof=0).add_suffix("_std").reset_index(),
+            on=group_keys,
+            how="left",
+            sort=False,
+        )
+
+    non_numeric_columns = [column for column in value_columns if column not in numeric_columns]
+    if non_numeric_columns:
+        non_numeric = grouped[non_numeric_columns].first().reset_index()
+        output = output.merge(non_numeric, on=group_keys, how="left", sort=False)
+
     if len(output):
+        single_run_mask = output["posterior_num_runs"] <= 1
+        if single_run_mask.any():
+            for column in numeric_columns:
+                for suffix in ("_q05", "_q95", "_mean", "_std"):
+                    derived_column = f"{column}{suffix}"
+                    if derived_column in output.columns:
+                        output.loc[single_run_mask, derived_column] = np.nan
         output = output.sort_values(group_keys).reset_index(drop=True)
     return output
 
@@ -8222,6 +8850,21 @@ def _recompute_posterior_detail_summaries(
             tna_type_summary["mean_abs_new_rate_delta"] = tna_type_summary["mean_abs_new_ratio_delta"]
         recomputed["tna_type_summary"] = tna_type_summary
 
+    reachability = recomputed.get("temporal_reachability_per_snapshot")
+    if reachability is not None and not reachability.empty:
+        reachability_metrics = [
+            "reachable_pair_count",
+            "reachability_ratio",
+            "new_reachable_pair_count",
+            "temporal_efficiency",
+            "mean_arrival_time_reached",
+        ]
+        recomputed["temporal_reachability_summary"] = _summarise_metric_time_series(
+            reachability,
+            reachability_metrics,
+            treat_missing_as_zero=False,
+        )
+
     for base_key in ("pi_mass", "pi_mass_closed", "pi_mass_pagerank", "magnetic_laplacian"):
         frame = recomputed.get(f"{base_key}_per_snapshot")
         if frame is None or frame.empty:
@@ -8269,6 +8912,27 @@ def _update_summary_with_recomputed_diagnostics(
         summary["reciprocity_pooled_correlation"] = _safe_correlation(
             pd.concat([frame.get("original_reciprocity", pd.Series(dtype=float)) for frame in run_level_per_snapshot], ignore_index=True),
             pd.concat([frame.get("synthetic_reciprocity", pd.Series(dtype=float)) for frame in run_level_per_snapshot], ignore_index=True),
+        )
+
+    reachability_summary = detailed_outputs.get("temporal_reachability_summary", pd.DataFrame())
+    if len(reachability_summary):
+        summary["temporal_reachability_ratio_correlation"] = _metric_lookup(reachability_summary, "reachability_ratio", "correlation") or 0.0
+        summary["temporal_efficiency_correlation"] = _metric_lookup(reachability_summary, "temporal_efficiency", "correlation") or 0.0
+        summary["temporal_new_reachable_pair_count_correlation"] = _metric_lookup(reachability_summary, "new_reachable_pair_count", "correlation") or 0.0
+        summary["temporal_mean_arrival_time_correlation"] = _metric_lookup(reachability_summary, "mean_arrival_time_reached", "correlation") or 0.0
+        reachability_run_details = _posterior_metric_correlation_details(
+            run_level_details.get("temporal_reachability_per_snapshot", []),
+            metric_names=["reachability_ratio", "temporal_efficiency", "new_reachable_pair_count", "mean_arrival_time_reached"],
+        )
+        summary["temporal_reachability_ratio_pooled_correlation"] = _metric_lookup(reachability_run_details, "reachability_ratio", "pooled_correlation") or 0.0
+        summary["temporal_efficiency_pooled_correlation"] = _metric_lookup(reachability_run_details, "temporal_efficiency", "pooled_correlation") or 0.0
+        summary["temporal_new_reachable_pair_count_pooled_correlation"] = _metric_lookup(reachability_run_details, "new_reachable_pair_count", "pooled_correlation") or 0.0
+        summary["temporal_mean_arrival_time_pooled_correlation"] = _metric_lookup(reachability_run_details, "mean_arrival_time_reached", "pooled_correlation") or 0.0
+    source_frame = detailed_outputs.get("temporal_reachability_source_summary", pd.DataFrame())
+    if len(source_frame) and "original_forward_reach_ratio" in source_frame.columns and "synthetic_forward_reach_ratio" in source_frame.columns:
+        summary["temporal_forward_reach_node_correlation"] = _safe_correlation(
+            source_frame["original_forward_reach_ratio"],
+            source_frame["synthetic_forward_reach_ratio"],
         )
 
     tea_summary = detailed_outputs.get("tea_summary", pd.DataFrame())
@@ -8468,6 +9132,7 @@ def aggregate_posterior_reports(
         metric_summary_specs = [
             ("tea_per_snapshot", "tea_summary"),
             ("tna_per_snapshot", "tna_summary"),
+            ("temporal_reachability_per_snapshot", "temporal_reachability_summary"),
             ("pi_mass_per_snapshot", "pi_mass_summary"),
             ("pi_mass_closed_per_snapshot", "pi_mass_closed_summary"),
             ("pi_mass_pagerank_per_snapshot", "pi_mass_pagerank_summary"),
@@ -8565,6 +9230,7 @@ def write_scientific_validation_report(
     output_path: Optional[Path] = None,
     title: Optional[str] = None,
     skip_spectral_metrics: bool = False,
+    include_daily_network_snapshots: bool = False,
 ) -> Path:
     run_dir = Path(run_dir).expanduser().resolve()
     diagnostics_dir = run_dir / "diagnostics"
@@ -8630,12 +9296,16 @@ def write_scientific_validation_report(
             manifest,
             summary_rows["sample_label"].astype(str).tolist(),
         )
-    network_assets = _write_daily_network_snapshot_assets(
-        run_dir,
-        diagnostics_dir,
-        manifest,
-        summary_rows,
-        selected_labels,
+    network_assets = (
+        _write_daily_network_snapshot_assets(
+            run_dir,
+            diagnostics_dir,
+            manifest,
+            summary_rows,
+            selected_labels,
+        )
+        if include_daily_network_snapshots
+        else {}
     )
     best_overlap_setting = _setting_display_payload(str(best_overlap["sample_label"]))
     lowest_novelty_setting = _setting_display_payload(str(lowest_novelty["sample_label"]))
@@ -8708,6 +9378,11 @@ def write_scientific_validation_report(
         "mean_abs_edge_count_delta",
         "mean_abs_weight_total_delta",
         "mean_abs_reciprocity_delta",
+        "temporal_reachability_ratio_correlation",
+        "temporal_efficiency_correlation",
+        "temporal_forward_reach_node_correlation",
+        "original_causal_fidelity",
+        "synthetic_causal_fidelity",
         "tea_new_ratio_correlation",
         "edge_type_share_correlation",
         "tna_new_ratio_correlation",
@@ -8746,6 +9421,11 @@ def write_scientific_validation_report(
             "mean_abs_edge_count_delta": "Mean abs edge delta",
             "mean_abs_reciprocity_delta": "Mean abs reciprocity delta",
             "mean_abs_weight_total_delta": "Mean abs weight delta",
+            "temporal_reachability_ratio_correlation": "Temporal reach corr",
+            "temporal_efficiency_correlation": "Temporal efficiency corr",
+            "temporal_forward_reach_node_correlation": "Forward-reach node corr",
+            "original_causal_fidelity": "Observed causal fidelity",
+            "synthetic_causal_fidelity": "Synthetic causal fidelity",
             "tea_new_ratio_correlation": "TEA new corr",
             "tea_persist_ratio_correlation": "TEA persist corr",
             "tea_type_pair_birth_rate_correlation": "TEA type-pair corr",
@@ -8795,6 +9475,9 @@ def write_scientific_validation_report(
             "Edge Jaccard": top_settings.apply(lambda row: _format_report_metric_value(row, "mean_snapshot_edge_jaccard"), axis=1) if posterior_mode else top_settings["mean_snapshot_edge_jaccard"],
             "Node Jaccard": top_settings.apply(lambda row: _format_report_metric_value(row, "mean_snapshot_node_jaccard"), axis=1) if posterior_mode else top_settings["mean_snapshot_node_jaccard"],
             "Novel edge rate": top_settings.apply(lambda row: _format_report_metric_value(row, "mean_synthetic_novel_edge_rate"), axis=1) if posterior_mode else top_settings["mean_synthetic_novel_edge_rate"],
+            "Temporal reachability corr": top_settings.apply(lambda row: _format_report_metric_value(row, "temporal_reachability_ratio_correlation"), axis=1) if posterior_mode and "temporal_reachability_ratio_correlation" in top_settings.columns else top_settings.get("temporal_reachability_ratio_correlation", pd.Series(np.nan, index=top_settings.index)),
+            "Temporal efficiency corr": top_settings.apply(lambda row: _format_report_metric_value(row, "temporal_efficiency_correlation"), axis=1) if posterior_mode and "temporal_efficiency_correlation" in top_settings.columns else top_settings.get("temporal_efficiency_correlation", pd.Series(np.nan, index=top_settings.index)),
+            "Forward-reach node corr": top_settings.apply(lambda row: _format_report_metric_value(row, "temporal_forward_reach_node_correlation"), axis=1) if posterior_mode and "temporal_forward_reach_node_correlation" in top_settings.columns else top_settings.get("temporal_forward_reach_node_correlation", pd.Series(np.nan, index=top_settings.index)),
             "Edge-count corr (median path)": top_settings.apply(lambda row: _format_report_metric_value(row, "edge_count_correlation"), axis=1) if posterior_mode else top_settings["edge_count_correlation"],
         }
     )
@@ -8806,6 +9489,10 @@ def write_scientific_validation_report(
         top_settings_display["Reciprocity corr (median path)"] = top_settings.apply(lambda row: _format_report_metric_value(row, "reciprocity_correlation"), axis=1) if posterior_mode else top_settings["reciprocity_correlation"]
     if posterior_mode and "edge_count_pooled_correlation" in top_settings.columns:
         top_settings_display["Edge-count corr (all runs)"] = top_settings["edge_count_pooled_correlation"]
+    if posterior_mode and "temporal_reachability_ratio_pooled_correlation" in top_settings.columns:
+        top_settings_display["Temporal reachability corr (all runs)"] = top_settings["temporal_reachability_ratio_pooled_correlation"]
+    if posterior_mode and "temporal_efficiency_pooled_correlation" in top_settings.columns:
+        top_settings_display["Temporal efficiency corr (all runs)"] = top_settings["temporal_efficiency_pooled_correlation"]
     if posterior_mode and "weight_total_pooled_correlation" in top_settings.columns:
         top_settings_display["Weight-total corr (all runs)"] = top_settings["weight_total_pooled_correlation"]
     if posterior_mode and "reciprocity_pooled_correlation" in top_settings.columns:
@@ -8865,7 +9552,7 @@ def write_scientific_validation_report(
             ("Sample classes", f"{len(primary_rows)} primary posterior-predictive, {len(sensitivity_rows)} sensitivity-analysis settings"),
             ("Posterior reporting", "Posterior medians with 5th-95th percentile intervals by setting" if posterior_mode else "Single generated panel per setting"),
             ("Time-series association", f"{TIME_SERIES_CORRELATION_LABEL} on aligned snapshot sequences"),
-            ("Advanced diagnostics", "TEA, TNA, hybrid edge-type composition, weighted Pi-Mass on the largest SCC, and weighted magnetic Laplacian eigenvalue / phase diagnostics"),
+            ("Advanced diagnostics", "TEA, TNA, strict temporal reachability / transmission-potential diagnostics, hybrid edge-type composition, weighted Pi-Mass on the largest SCC, and weighted magnetic Laplacian eigenvalue / phase diagnostics"),
         ],
         columns=["Parameter", "Value"],
     )
@@ -8873,6 +9560,10 @@ def write_scientific_validation_report(
         ("Edge Jaccard", f"Per-snapshot overlap of realized {'directed' if directed else 'undirected'} edges; higher is better."),
         ("Node Jaccard", "Per-snapshot overlap of active nodes; higher is better."),
         ("Novel edge rate", "Share of synthetic edges absent from the observed panel; lower is better."),
+        ("Temporal reachability corr", f"{TIME_SERIES_CORRELATION_LABEL} between observed and synthetic prefix reachability-ratio series under strict time-respecting paths on the discrete-time panel."),
+        ("Temporal efficiency corr", f"{TIME_SERIES_CORRELATION_LABEL} between observed and synthetic prefix temporal-efficiency series, where efficiency is the average inverse earliest-arrival time and unreachable ordered pairs contribute zero."),
+        ("Forward-reach node corr", "Spearman correlation between observed and synthetic source-level forward reachable fractions over the full observation window."),
+        ("Causal fidelity", "Temporal reachability ratio divided by static aggregated reachability ratio. Values near one mean the aggregated network is not overstating causal transmission opportunity."),
         ("Edge-count corr", f"{TIME_SERIES_CORRELATION_LABEL} between observed and synthetic snapshot edge-count series. In posterior mode this is the observed-versus-posterior-median trajectory correlation."),
     ]
     if manifest.get("weight_model"):
@@ -8921,10 +9612,11 @@ def write_scientific_validation_report(
             else f"Panel-level fit is strongest on snapshot volumes and total weight trends within the primary posterior-predictive class. The best-overlap primary setting reached mean edge Jaccard {float(best_overlap['mean_snapshot_edge_jaccard']):.3f}; the lowest-novelty primary setting reached novel-edge rate {float(lowest_novelty['mean_synthetic_novel_edge_rate']):.3f}."
         ),
         "The added TEA and TNA diagnostics test whether the model reproduces when edges and active nodes appear for the first time, persist, reactivate, or churn between consecutive snapshots.",
+        "The temporal reachability diagnostics track how many ordered node pairs become causally connected over the window, how quickly they do so, and whether the same source nodes can reach similarly large fractions of the network.",
         "Because this is a hybrid network, the report also checks whether activity is allocated correctly across the four edge channels F→F, F→R, R→F, and R→R rather than only matching totals after aggregation.",
         "The Pi-Mass and magnetic Laplacian diagnostics test higher-order directed structure using weighted flows: stationary-flow concentration on the largest strongly connected component, and orientation-sensitive weighted spectral structure over time.",
-        "Exact link recovery remains limited. Even the strongest settings still generate many novel edges, so this workflow is more reliable for aggregate activity and weight-allocation patterns than for reproducing specific observed links.",
-        "The fitted state on this slice has only two top-level blocks, so block-pair diagnostics are informative but still coarse. Node-level weight traces remain necessary to detect misallocation among the most active entities.",
+        "Exact link recovery is limited. Even the strongest settings generate many novel edges, so this workflow is more reliable for aggregate activity and weight-allocation patterns than for reproducing specific observed links.",
+        "The fitted state on this slice has only two top-level blocks, so block-pair diagnostics are informative but coarse. Node-level weight traces are necessary to detect misallocation among the most active entities.",
     ]
     if directed:
         feasibility_points.insert(
@@ -8944,6 +9636,7 @@ def write_scientific_validation_report(
             "tea.png",
             "tna.png",
             "edge_type.png",
+            "temporal_reachability.png",
             "pi_mass.png",
             "pi_mass_closed.png",
             "pi_mass_pagerank.png",
@@ -9094,10 +9787,12 @@ def write_scientific_validation_report(
             return "TNA tracks when nodes first become active, remain active, reactivate, or churn out. Use it to see whether the synthetic panel activates the right volume of nodes at the right times. Blue background bands mark weekends and red bands mark Dutch public holidays."
         if name.endswith("_edge_type.png"):
             return "This figure checks the hybrid-network channel allocation directly. Each color is one of the F→F, F→R, R→F, or R→R edge classes, and close observed versus synthetic trajectories mean the model is placing traffic in the right hybrid channels through time. Blue background bands mark weekends and red bands mark Dutch public holidays."
+        if name.endswith("_temporal_reachability.png"):
+            return "This figure measures transmission potential using strict time-respecting paths on the discrete-time panel. Reachability ratio shows how many ordered node pairs are causally connected, temporal efficiency summarizes how quickly those connections appear, newly reachable pairs show when the transmission envelope expands, and the source-level parity plot checks whether the same nodes can reach similarly large fractions of the network."
         if name.endswith("_pi_mass.png"):
             return "Pi-Mass summarizes how weighted stationary flow concentrates on node-type groups within the largest strongly connected component under a weighted lazy random walk. The LIC panels show whether directed flow is concentrated on the same part of the network as in the observed panel, and the active-node panels show whether the same number of farms and regional supernodes are engaged each day. Cross marks denote degenerate snapshots where Pi-Mass is undefined, and the traces break across those days. Blue background bands mark weekends and red bands mark Dutch public holidays."
         if name.endswith("_pi_mass_closed.png"):
-            return "This variant recomputes Pi-Mass on the largest closed strongly connected class under the weighted lazy walk. Use it to see whether the model preserves stationary flow once leakage to other classes is excluded, while still matching daily active-node counts inside the directed core. Cross marks denote degenerate snapshots where the closed-class Pi-Mass is undefined."
+            return "This variant recomputes Pi-Mass on the largest closed strongly connected class under the weighted lazy walk. Use it to see whether the model preserves stationary flow once leakage to other classes is excluded, while matching daily active-node counts inside the directed core. Cross marks denote degenerate snapshots where the closed-class Pi-Mass is undefined."
         if name.endswith("_pi_mass_pagerank.png"):
             return "This variant summarizes whole-snapshot teleporting PageRank by node type. It complements the closed-class lazy walk by providing a globally ergodic directed-flow summary over the active snapshot. Cross marks denote degenerate snapshots where the type-mass summary is undefined."
         if name.endswith("_magnetic_laplacian.png"):
@@ -9227,7 +9922,7 @@ def write_scientific_validation_report(
         )
     if best_block_weight is not None and best_out_weight is not None and best_in_weight is not None:
         local_fit_parts.append(
-            f"Weight allocation remains weaker than topology at finer scale: mean block-pair weight correlation is {best_block_weight:.3f}"
+            f"Weight allocation is weaker than topology at finer scale: mean block-pair weight correlation is {best_block_weight:.3f}"
             + (f" (minimum {best_block_weight_min:.3f})" if best_block_weight_min is not None else "")
             + f", while median top-node outgoing and incoming weight correlations are {best_out_weight:.3f} and {best_in_weight:.3f}."
         )
@@ -9261,9 +9956,9 @@ def write_scientific_validation_report(
         if higher_order_score >= 0.85:
             prefix = "The higher-order directed diagnostics are supportive."
         elif higher_order_score >= 0.60:
-            prefix = "The higher-order directed diagnostics are mixed but still broadly supportive."
+            prefix = "The higher-order directed diagnostics are mixed but broadly supportive."
         else:
-            prefix = "The higher-order directed diagnostics remain the weakest part of the fit."
+            prefix = "The higher-order directed diagnostics are the weakest part of the fit."
         sentence = (
             f"{prefix} Weighted Pi-mass correlation is {best_pi_mass:.3f}"
             + (f", closed-class Pi correlation is {best_pi_closed:.3f}" if best_pi_closed is not None else "")
@@ -9296,7 +9991,7 @@ def write_scientific_validation_report(
         synthesis_strengths.append(f"edge and node turnover are both well aligned with the observed panel (TEA/TNA new-ratio correlations {best_tea_new:.3f}/{best_tna_new:.3f})")
 
     if best_novelty is not None and best_novelty >= 0.40:
-        synthesis_limitations.append(f"novel edges are still substantial ({best_novelty:.3f} mean novel-edge rate)")
+        synthesis_limitations.append(f"novel edges are substantial ({best_novelty:.3f} mean novel-edge rate)")
     if best_block_weight is not None and best_block_weight < 0.80:
         synthesis_limitations.append(f"block-pair weight allocation is only partially recovered (mean block-pair weight correlation {best_block_weight:.3f})")
     if best_edge_type_weight is not None and best_edge_type_weight < 0.80:
@@ -9324,7 +10019,7 @@ def write_scientific_validation_report(
         worst_payload = _setting_display_payload(str(worst_reciprocity_row["sample_label"]))
         worst_class = _display_sample_class(str(worst_reciprocity_row.get("sample_class", _default_sample_class(str(worst_reciprocity_row["sample_label"])))))
         conclusion_paragraphs.append(
-            f"The directed diagnostics also identify a clear failure mode: <strong>{html.escape(worst_payload['short_label'])}</strong> ({html.escape(worst_class)}) drops reciprocity correlation to {float(worst_reciprocity_row['reciprocity_correlation']):.3f} while still producing superficially plausible totals. This is why the report keeps reciprocity and node-level in/out evidence alongside overlap and weight summaries."
+            f"The directed diagnostics also identify a clear failure mode: <strong>{html.escape(worst_payload['short_label'])}</strong> ({html.escape(worst_class)}) drops reciprocity correlation to {float(worst_reciprocity_row['reciprocity_correlation']):.3f} while producing superficially plausible totals. This is why the report keeps reciprocity and node-level in/out evidence alongside overlap and weight summaries."
         )
 
     def figure_tag(path: Optional[Path], caption: str, explain_text: Optional[str] = None) -> str:
@@ -9956,9 +10651,15 @@ def write_scientific_validation_report(
             html_parts.append(
                 f"<div class='card'><h3>Hybrid edge-type evidence</h3>{_render_html_table_widget(section['tables']['edge_types'], table_id=edge_type_table_id, explain_text='Each row is one hybrid edge channel. Use these correlations to see whether the model keeps activity on the right F→F, F→R, R→F, and R→R pathways through time.')}</div>"
             )
+        if section["tables"].get("reachability_sources") is not None:
+            reach_source_table_id = re.sub(r"[^a-z0-9]+", "_", section["label"].lower()).strip("_") + "_reachability_sources"
+            html_parts.append(
+                f"<div class='card'><h3>Transmission-source evidence</h3>{_render_html_table_widget(section['tables']['reachability_sources'], table_id=reach_source_table_id, explain_text='Each row is a source node. Compare the final forward reachable fractions to see whether the synthetic panel gives the same nodes similar causal reach across the full observation window.')}</div>"
+            )
         advanced_table_specs = [
             ("tea", "TEA summary", "These rows summarize how closely the synthetic panel matches observed edge appearance, persistence, reactivation, and churn through time."),
             ("tna", "TNA summary", "These rows summarize whether nodes become active, persist, reactivate, and churn at the right times."),
+            ("temporal_reachability", "Temporal reachability summary", "These rows summarize how closely the synthetic panel matches the observed transmission envelope under strict time-respecting paths: total reachable pairs, reachability ratio, new reachable pairs, temporal efficiency, and mean arrival time."),
             ("pi_mass", "Pi-Mass / LIC summary", "These rows summarize stationary flow concentration on the largest strongly connected component under the lazy walk, along with support size and daily active-node counts."),
             ("pi_mass_closed", "Pi-Mass / closed-class summary", "These rows summarize stationary flow concentration on the largest closed strongly connected class under the lazy walk, along with support size and daily active-node counts."),
             ("pi_mass_pagerank", "Pi-Mass / PageRank summary", "These rows summarize whole-snapshot teleporting PageRank mass by node type, along with active-snapshot size and daily active-node counts."),
