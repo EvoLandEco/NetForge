@@ -514,6 +514,36 @@ def add_generation_arguments(
         help="Start the activity process from the observed first snapshot or sample the initial active set from the fitted activity model.",
     )
     parser.add_argument(
+        "--temporal-activity-prior-strength",
+        type=float,
+        default=8.0,
+        help="Pseudo-count strength used by the temporal activity Markov model.",
+    )
+    parser.add_argument(
+        "--temporal-activity-composition-mode",
+        default="auto",
+        choices=["auto", "none", "total", "type_count"],
+        help="How strongly the sampled activity state tracks observed realized active-node totals. 'auto' uses type counts when node types are available and total counts otherwise.",
+    )
+    parser.add_argument(
+        "--temporal-activity-composition-weight",
+        type=float,
+        default=0.15,
+        help="Weight applied when the activity sampler scores candidates against realized active-node composition targets.",
+    )
+    parser.add_argument(
+        "--temporal-realized-activity-mode",
+        default="auto",
+        choices=["auto", "none", "total", "type_count"],
+        help="How strongly turnover-pool selection favors edges that reduce realized active-node shortfall. 'auto' uses type counts when node types are available and total counts otherwise.",
+    )
+    parser.add_argument(
+        "--temporal-realized-activity-weight",
+        type=float,
+        default=2.0,
+        help="Weight applied when turnover matching scores candidates against realized active-node targets.",
+    )
+    parser.add_argument(
         "--temporal-proposal-rounds",
         type=int,
         default=3,
