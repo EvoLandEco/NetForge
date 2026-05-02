@@ -45,6 +45,19 @@ LOGGER = logging.getLogger(__name__)
 _ACTIVE_LOG_TEE: Optional["_TerminalLogTee"] = None
 
 
+def _parse_positive_int_or_inf(value: object) -> Optional[int]:
+    text = str(value).strip().lower()
+    if text in {"inf", "infinity", "unbounded", "unlimited"}:
+        return None
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Expected a positive integer or 'inf'.") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("Expected a positive integer or 'inf'.")
+    return parsed
+
+
 class _TerminalLogTee:
     def __init__(self, log_path: Path) -> None:
         self.log_path = Path(log_path)
@@ -512,6 +525,18 @@ def add_generation_arguments(
         default="observed",
         choices=["observed", "model"],
         help="Start the activity process from the observed first snapshot or sample the initial active set from the fitted activity model.",
+    )
+    parser.add_argument(
+        "--temporal-activity-snapshot-match-mode",
+        default="none",
+        choices=["none", "stored", "stepwise", "full_panel"],
+        help="How the temporal activity sampler handles stored daily activity snapshots. 'stepwise' runs the step-by-step exact-match bridge search, 'full_panel' searches over whole-panel draws, 'stored' reuses the saved snapshots directly, and 'none' leaves activity states unconstrained.",
+    )
+    parser.add_argument(
+        "--temporal-activity-snapshot-match-attempts",
+        type=_parse_positive_int_or_inf,
+        default=32,
+        help="Maximum number of per-day search attempts used when snapshot matching runs in search mode. Use 'inf' for an unbounded search.",
     )
     parser.add_argument(
         "--temporal-activity-prior-strength",

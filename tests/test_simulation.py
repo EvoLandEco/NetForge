@@ -178,16 +178,16 @@ class SimulationTests(unittest.TestCase):
                 {
                     "metric": ["farm_attack_rate", "farm_peak_prevalence", "farm_peak_day_index", "farm_duration_days"],
                     "wasserstein_distance": [0.01, 0.02, 0.03, 0.04],
-                    "original_median": [0.10, 2.0, 4.0, 8.5],
-                    "synthetic_median": [0.12, 2.5, 5.0, 8.0],
+                    "original_mean": [0.15, 2.5, 4.5, 8.5],
+                    "synthetic_mean": [0.12, 2.0, 5.0, 8.5],
                 }
             ).to_csv(outcome_summary_a, index=False)
             pd.DataFrame(
                 {
                     "metric": ["farm_attack_rate", "farm_peak_prevalence", "farm_peak_day_index", "farm_duration_days"],
                     "wasserstein_distance": [0.02, 0.03, 0.04, 0.05],
-                    "original_median": [0.10, 2.0, 4.0, 8.5],
-                    "synthetic_median": [0.14, 3.0, 6.0, 10.0],
+                    "original_mean": [0.15, 2.5, 4.5, 8.5],
+                    "synthetic_mean": [0.15, 3.5, 6.5, 10.0],
                 }
             ).to_csv(outcome_summary_b, index=False)
 
@@ -596,8 +596,8 @@ class SimulationTests(unittest.TestCase):
                         "reservoir_max_peak",
                     ],
                     "wasserstein_distance": [0.1, 0.2, 0.3, 0.4, 0.2, 0.1, 0.3, 0.2],
-                    "original_median": [0.2, 3.0, 2.0, 5.0, 2.0, 3.0, 1.0, 0.4],
-                    "synthetic_median": [0.3, 4.0, 3.0, 6.0, 3.0, 4.0, 1.5, 0.5],
+                    "original_mean": [0.2, 3.0, 2.0, 5.0, 2.0, 3.0, 1.0, 0.4],
+                    "synthetic_mean": [0.3, 4.0, 3.0, 6.0, 3.0, 4.0, 1.5, 0.5],
                 }
             )
             daily_mean_comparison = pd.DataFrame(
@@ -710,14 +710,14 @@ class SimulationTests(unittest.TestCase):
                     "farm_incidence_interval_coverage": [1.0],
                     "farm_cumulative_incidence_interval_coverage": [0.9],
                     "reservoir_total_interval_coverage": [0.8],
-                    "farm_attack_rate_observed_median_in_pooled_synthetic_90pct": [1.0],
-                    "farm_attack_rate_observed_median_pooled_tail_area": [0.4],
-                    "farm_peak_prevalence_observed_median_in_pooled_synthetic_90pct": [1.0],
-                    "farm_peak_prevalence_observed_median_pooled_tail_area": [0.3],
-                    "farm_peak_day_observed_median_in_pooled_synthetic_90pct": [1.0],
-                    "farm_peak_day_observed_median_pooled_tail_area": [0.5],
-                    "farm_duration_observed_median_in_pooled_synthetic_90pct": [0.0],
-                    "farm_duration_observed_median_pooled_tail_area": [0.1],
+                    "farm_attack_rate_observed_mean_in_pooled_synthetic_90pct": [1.0],
+                    "farm_attack_rate_observed_mean_pooled_tail_area": [0.4],
+                    "farm_peak_prevalence_observed_mean_in_pooled_synthetic_90pct": [1.0],
+                    "farm_peak_prevalence_observed_mean_pooled_tail_area": [0.3],
+                    "farm_peak_day_observed_mean_in_pooled_synthetic_90pct": [1.0],
+                    "farm_peak_day_observed_mean_pooled_tail_area": [0.5],
+                    "farm_duration_observed_mean_in_pooled_synthetic_90pct": [0.0],
+                    "farm_duration_observed_mean_pooled_tail_area": [0.1],
                     "farm_attack_rate_network_uncertainty_share": [0.2],
                     "farm_peak_prevalence_network_uncertainty_share": [0.3],
                     "farm_peak_day_network_uncertainty_share": [0.4],

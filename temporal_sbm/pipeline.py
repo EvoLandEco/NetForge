@@ -12,6 +12,7 @@ import pickle
 import re
 import tempfile
 import sys
+import time
 import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -2246,7 +2247,8 @@ def _posterior_partition_state(
 
 WEIGHT_GENERATOR_PAYLOAD_FORMAT = "parametric_weight_generator_v2"
 WEIGHT_GENERATOR_PAYLOAD_FORMAT_LEGACY = "parametric_weight_generator_v1"
-TEMPORAL_GENERATOR_PAYLOAD_FORMAT = "temporal_generator_model_v1"
+TEMPORAL_GENERATOR_PAYLOAD_FORMAT = "temporal_generator_model_v2"
+TEMPORAL_GENERATOR_PAYLOAD_FORMAT_LEGACY = "temporal_generator_model_v1"
 
 
 def _canonical_weight_channel(
@@ -3618,12 +3620,17 @@ def _fit_temporal_activity_counts_from_snapshot_sets(
     entity_universe: Iterable[int],
 ) -> dict[str, Any]:
     entity_list = sorted({int(entity) for entity in entity_universe})
+    observed_snapshot_sets = {
+        int(ts_value): sorted(int(entity) for entity in snapshot_sets.get(int(ts_value), set()))
+        for ts_value in timeline
+    }
     if not timeline:
         return {
             "timeline": [],
             "entities": entity_list,
             "initial_active_entities": [],
             "observed_active_counts": {},
+            "observed_snapshot_sets": {},
             "entity_counts": {},
         }
 
@@ -3665,6 +3672,10 @@ def _fit_temporal_activity_counts_from_snapshot_sets(
         "entities": entity_list,
         "initial_active_entities": sorted(int(entity) for entity in snapshot_sets.get(first_ts, set())),
         "observed_active_counts": {str(int(ts_value)): int(count) for ts_value, count in observed_active_counts.items()},
+        "observed_snapshot_sets": {
+            str(int(ts_value)): [int(entity) for entity in observed_snapshot_sets.get(int(ts_value), [])]
+            for ts_value in timeline
+        },
         "entity_counts": {
             str(int(entity)): {
                 "initial_active": int(counts["initial_active"]),
@@ -3690,6 +3701,10 @@ def _build_temporal_activity_model_from_counts(
         int(ts_value): int(count)
         for ts_value, count in dict(activity_counts.get("observed_active_counts", {})).items()
     }
+    observed_snapshot_sets = {
+        int(ts_value): {int(entity) for entity in snapshot}
+        for ts_value, snapshot in dict(activity_counts.get("observed_snapshot_sets", {})).items()
+    }
     initial_active_set = {
         int(entity)
         for entity in activity_counts.get("initial_active_entities", [])
@@ -3713,6 +3728,7 @@ def _build_temporal_activity_model_from_counts(
             "params": {},
             "initial_active_set": set(),
             "observed_active_counts": observed_active_counts,
+            "observed_snapshot_sets": observed_snapshot_sets,
             "global_initial_prob": 0.0,
             "global_p01": 0.0,
             "global_p11": 0.0,
@@ -3788,6 +3804,10 @@ def _build_temporal_activity_model_from_counts(
         "params": params,
         "initial_active_set": initial_active_set,
         "observed_active_counts": observed_active_counts,
+        "observed_snapshot_sets": {
+            int(ts_value): set(int(entity) for entity in observed_snapshot_sets.get(int(ts_value), set()))
+            for ts_value in timeline
+        },
         "global_initial_prob": float(global_initial_prob),
         "global_p01": float(global_p01),
         "global_p11": float(global_p11),
@@ -4113,7 +4133,304 @@ def _sample_fixed_count_state(
 
 
 
-def _sample_temporal_activity_states(
+
+def _temporal_activity_snapshot_match_mode_name(
+    args: argparse.Namespace,
+    *,
+    proposal_mode: str,
+    activity_level: str,
+    has_snapshot_targets: bool,
+) -> str:
+    raw_value = str(getattr(args, "temporal_activity_snapshot_match_mode", "none")).strip().lower()
+    aliases = {
+        "off": "none",
+        "disabled": "none",
+        "false": "none",
+        "target": "stored",
+        "targets": "stored",
+        "snapshot": "stored",
+        "snapshots": "stored",
+        "stored_targets": "stored",
+        "stored_snapshots": "stored",
+        "rejection": "stepwise",
+        "reject": "stepwise",
+        "step": "stepwise",
+        "stepwise": "stepwise",
+        "sequential": "stepwise",
+        "panel": "full_panel",
+        "full_panel": "full_panel",
+        "panel_search": "full_panel",
+        "panel-search": "full_panel",
+        "trajectory": "full_panel",
+        "path": "full_panel",
+        "restart": "full_panel",
+        "resimulate": "full_panel",
+        "resimulation": "full_panel",
+        "whole_panel": "full_panel",
+        "fullpath": "full_panel",
+    }
+    raw_value = aliases.get(raw_value, raw_value)
+    if raw_value not in {"none", "stored", "stepwise", "full_panel"}:
+        raise ValueError(
+            "Unknown temporal_activity_snapshot_match_mode. Use 'none', 'stored', 'stepwise', or 'full_panel'."
+        )
+    if raw_value in {"stored", "stepwise", "full_panel"} and not has_snapshot_targets:
+        raise ValueError(
+            "temporal_activity_snapshot_match_mode requires stored daily activity snapshots in the temporal generator model."
+        )
+    return raw_value
+
+
+
+def _copy_activity_snapshot_sets(
+    snapshot_sets: dict[int, set[int]],
+    timeline: list[int],
+) -> dict[int, set[int]]:
+    return {
+        int(ts_value): set(int(entity) for entity in snapshot_sets.get(int(ts_value), set()))
+        for ts_value in timeline
+    }
+
+
+
+def _activity_snapshot_day_metrics(
+    sampled_state: set[int],
+    target_state: set[int],
+) -> dict[str, Any]:
+    sampled = set(int(entity) for entity in sampled_state)
+    target = set(int(entity) for entity in target_state)
+    intersection_size = int(len(sampled & target))
+    union_size = int(len(sampled | target))
+    return {
+        "sampled_entity_count": int(len(sampled)),
+        "target_entity_count": int(len(target)),
+        "overlap_entity_count": int(intersection_size),
+        "union_entity_count": int(union_size),
+        "daily_jaccard": 1.0 if union_size <= 0 else float(intersection_size) / float(union_size),
+        "exact_match": bool(sampled == target),
+    }
+
+
+
+def _activity_snapshot_match_metrics(
+    sampled_states: dict[int, set[int]],
+    target_snapshot_sets: dict[int, set[int]],
+    timeline: list[int],
+) -> dict[str, Any]:
+    exact_daily_matches = 0
+    overlap_entity_total = 0
+    target_entity_total = 0
+    union_entity_total = 0
+    jaccard_sum = 0.0
+
+    for ts_value in timeline:
+        sampled = set(int(entity) for entity in sampled_states.get(int(ts_value), set()))
+        target = set(int(entity) for entity in target_snapshot_sets.get(int(ts_value), set()))
+        intersection_size = int(len(sampled & target))
+        union_size = int(len(sampled | target))
+        exact_daily_matches += int(sampled == target)
+        overlap_entity_total += intersection_size
+        target_entity_total += int(len(target))
+        union_entity_total += union_size
+        jaccard_sum += 1.0 if union_size <= 0 else float(intersection_size) / float(union_size)
+
+    timeline_length = int(len(timeline))
+    return {
+        "timeline_length": timeline_length,
+        "exact_daily_matches": int(exact_daily_matches),
+        "exact_daily_match_fraction": float(exact_daily_matches / timeline_length) if timeline_length > 0 else 1.0,
+        "overlap_entity_total": int(overlap_entity_total),
+        "target_entity_total": int(target_entity_total),
+        "union_entity_total": int(union_entity_total),
+        "mean_daily_jaccard": float(jaccard_sum / timeline_length) if timeline_length > 0 else 1.0,
+        "full_match": bool(timeline_length > 0 and exact_daily_matches == timeline_length),
+    }
+
+
+
+def _activity_snapshot_match_order_key(metrics: dict[str, Any]) -> tuple[int, int, int, float]:
+    sampled_count = int(metrics.get("sampled_entity_count", 0))
+    target_count = int(metrics.get("target_entity_count", 0))
+    return (
+        int(bool(metrics.get("exact_match", False))),
+        int(metrics.get("overlap_entity_count", 0)),
+        -abs(sampled_count - target_count),
+        float(metrics.get("daily_jaccard", 0.0)),
+    )
+
+
+
+def _temporal_activity_snapshot_match_attempt_budget(
+    args: argparse.Namespace,
+) -> Optional[int]:
+    raw_value = getattr(args, "temporal_activity_snapshot_match_attempts", 32)
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, str):
+        text = raw_value.strip().lower()
+        if text in {"inf", "infinity", "unbounded", "unlimited"}:
+            return None
+        raw_value = text
+    if isinstance(raw_value, (float, np.floating)) and not np.isfinite(float(raw_value)):
+        return None
+    return max(1, int(raw_value))
+
+
+def _temporal_activity_snapshot_match_attempt_budget_label(
+    requested_attempts: Optional[int],
+) -> str:
+    return "inf" if requested_attempts is None else str(int(requested_attempts))
+
+
+def _log_temporal_activity_snapshot_match_result(
+    *,
+    activity_level: str,
+    ts_value: int,
+    previous_ts: Optional[int],
+    stage: str,
+    attempts_used: int,
+    elapsed_seconds: float,
+    match_source: str,
+    metrics: dict[str, Any],
+    requested_attempts: Optional[int],
+) -> None:
+    LOGGER.info(
+        "Temporal activity snapshot match | level=%s | ts=%s | previous_ts=%s | stage=%s | attempts=%s | attempt_budget=%s | elapsed_seconds=%.6f | source=%s | overlap=%s/%s | sampled_count=%s | target_count=%s | daily_jaccard=%.6f | exact_match=%s",
+        activity_level,
+        int(ts_value),
+        None if previous_ts is None else int(previous_ts),
+        stage,
+        int(attempts_used),
+        _temporal_activity_snapshot_match_attempt_budget_label(requested_attempts),
+        float(elapsed_seconds),
+        match_source,
+        int(metrics.get("overlap_entity_count", 0)),
+        int(metrics.get("target_entity_count", 0)),
+        int(metrics.get("sampled_entity_count", 0)),
+        int(metrics.get("target_entity_count", 0)),
+        float(metrics.get("daily_jaccard", 0.0)),
+        bool(metrics.get("exact_match", False)),
+    )
+
+
+def _sample_temporal_activity_initial_state(
+    activity_model: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+    composition_targets: Optional[dict[int, dict[str, Any]]] = None,
+    composition_by_entity: Optional[dict[int, dict[str, Any]]] = None,
+    composition_mode: str = "none",
+    composition_weight: float = 0.0,
+) -> set[int]:
+    timeline = [int(ts_value) for ts_value in activity_model.get("timeline", [])]
+    entities = [int(entity) for entity in activity_model.get("entities", [])]
+    params = activity_model.get("params", {})
+    if not timeline or not entities:
+        return set()
+
+    count_constraint = str(getattr(args, "temporal_activity_count_constraint", "observed")).strip().lower()
+    initial_mode = str(getattr(args, "temporal_activity_initial", "observed")).strip().lower()
+    observed_snapshot_sets = activity_model.get("observed_snapshot_sets", {})
+    observed_active_counts = activity_model.get("observed_active_counts", {})
+    initial_active_set = {
+        int(entity)
+        for entity in activity_model.get("initial_active_set", [])
+    }
+    use_composition = bool(
+        count_constraint == "observed"
+        and composition_mode != "none"
+        and composition_targets
+        and composition_by_entity
+    )
+
+    first_ts = int(timeline[0])
+    if initial_mode == "observed":
+        if isinstance(observed_snapshot_sets, dict) and observed_snapshot_sets:
+            return set(int(entity) for entity in observed_snapshot_sets.get(first_ts, set()))
+        return set(int(entity) for entity in initial_active_set)
+
+    init_probabilities = np.asarray([float(params[int(entity)]["p_init"]) for entity in entities], dtype=float)
+    if count_constraint == "observed":
+        target_count = int(
+            observed_active_counts.get(
+                first_ts,
+                len(initial_active_set) if initial_active_set else 0,
+            )
+        )
+        return _sample_fixed_count_state(
+            entities,
+            init_probabilities,
+            target_count,
+            rng,
+            composition_mode=composition_mode if use_composition else "none",
+            composition_targets=composition_targets.get(first_ts) if use_composition and composition_targets else None,
+            composition_by_entity=composition_by_entity if use_composition else None,
+            composition_weight=float(composition_weight),
+        )
+
+    return {
+        int(entity)
+        for entity, probability in zip(entities, init_probabilities)
+        if rng.random() < float(probability)
+    }
+
+
+
+def _sample_temporal_activity_next_state(
+    current_state: set[int],
+    ts_value: int,
+    activity_model: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+    composition_targets: Optional[dict[int, dict[str, Any]]] = None,
+    composition_by_entity: Optional[dict[int, dict[str, Any]]] = None,
+    composition_mode: str = "none",
+    composition_weight: float = 0.0,
+) -> set[int]:
+    entities = [int(entity) for entity in activity_model.get("entities", [])]
+    params = activity_model.get("params", {})
+    if not entities:
+        return set()
+
+    count_constraint = str(getattr(args, "temporal_activity_count_constraint", "observed")).strip().lower()
+    observed_active_counts = activity_model.get("observed_active_counts", {})
+    use_composition = bool(
+        count_constraint == "observed"
+        and composition_mode != "none"
+        and composition_targets
+        and composition_by_entity
+    )
+
+    probabilities = np.asarray(
+        [
+            float(params[int(entity)]["p11"] if int(entity) in current_state else params[int(entity)]["p01"])
+            for entity in entities
+        ],
+        dtype=float,
+    )
+    if count_constraint == "observed":
+        return _sample_fixed_count_state(
+            entities,
+            probabilities,
+            int(observed_active_counts.get(int(ts_value), 0)),
+            rng,
+            composition_mode=composition_mode if use_composition else "none",
+            composition_targets=composition_targets.get(int(ts_value)) if use_composition and composition_targets else None,
+            composition_by_entity=composition_by_entity if use_composition else None,
+            composition_weight=float(composition_weight),
+        )
+
+    return {
+        int(entity)
+        for entity, probability in zip(entities, probabilities)
+        if rng.random() < float(probability)
+    }
+
+
+
+def _sample_temporal_activity_states_once(
     activity_model: dict[str, Any],
     *,
     rng: np.random.Generator,
@@ -4124,89 +4441,580 @@ def _sample_temporal_activity_states(
     composition_weight: float = 0.0,
 ) -> dict[int, set[int]]:
     timeline = [int(ts_value) for ts_value in activity_model.get("timeline", [])]
-    entities = [int(entity) for entity in activity_model.get("entities", [])]
-    params = activity_model.get("params", {})
-    if not timeline or not entities:
+    if not timeline:
         return {int(ts_value): set() for ts_value in timeline}
 
-    count_constraint = str(getattr(args, "temporal_activity_count_constraint", "observed")).strip().lower()
-    initial_mode = str(getattr(args, "temporal_activity_initial", "observed")).strip().lower()
-    observed_snapshot_sets = activity_model.get("observed_snapshot_sets", {})
-    observed_active_counts = activity_model.get("observed_active_counts", {})
-    initial_active_set = {
-        int(entity)
-        for entity in activity_model.get("initial_active_set", [])
-    }
-
-    use_composition = bool(
-        count_constraint == "observed"
-        and composition_mode != "none"
-        and composition_targets
-        and composition_by_entity
-    )
-
     states: dict[int, set[int]] = {}
+    current_state = _sample_temporal_activity_initial_state(
+        activity_model,
+        rng=rng,
+        args=args,
+        composition_targets=composition_targets,
+        composition_by_entity=composition_by_entity,
+        composition_mode=composition_mode,
+        composition_weight=float(composition_weight),
+    )
     first_ts = int(timeline[0])
-    if initial_mode == "observed":
-        if isinstance(observed_snapshot_sets, dict) and observed_snapshot_sets:
-            current_state = set(int(entity) for entity in observed_snapshot_sets.get(first_ts, set()))
-        else:
-            current_state = set(int(entity) for entity in initial_active_set)
-    else:
-        init_probabilities = np.asarray([float(params[int(entity)]["p_init"]) for entity in entities], dtype=float)
-        if count_constraint == "observed":
-            target_count = int(
-                observed_active_counts.get(
-                    first_ts,
-                    len(initial_active_set) if initial_active_set else 0,
-                )
-            )
-            current_state = _sample_fixed_count_state(
-                entities,
-                init_probabilities,
-                target_count,
-                rng,
-                composition_mode=composition_mode if use_composition else "none",
-                composition_targets=composition_targets.get(first_ts) if use_composition and composition_targets else None,
-                composition_by_entity=composition_by_entity if use_composition else None,
-                composition_weight=float(composition_weight),
-            )
-        else:
-            current_state = {
-                int(entity)
-                for entity, probability in zip(entities, init_probabilities)
-                if rng.random() < float(probability)
-            }
-    states[first_ts] = current_state
+    states[first_ts] = set(int(entity) for entity in current_state)
 
     for ts_value in timeline[1:]:
-        probabilities = np.asarray(
-            [
-                float(params[int(entity)]["p11"] if int(entity) in current_state else params[int(entity)]["p01"])
-                for entity in entities
-            ],
-            dtype=float,
+        current_state = _sample_temporal_activity_next_state(
+            current_state,
+            int(ts_value),
+            activity_model,
+            rng=rng,
+            args=args,
+            composition_targets=composition_targets,
+            composition_by_entity=composition_by_entity,
+            composition_mode=composition_mode,
+            composition_weight=float(composition_weight),
         )
-        if count_constraint == "observed":
-            next_state = _sample_fixed_count_state(
-                entities,
-                probabilities,
-                int(observed_active_counts.get(int(ts_value), 0)),
-                rng,
-                composition_mode=composition_mode if use_composition else "none",
-                composition_targets=composition_targets.get(int(ts_value)) if use_composition and composition_targets else None,
-                composition_by_entity=composition_by_entity if use_composition else None,
+        states[int(ts_value)] = set(int(entity) for entity in current_state)
+    return states
+
+
+
+def _raise_temporal_activity_stepwise_search_failure(
+    *,
+    activity_level: str,
+    ts_value: int,
+    previous_ts: Optional[int],
+    attempts_per_day: Optional[int],
+    matched_prefix_days: int,
+    timeline_length: int,
+    best_metrics: Optional[dict[str, Any]],
+    elapsed_seconds: float,
+) -> None:
+    context = (
+        f"from the matched state at ts={int(previous_ts)}"
+        if previous_ts is not None
+        else "while searching the initial day"
+    )
+    if best_metrics is None:
+        detail = "No candidate state could be evaluated."
+    else:
+        detail = (
+            "Best sampled overlap="
+            f"{int(best_metrics.get('overlap_entity_count', 0))}/"
+            f"{int(best_metrics.get('target_entity_count', 0))}, "
+            f"sampled_count={int(best_metrics.get('sampled_entity_count', 0))}, "
+            f"target_count={int(best_metrics.get('target_entity_count', 0))}, "
+            f"daily_jaccard={float(best_metrics.get('daily_jaccard', 0.0)):.6f}."
+        )
+    attempt_text = (
+        f"{int(attempts_per_day)} attempts"
+        if attempts_per_day is not None
+        else "an unbounded number of attempts"
+    )
+    raise RuntimeError(
+        "Step-wise temporal activity snapshot search failed "
+        f"for activity_level={activity_level!r} at ts={int(ts_value)} after "
+        f"{attempt_text} {context}. "
+        "Exact daily snapshot matching is required and no fallback is enabled. "
+        f"Matched prefix days={int(matched_prefix_days)}/{int(timeline_length)}. "
+        f"Elapsed search time={float(elapsed_seconds):.6f}s. "
+        f"{detail} Increase temporal_activity_snapshot_match_attempts, relax the "
+        "snapshot conditioning, or revisit the fitted activity model."
+    )
+
+
+
+def _sample_temporal_activity_states_stepwise_match(
+    activity_model: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+    target_snapshot_sets: dict[int, set[int]],
+    composition_targets: Optional[dict[int, dict[str, Any]]] = None,
+    composition_by_entity: Optional[dict[int, dict[str, Any]]] = None,
+    composition_mode: str = "none",
+    composition_weight: float = 0.0,
+) -> tuple[dict[int, set[int]], dict[str, Any]]:
+    timeline = [int(ts_value) for ts_value in activity_model.get("timeline", [])]
+    activity_level = str(activity_model.get("level", "node"))
+    if not timeline:
+        empty_states = {int(ts_value): set() for ts_value in timeline}
+        empty_metrics = _activity_snapshot_match_metrics(empty_states, target_snapshot_sets, timeline)
+        return empty_states, {
+            "mode": "stepwise",
+            "search_strategy": "stepwise",
+            "selected_source": "stepwise_exact_match",
+            "has_snapshot_targets": bool(target_snapshot_sets),
+            "strict_failure": True,
+            "requested_search_attempts": 0,
+            "requested_search_attempts_per_day": 0,
+            "search_attempts": 0,
+            "exact_full_match_found": True,
+            "exact_full_match_attempt": None,
+            "best_search_metrics": dict(empty_metrics),
+            "selected_metrics": dict(empty_metrics),
+            "daily_attempts": [],
+        }
+
+    requested_attempts = _temporal_activity_snapshot_match_attempt_budget(args)
+    initial_mode = str(getattr(args, "temporal_activity_initial", "observed")).strip().lower()
+    states: dict[int, set[int]] = {}
+    daily_attempts: list[dict[str, Any]] = []
+    total_attempts = 0
+
+    first_ts = int(timeline[0])
+    first_target = set(int(entity) for entity in target_snapshot_sets.get(first_ts, set()))
+    if initial_mode == "observed":
+        current_state = set(first_target)
+        first_metrics = _activity_snapshot_day_metrics(current_state, first_target)
+        elapsed_seconds = 0.0
+        daily_attempts.append(
+            {
+                "ts": int(first_ts),
+                "previous_ts": None,
+                "stage": "initial",
+                "attempts_used": 0,
+                "elapsed_seconds": float(elapsed_seconds),
+                "attempt_budget": _temporal_activity_snapshot_match_attempt_budget_label(requested_attempts),
+                "match_source": "observed_anchor",
+                **first_metrics,
+            }
+        )
+        _log_temporal_activity_snapshot_match_result(
+            activity_level=activity_level,
+            ts_value=int(first_ts),
+            previous_ts=None,
+            stage="initial",
+            attempts_used=0,
+            elapsed_seconds=elapsed_seconds,
+            match_source="observed_anchor",
+            metrics=first_metrics,
+            requested_attempts=requested_attempts,
+        )
+    else:
+        current_state = set()
+        matched = False
+        best_metrics: Optional[dict[str, Any]] = None
+        best_key: Optional[tuple[int, int, int, float]] = None
+        attempt = 0
+        search_start = time.perf_counter()
+        while requested_attempts is None or attempt < requested_attempts:
+            attempt += 1
+            candidate_state = _sample_temporal_activity_initial_state(
+                activity_model,
+                rng=rng,
+                args=args,
+                composition_targets=composition_targets,
+                composition_by_entity=composition_by_entity,
+                composition_mode=composition_mode,
                 composition_weight=float(composition_weight),
             )
-        else:
-            next_state = {
-                int(entity)
-                for entity, probability in zip(entities, probabilities)
-                if rng.random() < float(probability)
+            total_attempts += 1
+            candidate_metrics = _activity_snapshot_day_metrics(candidate_state, first_target)
+            candidate_key = _activity_snapshot_match_order_key(candidate_metrics)
+            if best_key is None or candidate_key > best_key:
+                best_key = candidate_key
+                best_metrics = candidate_metrics
+            if bool(candidate_metrics["exact_match"]):
+                elapsed_seconds = time.perf_counter() - search_start
+                current_state = set(int(entity) for entity in candidate_state)
+                states[first_ts] = set(current_state)
+                daily_attempts.append(
+                    {
+                        "ts": int(first_ts),
+                        "previous_ts": None,
+                        "stage": "initial",
+                        "attempts_used": int(attempt),
+                        "elapsed_seconds": float(elapsed_seconds),
+                        "attempt_budget": _temporal_activity_snapshot_match_attempt_budget_label(requested_attempts),
+                        "match_source": "stepwise_search",
+                        **candidate_metrics,
+                    }
+                )
+                _log_temporal_activity_snapshot_match_result(
+                    activity_level=activity_level,
+                    ts_value=int(first_ts),
+                    previous_ts=None,
+                    stage="initial",
+                    attempts_used=int(attempt),
+                    elapsed_seconds=elapsed_seconds,
+                    match_source="stepwise_search",
+                    metrics=candidate_metrics,
+                    requested_attempts=requested_attempts,
+                )
+                matched = True
+                break
+        if not matched:
+            _raise_temporal_activity_stepwise_search_failure(
+                activity_level=activity_level,
+                ts_value=int(first_ts),
+                previous_ts=None,
+                attempts_per_day=requested_attempts,
+                matched_prefix_days=0,
+                timeline_length=len(timeline),
+                best_metrics=best_metrics,
+                elapsed_seconds=time.perf_counter() - search_start,
+            )
+
+    states[first_ts] = set(int(entity) for entity in current_state)
+
+    for day_index, ts_value in enumerate(timeline[1:], start=1):
+        ts_int = int(ts_value)
+        target_state = set(int(entity) for entity in target_snapshot_sets.get(ts_int, set()))
+        matched = False
+        best_metrics = None
+        best_key = None
+        previous_ts = int(timeline[day_index - 1])
+
+        attempt = 0
+        search_start = time.perf_counter()
+        while requested_attempts is None or attempt < requested_attempts:
+            attempt += 1
+            candidate_state = _sample_temporal_activity_next_state(
+                current_state,
+                ts_int,
+                activity_model,
+                rng=rng,
+                args=args,
+                composition_targets=composition_targets,
+                composition_by_entity=composition_by_entity,
+                composition_mode=composition_mode,
+                composition_weight=float(composition_weight),
+            )
+            total_attempts += 1
+            candidate_metrics = _activity_snapshot_day_metrics(candidate_state, target_state)
+            candidate_key = _activity_snapshot_match_order_key(candidate_metrics)
+            if best_key is None or candidate_key > best_key:
+                best_key = candidate_key
+                best_metrics = candidate_metrics
+            if bool(candidate_metrics["exact_match"]):
+                elapsed_seconds = time.perf_counter() - search_start
+                current_state = set(int(entity) for entity in candidate_state)
+                states[ts_int] = set(current_state)
+                daily_attempts.append(
+                    {
+                        "ts": int(ts_int),
+                        "previous_ts": int(previous_ts),
+                        "stage": "transition",
+                        "attempts_used": int(attempt),
+                        "elapsed_seconds": float(elapsed_seconds),
+                        "attempt_budget": _temporal_activity_snapshot_match_attempt_budget_label(requested_attempts),
+                        "match_source": "stepwise_search",
+                        **candidate_metrics,
+                    }
+                )
+                _log_temporal_activity_snapshot_match_result(
+                    activity_level=activity_level,
+                    ts_value=int(ts_int),
+                    previous_ts=int(previous_ts),
+                    stage="transition",
+                    attempts_used=int(attempt),
+                    elapsed_seconds=elapsed_seconds,
+                    match_source="stepwise_search",
+                    metrics=candidate_metrics,
+                    requested_attempts=requested_attempts,
+                )
+                matched = True
+                break
+
+        if not matched:
+            _raise_temporal_activity_stepwise_search_failure(
+                activity_level=activity_level,
+                ts_value=int(ts_int),
+                previous_ts=int(previous_ts),
+                attempts_per_day=requested_attempts,
+                matched_prefix_days=len(states),
+                timeline_length=len(timeline),
+                best_metrics=best_metrics,
+                elapsed_seconds=time.perf_counter() - search_start,
+            )
+
+    selected_metrics = _activity_snapshot_match_metrics(states, target_snapshot_sets, timeline)
+    return states, {
+        "mode": "stepwise",
+        "search_strategy": "stepwise",
+        "selected_source": "stepwise_exact_match",
+        "has_snapshot_targets": True,
+        "strict_failure": True,
+        "requested_search_attempts": None if requested_attempts is None else int(requested_attempts),
+        "requested_search_attempts_per_day": None if requested_attempts is None else int(requested_attempts),
+        "search_attempts": int(total_attempts),
+        "exact_full_match_found": True,
+        "exact_full_match_attempt": None,
+        "best_search_metrics": dict(selected_metrics),
+        "selected_metrics": dict(selected_metrics),
+        "daily_attempts": daily_attempts,
+    }
+
+
+
+def _raise_temporal_activity_full_panel_search_failure(
+    *,
+    activity_level: str,
+    requested_attempts: Optional[int],
+    timeline_length: int,
+    best_metrics: Optional[dict[str, Any]],
+    elapsed_seconds: float,
+) -> None:
+    if best_metrics is None:
+        detail = "No candidate panel could be evaluated."
+    else:
+        detail = (
+            "Best sampled exact days="
+            f"{int(best_metrics.get('exact_daily_matches', 0))}/"
+            f"{int(timeline_length)}, "
+            f"overlap_entities={int(best_metrics.get('overlap_entity_total', 0))}/"
+            f"{int(best_metrics.get('target_entity_total', 0))}, "
+            f"mean_daily_jaccard={float(best_metrics.get('mean_daily_jaccard', 0.0)):.6f}."
+        )
+    attempt_text = (
+        f"{int(requested_attempts)} full-panel attempts"
+        if requested_attempts is not None
+        else "an unbounded number of full-panel attempts"
+    )
+    raise RuntimeError(
+        "Full-panel temporal activity snapshot search failed "
+        f"for activity_level={activity_level!r} after {attempt_text}. "
+        "Exact full-panel snapshot matching is required and no fallback is enabled. "
+        f"Elapsed search time={float(elapsed_seconds):.6f}s. "
+        f"{detail} Increase temporal_activity_snapshot_match_attempts, relax the "
+        "snapshot conditioning, or revisit the fitted activity model."
+    )
+
+
+
+def _sample_temporal_activity_states_full_panel_search(
+    activity_model: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+    target_snapshot_sets: dict[int, set[int]],
+    composition_targets: Optional[dict[int, dict[str, Any]]] = None,
+    composition_by_entity: Optional[dict[int, dict[str, Any]]] = None,
+    composition_mode: str = "none",
+    composition_weight: float = 0.0,
+) -> tuple[dict[int, set[int]], dict[str, Any]]:
+    timeline = [int(ts_value) for ts_value in activity_model.get("timeline", [])]
+    activity_level = str(activity_model.get("level", "node"))
+    if not timeline:
+        empty_states = {int(ts_value): set() for ts_value in timeline}
+        empty_metrics = _activity_snapshot_match_metrics(empty_states, target_snapshot_sets, timeline)
+        return empty_states, {
+            "mode": "full_panel",
+            "search_strategy": "full_panel",
+            "selected_source": "full_panel_exact_match",
+            "has_snapshot_targets": bool(target_snapshot_sets),
+            "strict_failure": True,
+            "requested_search_attempts": 0,
+            "requested_search_attempts_per_day": None,
+            "search_attempts": 0,
+            "exact_full_match_found": True,
+            "exact_full_match_attempt": None,
+            "best_search_metrics": dict(empty_metrics),
+            "selected_metrics": dict(empty_metrics),
+            "daily_attempts": [],
+        }
+
+    requested_attempts = _temporal_activity_snapshot_match_attempt_budget(args)
+    best_states: Optional[dict[int, set[int]]] = None
+    best_metrics: Optional[dict[str, Any]] = None
+    best_key: Optional[tuple[int, int, float]] = None
+    attempt = 0
+    search_start = time.perf_counter()
+
+    while requested_attempts is None or attempt < requested_attempts:
+        attempt += 1
+        candidate_states = _sample_temporal_activity_states_once(
+            activity_model,
+            rng=rng,
+            args=args,
+            composition_targets=composition_targets,
+            composition_by_entity=composition_by_entity,
+            composition_mode=composition_mode,
+            composition_weight=float(composition_weight),
+        )
+        candidate_metrics = _activity_snapshot_match_metrics(candidate_states, target_snapshot_sets, timeline)
+        candidate_key = (
+            int(candidate_metrics.get("exact_daily_matches", 0)),
+            int(candidate_metrics.get("overlap_entity_total", 0)),
+            float(candidate_metrics.get("mean_daily_jaccard", 0.0)),
+        )
+        if best_key is None or candidate_key > best_key:
+            best_states = candidate_states
+            best_metrics = candidate_metrics
+            best_key = candidate_key
+        if bool(candidate_metrics.get("full_match", False)):
+            elapsed_seconds = time.perf_counter() - search_start
+            LOGGER.info(
+                "Temporal activity full-panel search match | level=%s | attempts=%s | attempt_budget=%s | elapsed_seconds=%.6f | exact_days=%s/%s | overlap_entities=%s/%s | mean_daily_jaccard=%.6f",
+                activity_level,
+                int(attempt),
+                _temporal_activity_snapshot_match_attempt_budget_label(requested_attempts),
+                float(elapsed_seconds),
+                int(candidate_metrics.get("exact_daily_matches", 0)),
+                int(candidate_metrics.get("timeline_length", len(timeline))),
+                int(candidate_metrics.get("overlap_entity_total", 0)),
+                int(candidate_metrics.get("target_entity_total", 0)),
+                float(candidate_metrics.get("mean_daily_jaccard", 0.0)),
+            )
+            return candidate_states, {
+                "mode": "full_panel",
+                "search_strategy": "full_panel",
+                "selected_source": "full_panel_exact_match",
+                "has_snapshot_targets": True,
+                "strict_failure": True,
+                "requested_search_attempts": None if requested_attempts is None else int(requested_attempts),
+                "requested_search_attempts_per_day": None,
+                "search_attempts": int(attempt),
+                "exact_full_match_found": True,
+                "exact_full_match_attempt": int(attempt),
+                "best_search_metrics": dict(candidate_metrics),
+                "selected_metrics": dict(candidate_metrics),
+                "daily_attempts": [],
             }
-        states[int(ts_value)] = next_state
-        current_state = next_state
-    return states
+
+    _raise_temporal_activity_full_panel_search_failure(
+        activity_level=activity_level,
+        requested_attempts=requested_attempts,
+        timeline_length=len(timeline),
+        best_metrics=best_metrics,
+        elapsed_seconds=time.perf_counter() - search_start,
+    )
+
+
+
+def _sample_temporal_activity_states(
+    activity_model: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+    composition_targets: Optional[dict[int, dict[str, Any]]] = None,
+    composition_by_entity: Optional[dict[int, dict[str, Any]]] = None,
+    composition_mode: str = "none",
+    composition_weight: float = 0.0,
+) -> tuple[dict[int, set[int]], dict[str, Any]]:
+    timeline = [int(ts_value) for ts_value in activity_model.get("timeline", [])]
+    target_snapshot_sets = {
+        int(ts_value): {int(entity) for entity in snapshot}
+        for ts_value, snapshot in dict(activity_model.get("observed_snapshot_sets", {})).items()
+    }
+    proposal_mode = _temporal_proposal_mode_name(
+        args,
+        temporal_mode=_temporal_generator_mode_name(args),
+    )
+    activity_level = str(activity_model.get("level", "node"))
+    match_mode = _temporal_activity_snapshot_match_mode_name(
+        args,
+        proposal_mode=proposal_mode,
+        activity_level=activity_level,
+        has_snapshot_targets=bool(target_snapshot_sets),
+    )
+
+    if not timeline:
+        return ({int(ts_value): set() for ts_value in timeline}, {
+            "mode": match_mode,
+            "search_strategy": "none",
+            "selected_source": "empty",
+            "has_snapshot_targets": bool(target_snapshot_sets),
+            "strict_failure": bool(match_mode in {"stepwise", "full_panel"}),
+            "requested_search_attempts": 0,
+            "requested_search_attempts_per_day": 0,
+            "search_attempts": 0,
+            "exact_full_match_found": True,
+            "exact_full_match_attempt": None,
+            "best_search_metrics": None,
+            "selected_metrics": None,
+            "daily_attempts": [],
+        })
+
+    if match_mode == "stored":
+        selected_states = _copy_activity_snapshot_sets(target_snapshot_sets, timeline)
+        selected_metrics = _activity_snapshot_match_metrics(selected_states, target_snapshot_sets, timeline)
+        LOGGER.debug(
+            "Using stored temporal activity snapshots directly | level=%s | timeline=%s",
+            activity_level,
+            len(timeline),
+        )
+        return selected_states, {
+            "mode": match_mode,
+            "search_strategy": "stored",
+            "selected_source": "stored_snapshot_targets",
+            "has_snapshot_targets": True,
+            "strict_failure": False,
+            "requested_search_attempts": 0,
+            "requested_search_attempts_per_day": 0,
+            "search_attempts": 0,
+            "exact_full_match_found": True,
+            "exact_full_match_attempt": 0,
+            "best_search_metrics": dict(selected_metrics),
+            "selected_metrics": dict(selected_metrics),
+            "daily_attempts": [],
+        }
+
+    if match_mode == "stepwise":
+        LOGGER.debug(
+            "Running step-wise temporal activity snapshot search | level=%s | timeline=%s | attempts_per_day=%s",
+            activity_level,
+            len(timeline),
+            _temporal_activity_snapshot_match_attempt_budget_label(
+                _temporal_activity_snapshot_match_attempt_budget(args)
+            ),
+        )
+        return _sample_temporal_activity_states_stepwise_match(
+            activity_model,
+            rng=rng,
+            args=args,
+            target_snapshot_sets=target_snapshot_sets,
+            composition_targets=composition_targets,
+            composition_by_entity=composition_by_entity,
+            composition_mode=composition_mode,
+            composition_weight=float(composition_weight),
+        )
+
+    if match_mode == "full_panel":
+        LOGGER.debug(
+            "Running full-panel temporal activity snapshot search | level=%s | timeline=%s | attempts=%s",
+            activity_level,
+            len(timeline),
+            _temporal_activity_snapshot_match_attempt_budget_label(
+                _temporal_activity_snapshot_match_attempt_budget(args)
+            ),
+        )
+        return _sample_temporal_activity_states_full_panel_search(
+            activity_model,
+            rng=rng,
+            args=args,
+            target_snapshot_sets=target_snapshot_sets,
+            composition_targets=composition_targets,
+            composition_by_entity=composition_by_entity,
+            composition_mode=composition_mode,
+            composition_weight=float(composition_weight),
+        )
+
+    selected_states = _sample_temporal_activity_states_once(
+        activity_model,
+        rng=rng,
+        args=args,
+        composition_targets=composition_targets,
+        composition_by_entity=composition_by_entity,
+        composition_mode=composition_mode,
+        composition_weight=float(composition_weight),
+    )
+    selected_metrics = (
+        _activity_snapshot_match_metrics(selected_states, target_snapshot_sets, timeline)
+        if target_snapshot_sets
+        else None
+    )
+    return selected_states, {
+        "mode": match_mode,
+        "search_strategy": "direct",
+        "selected_source": "markov_sample",
+        "has_snapshot_targets": bool(target_snapshot_sets),
+        "strict_failure": False,
+        "requested_search_attempts": 0,
+        "requested_search_attempts_per_day": 0,
+        "search_attempts": 0,
+        "exact_full_match_found": bool(selected_metrics and selected_metrics.get("full_match")),
+        "exact_full_match_attempt": 1 if selected_metrics and selected_metrics.get("full_match") else None,
+        "best_search_metrics": None,
+        "selected_metrics": None if selected_metrics is None else dict(selected_metrics),
+        "daily_attempts": [],
+    }
 
 
 def _activity_nodes_for_timestamp(
@@ -4759,6 +5567,10 @@ def _serialise_temporal_activity_counts_payload(payload: dict[str, Any]) -> dict
             str(int(ts_value)): int(count)
             for ts_value, count in dict(payload.get("observed_active_counts", {})).items()
         },
+        "observed_snapshot_sets": {
+            str(int(ts_value)): sorted(int(entity) for entity in snapshot)
+            for ts_value, snapshot in dict(payload.get("observed_snapshot_sets", {})).items()
+        },
         "entity_counts": {
             str(int(entity)): {
                 "initial_active": int(counts.get("initial_active", 0)),
@@ -4971,6 +5783,9 @@ def _fit_temporal_generator_model(
             "has_node_types": bool(node_id_to_type),
             "fitted_block_count": int(len(set(node_id_to_block.values()))),
             "fitted_node_count": int(len(node_id_to_block)),
+            "stores_daily_activity_snapshots": True,
+            "node_snapshot_target_days": int(len(node_snapshot_sets)),
+            "block_snapshot_target_days": int(len(block_snapshot_sets)),
             "full_generative_topology_supported": True,
             "posterior_refresh_requires_observed_edges": True,
         },
@@ -4991,7 +5806,8 @@ def _prepare_temporal_targets_for_generation(
     posterior_partition_sweeps: int,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]:
     if temporal_generator_model is not None and int(posterior_partition_sweeps) <= 0:
-        if str(temporal_generator_model.get("format")) != TEMPORAL_GENERATOR_PAYLOAD_FORMAT:
+        payload_format = str(temporal_generator_model.get("format"))
+        if payload_format not in {TEMPORAL_GENERATOR_PAYLOAD_FORMAT, TEMPORAL_GENERATOR_PAYLOAD_FORMAT_LEGACY}:
             raise ValueError(
                 "Unsupported temporal generator payload format: "
                 f"{temporal_generator_model.get('format')!r}"
@@ -5296,7 +6112,7 @@ def _sample_synthetic_panel_markov_turnover(
         node_id_to_type=node_id_to_type or None,
     )
     activity_rng = np.random.default_rng(int(seed) + 7919)
-    activity_states = _sample_temporal_activity_states(
+    activity_states, activity_sampling_summary = _sample_temporal_activity_states(
         activity_model,
         rng=activity_rng,
         args=args,
@@ -5305,6 +6121,10 @@ def _sample_synthetic_panel_markov_turnover(
         composition_mode=activity_composition_mode,
         composition_weight=float(activity_composition_weight),
     )
+    activity_snapshot_targets = {
+        int(ts_value): set(int(entity) for entity in snapshot)
+        for ts_value, snapshot in dict(activity_model.get("observed_snapshot_sets", {})).items()
+    }
 
     sample_records: list[dict[str, Any]] = []
     record_columns = ["u", "i", "ts", "snapshot"] + ([weight_col] if weight_col else [])
@@ -5349,6 +6169,7 @@ def _sample_synthetic_panel_markov_turnover(
             ts_int,
             {"total": 0, "by_type": {}},
         )
+        target_activity_entities = set(int(entity) for entity in activity_snapshot_targets.get(ts_int, set()))
 
         proposal_counts: Counter[tuple[int, int]] = Counter()
         rounds_used = 0
@@ -5550,7 +6371,13 @@ def _sample_synthetic_panel_markov_turnover(
                 "proposal_rounds_used": int(rounds_used),
                 "proposal_candidate_edge_count": int(len(proposal_counts)),
                 "observed_active_entity_count": int(activity_model.get("observed_active_counts", {}).get(ts_int, 0)),
+                "activity_snapshot_target_entity_count": int(len(target_activity_entities)),
                 "sampled_active_entity_count": int(len(activity_states.get(ts_int, set()))),
+                "activity_snapshot_exact_match": (
+                    None
+                    if not activity_snapshot_targets
+                    else bool(activity_states.get(ts_int, set()) == target_activity_entities)
+                ),
                 "observed_active_node_count": int(observed_activity_target.get("total", 0)),
                 "sampled_active_node_count": int(len(active_nodes)),
                 "eligible_active_node_count": int(len(active_nodes)),
@@ -5647,7 +6474,9 @@ def _sample_synthetic_panel_markov_turnover(
             "global_initial_prob": float(activity_model.get("global_initial_prob", 0.0)),
             "global_p01": float(activity_model.get("global_p01", 0.0)),
             "global_p11": float(activity_model.get("global_p11", 0.0)),
+            "stores_snapshot_targets": bool(activity_snapshot_targets),
         },
+        "activity_snapshot_matching": _json_ready(activity_sampling_summary),
         "realized_activity_targets": {
             "types": _json_ready(observed_realized_activity_targets.get("types", [])),
             "mean_active_node_shortfall": float(mean_active_node_shortfall),
@@ -5703,6 +6532,12 @@ def _sample_synthetic_panel_markov_turnover(
             "temporal_realized_activity_weight": float(realized_activity_weight),
             "temporal_activity_count_constraint": str(getattr(args, "temporal_activity_count_constraint", "observed")).strip().lower(),
             "temporal_activity_initial": str(getattr(args, "temporal_activity_initial", "observed")).strip().lower(),
+            "temporal_activity_snapshot_match_mode": str(activity_sampling_summary.get("mode", "none")),
+            "temporal_activity_snapshot_match_strategy": str(activity_sampling_summary.get("search_strategy", "none")),
+            "temporal_activity_snapshot_match_strict_failure": bool(activity_sampling_summary.get("strict_failure", False)),
+            "temporal_activity_snapshot_match_attempts": _json_ready(activity_sampling_summary.get("requested_search_attempts")),
+            "temporal_activity_snapshot_match_attempts_per_day": _json_ready(activity_sampling_summary.get("requested_search_attempts_per_day")),
+            "temporal_activity_snapshot_selected_source": str(activity_sampling_summary.get("selected_source", "markov_sample")),
             "temporal_proposal_rounds": int(proposal_rounds_min),
             "temporal_proposal_rounds_max": int(proposal_rounds_max),
             "temporal_random_proposal_multiplier": float(random_proposal_multiplier),
@@ -5715,6 +6550,7 @@ def _sample_synthetic_panel_markov_turnover(
             "group_mode": group_mode,
             "activity_composition_mode": activity_composition_mode,
             "realized_activity_mode": realized_activity_mode,
+            "activity_snapshot_matching": _json_ready(activity_sampling_summary),
             "proposal_rounds_min": int(proposal_rounds_min),
             "proposal_rounds_max": int(proposal_rounds_max),
             "random_proposal_multiplier": float(random_proposal_multiplier),

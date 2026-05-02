@@ -4,6 +4,7 @@
 
 # Python cache and local tooling
 __pycache__/
+.cache/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/

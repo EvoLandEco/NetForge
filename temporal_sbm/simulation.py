@@ -1382,10 +1382,11 @@ def _summarise_daily_arrays(
             values = np.asarray(matrix[:, day_index], dtype=float)
             finite = values[np.isfinite(values)]
             if len(finite):
-                row[metric_name] = float(np.median(finite))
+                mean_value = float(np.mean(finite))
+                row[metric_name] = mean_value
                 row[f"{metric_name}_q05"] = float(np.quantile(finite, 0.05))
                 row[f"{metric_name}_q95"] = float(np.quantile(finite, 0.95))
-                row[f"{metric_name}_mean"] = float(np.mean(finite))
+                row[f"{metric_name}_mean"] = mean_value
                 row[f"{metric_name}_std"] = float(np.std(finite, ddof=0))
             else:
                 row[metric_name] = np.nan
@@ -1434,10 +1435,11 @@ def _summarise_region_daily_arrays(
                 values = np.asarray(matrix[:, region_index, day_index], dtype=float)
                 finite = values[np.isfinite(values)]
                 if len(finite):
-                    row[metric_name] = float(np.median(finite))
+                    mean_value = float(np.mean(finite))
+                    row[metric_name] = mean_value
                     row[f"{metric_name}_q05"] = float(np.quantile(finite, 0.05))
                     row[f"{metric_name}_q95"] = float(np.quantile(finite, 0.95))
-                    row[f"{metric_name}_mean"] = float(np.mean(finite))
+                    row[f"{metric_name}_mean"] = mean_value
                     row[f"{metric_name}_std"] = float(np.std(finite, ddof=0))
                 else:
                     row[metric_name] = np.nan
@@ -1554,7 +1556,6 @@ def _summarise_rf_pathway_fields(
         "positive_rf_farm_count": np.zeros((run_count, day_count), dtype=float),
         "positive_rf_union_7d_farm_count": np.zeros((run_count, day_count), dtype=float),
         "positive_rf_indegree_mean": np.zeros((run_count, day_count), dtype=float),
-        "positive_rf_indegree_median": np.zeros((run_count, day_count), dtype=float),
         "positive_rf_indegree_q95": np.zeros((run_count, day_count), dtype=float),
         "positive_rf_indegree_max": np.zeros((run_count, day_count), dtype=float),
     }
@@ -1580,7 +1581,6 @@ def _summarise_rf_pathway_fields(
             arrays["positive_rf_farm_count"][run_index, day_index] = float(np.sum(reached))
             arrays["positive_rf_union_7d_farm_count"][run_index, day_index] = float(np.sum(union_mask))
             arrays["positive_rf_indegree_mean"][run_index, day_index] = float(np.mean(indegree))
-            arrays["positive_rf_indegree_median"][run_index, day_index] = float(np.median(indegree))
             arrays["positive_rf_indegree_q95"][run_index, day_index] = float(np.quantile(indegree, 0.95))
             arrays["positive_rf_indegree_max"][run_index, day_index] = float(np.max(indegree)) if len(indegree) else 0.0
             if hazard_metric_name:
@@ -1749,7 +1749,7 @@ def _summarise_farm_node_arrays(
         return pd.DataFrame(columns=[
             "node_id", "ubn", "corop", "x", "y", "display_label",
             "seed_probability", "ever_infected_probability", "network_generated_attack_probability",
-            "first_infection_day_mean", "first_infection_day_median",
+            "first_infection_day_mean",
             "first_infection_day_q05", "first_infection_day_q95",
         ])
 
@@ -1796,12 +1796,10 @@ def _summarise_farm_node_arrays(
         }
         if len(finite_first):
             row["first_infection_day_mean"] = float(np.mean(finite_first))
-            row["first_infection_day_median"] = float(np.median(finite_first))
             row["first_infection_day_q05"] = float(np.quantile(finite_first, 0.05))
             row["first_infection_day_q95"] = float(np.quantile(finite_first, 0.95))
         else:
             row["first_infection_day_mean"] = np.nan
-            row["first_infection_day_median"] = np.nan
             row["first_infection_day_q05"] = np.nan
             row["first_infection_day_q95"] = np.nan
         rows.append(row)
@@ -1828,7 +1826,7 @@ def _merge_farm_node_summaries(
             original_series = merged[original_col] if original_col in merged.columns else pd.Series([np.nan] * len(merged), index=merged.index)
             synthetic_series = merged[synthetic_col] if synthetic_col in merged.columns else pd.Series([np.nan] * len(merged), index=merged.index)
             merged[meta] = original_series.where(original_series.notna(), synthetic_series)
-    for metric_name in ["network_generated_attack_probability", "ever_infected_probability", "first_infection_day_median", "first_infection_day_mean"]:
+    for metric_name in ["network_generated_attack_probability", "ever_infected_probability", "first_infection_day_mean"]:
         original_col = f"original_{metric_name}"
         synthetic_col = f"synthetic_{metric_name}"
         if original_col in merged.columns and synthetic_col in merged.columns:
@@ -1843,25 +1841,25 @@ def _summarise_farm_corop_fit(farm_merged: pd.DataFrame) -> pd.DataFrame:
             "original_network_generated_attack_probability",
             "synthetic_network_generated_attack_probability",
             "network_generated_attack_probability_delta",
-            "original_first_infection_day_median",
-            "synthetic_first_infection_day_median",
-            "first_infection_day_median_delta",
+            "original_first_infection_day_mean",
+            "synthetic_first_infection_day_mean",
+            "first_infection_day_mean_delta",
             "farm_count",
         ])
     rows: list[dict[str, object]] = []
     for corop, group in farm_merged.groupby("corop", dropna=False, sort=True):
         original_attack = pd.to_numeric(group.get("original_network_generated_attack_probability", np.nan), errors="coerce")
         synthetic_attack = pd.to_numeric(group.get("synthetic_network_generated_attack_probability", np.nan), errors="coerce")
-        original_first = pd.to_numeric(group.get("original_first_infection_day_median", np.nan), errors="coerce")
-        synthetic_first = pd.to_numeric(group.get("synthetic_first_infection_day_median", np.nan), errors="coerce")
+        original_first = pd.to_numeric(group.get("original_first_infection_day_mean", np.nan), errors="coerce")
+        synthetic_first = pd.to_numeric(group.get("synthetic_first_infection_day_mean", np.nan), errors="coerce")
         rows.append({
             "corop": str(corop),
             "original_network_generated_attack_probability": float(original_attack.mean()) if original_attack.notna().any() else np.nan,
             "synthetic_network_generated_attack_probability": float(synthetic_attack.mean()) if synthetic_attack.notna().any() else np.nan,
             "network_generated_attack_probability_delta": float((synthetic_attack - original_attack).mean()) if original_attack.notna().any() and synthetic_attack.notna().any() else np.nan,
-            "original_first_infection_day_median": float(original_first.mean()) if original_first.notna().any() else np.nan,
-            "synthetic_first_infection_day_median": float(synthetic_first.mean()) if synthetic_first.notna().any() else np.nan,
-            "first_infection_day_median_delta": float((synthetic_first - original_first).mean()) if original_first.notna().any() and synthetic_first.notna().any() else np.nan,
+            "original_first_infection_day_mean": float(original_first.mean()) if original_first.notna().any() else np.nan,
+            "synthetic_first_infection_day_mean": float(synthetic_first.mean()) if synthetic_first.notna().any() else np.nan,
+            "first_infection_day_mean_delta": float((synthetic_first - original_first).mean()) if original_first.notna().any() and synthetic_first.notna().any() else np.nan,
             "farm_count": int(len(group)),
         })
     return pd.DataFrame(rows)
@@ -2052,10 +2050,7 @@ def _summarise_outcome_distribution_comparison(
                 "metric": metric_name,
                 "original_mean": float(np.mean(observed)) if len(observed) else np.nan,
                 "synthetic_mean": float(np.mean(synthetic)) if len(synthetic) else np.nan,
-                "original_median": float(np.median(observed)) if len(observed) else np.nan,
-                "synthetic_median": float(np.median(synthetic)) if len(synthetic) else np.nan,
                 "mean_delta": float(np.mean(synthetic) - np.mean(observed)) if len(observed) and len(synthetic) else np.nan,
-                "median_delta": float(np.median(synthetic) - np.median(observed)) if len(observed) and len(synthetic) else np.nan,
                 "wasserstein_distance": _wasserstein_distance_1d(observed, synthetic),
                 "correlation": _safe_correlation(observed, synthetic) if len(observed) == len(synthetic) else np.nan,
                 "replicate_count_original": int(len(observed)),
@@ -2105,7 +2100,6 @@ def _summarise_daily_interval_calibration(
             "valid_count": 0,
             "interval_coverage": np.nan,
             "mean_interval_width": np.nan,
-            "median_interval_width": np.nan,
             "mean_abs_exceedance": np.nan,
             "max_abs_exceedance": np.nan,
             "mean_abs_delta_to_synthetic_center": np.nan,
@@ -2124,7 +2118,6 @@ def _summarise_daily_interval_calibration(
             "valid_count": 0,
             "interval_coverage": np.nan,
             "mean_interval_width": np.nan,
-            "median_interval_width": np.nan,
             "mean_abs_exceedance": np.nan,
             "max_abs_exceedance": np.nan,
             "mean_abs_delta_to_synthetic_center": np.nan,
@@ -2145,7 +2138,6 @@ def _summarise_daily_interval_calibration(
         "valid_count": int(len(obs)),
         "interval_coverage": float(np.mean(inside)),
         "mean_interval_width": float(np.mean(width)),
-        "median_interval_width": float(np.median(width)),
         "mean_abs_exceedance": float(np.mean(exceedance)),
         "max_abs_exceedance": float(np.max(exceedance)) if len(exceedance) else np.nan,
         "mean_abs_delta_to_synthetic_center": float(np.mean(np.abs(obs - syn))),
@@ -2220,38 +2212,25 @@ def _summarise_scalar_calibration(
             "metric": metric_name,
             "metric_type": "scalar",
             "observed_mean": np.nan,
-            "observed_median": np.nan,
             "synthetic_mean": np.nan,
-            "synthetic_median": np.nan,
             "synthetic_q05": np.nan,
             "synthetic_q95": np.nan,
             "synthetic_interval_width": np.nan,
-            "observed_median_in_synthetic_90pct": np.nan,
             "observed_mean_in_synthetic_90pct": np.nan,
-            "observed_median_percentile": np.nan,
-            "observed_median_tail_area": np.nan,
             "observed_mean_percentile": np.nan,
             "observed_mean_tail_area": np.nan,
-            "abs_gap_to_interval_median": np.nan,
             "abs_gap_to_interval_mean": np.nan,
         }
 
     observed_mean = float(np.mean(observed))
-    observed_median = float(np.median(observed))
     synthetic_mean = float(np.mean(synthetic))
-    synthetic_median = float(np.median(synthetic))
     synthetic_q05 = float(np.quantile(synthetic, 0.05))
     synthetic_q95 = float(np.quantile(synthetic, 0.95))
     interval_width = float(synthetic_q95 - synthetic_q05)
 
-    median_percentile = float(np.mean(synthetic <= observed_median))
     mean_percentile = float(np.mean(synthetic <= observed_mean))
-    median_tail = float(min(1.0, 2.0 * min(median_percentile, 1.0 - median_percentile)))
     mean_tail = float(min(1.0, 2.0 * min(mean_percentile, 1.0 - mean_percentile)))
 
-    median_gap = 0.0 if synthetic_q05 <= observed_median <= synthetic_q95 else (
-        synthetic_q05 - observed_median if observed_median < synthetic_q05 else observed_median - synthetic_q95
-    )
     mean_gap = 0.0 if synthetic_q05 <= observed_mean <= synthetic_q95 else (
         synthetic_q05 - observed_mean if observed_mean < synthetic_q05 else observed_mean - synthetic_q95
     )
@@ -2260,19 +2239,13 @@ def _summarise_scalar_calibration(
         "metric": metric_name,
         "metric_type": "scalar",
         "observed_mean": observed_mean,
-        "observed_median": observed_median,
         "synthetic_mean": synthetic_mean,
-        "synthetic_median": synthetic_median,
         "synthetic_q05": synthetic_q05,
         "synthetic_q95": synthetic_q95,
         "synthetic_interval_width": interval_width,
-        "observed_median_in_synthetic_90pct": float(synthetic_q05 <= observed_median <= synthetic_q95),
         "observed_mean_in_synthetic_90pct": float(synthetic_q05 <= observed_mean <= synthetic_q95),
-        "observed_median_percentile": median_percentile,
-        "observed_median_tail_area": median_tail,
         "observed_mean_percentile": mean_percentile,
         "observed_mean_tail_area": mean_tail,
-        "abs_gap_to_interval_median": float(abs(median_gap)),
         "abs_gap_to_interval_mean": float(abs(mean_gap)),
     }
 
@@ -2994,8 +2967,8 @@ def _compare_simulation_outputs(
             farm_attack_probability_moran_synthetic = _global_moran_i(syn_attack, coords)
             if np.isfinite(farm_attack_probability_moran_original) and np.isfinite(farm_attack_probability_moran_synthetic):
                 farm_attack_probability_moran_abs_delta = float(abs(farm_attack_probability_moran_synthetic - farm_attack_probability_moran_original))
-        original_first = pd.to_numeric(farm_spatial_summary.get("original_first_infection_day_median", np.nan), errors="coerce")
-        synthetic_first = pd.to_numeric(farm_spatial_summary.get("synthetic_first_infection_day_median", np.nan), errors="coerce")
+        original_first = pd.to_numeric(farm_spatial_summary.get("original_first_infection_day_mean", np.nan), errors="coerce")
+        synthetic_first = pd.to_numeric(farm_spatial_summary.get("synthetic_first_infection_day_mean", np.nan), errors="coerce")
         valid_first = original_first.notna() & synthetic_first.notna()
         if bool(valid_first.any()):
             obs_first = original_first.loc[valid_first].to_numpy(dtype=float)
@@ -3091,13 +3064,13 @@ def _compare_simulation_outputs(
         "positive_rf_indegree_mean_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "positive_rf_indegree_mean", "mean_abs_delta"),
         "positive_rf_indegree_q95_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "positive_rf_indegree_q95", "mean_abs_delta"),
         "rf_observed_field_hazard_mean_curve_mae": _calibration_lookup(daily_mean_comparison, "rf_observed_field_hazard", "mean_abs_delta"),
-        "farm_attack_rate_observed_median_in_synthetic_90pct": _calibration_lookup(scalar_calibration, "farm_attack_rate", "observed_median_in_synthetic_90pct"),
-        "farm_attack_rate_observed_median_tail_area": _calibration_lookup(scalar_calibration, "farm_attack_rate", "observed_median_tail_area"),
+        "farm_attack_rate_observed_mean_in_synthetic_90pct": _calibration_lookup(scalar_calibration, "farm_attack_rate", "observed_mean_in_synthetic_90pct"),
+        "farm_attack_rate_observed_mean_tail_area": _calibration_lookup(scalar_calibration, "farm_attack_rate", "observed_mean_tail_area"),
         "farm_attack_rate_synthetic_interval_width": _calibration_lookup(scalar_calibration, "farm_attack_rate", "synthetic_interval_width"),
-        "farm_peak_prevalence_observed_median_in_synthetic_90pct": _calibration_lookup(scalar_calibration, "farm_peak_prevalence", "observed_median_in_synthetic_90pct"),
-        "farm_peak_prevalence_observed_median_tail_area": _calibration_lookup(scalar_calibration, "farm_peak_prevalence", "observed_median_tail_area"),
-        "farm_duration_observed_median_in_synthetic_90pct": _calibration_lookup(scalar_calibration, "farm_duration_days", "observed_median_in_synthetic_90pct"),
-        "farm_duration_observed_median_tail_area": _calibration_lookup(scalar_calibration, "farm_duration_days", "observed_median_tail_area"),
+        "farm_peak_prevalence_observed_mean_in_synthetic_90pct": _calibration_lookup(scalar_calibration, "farm_peak_prevalence", "observed_mean_in_synthetic_90pct"),
+        "farm_peak_prevalence_observed_mean_tail_area": _calibration_lookup(scalar_calibration, "farm_peak_prevalence", "observed_mean_tail_area"),
+        "farm_duration_observed_mean_in_synthetic_90pct": _calibration_lookup(scalar_calibration, "farm_duration_days", "observed_mean_in_synthetic_90pct"),
+        "farm_duration_observed_mean_tail_area": _calibration_lookup(scalar_calibration, "farm_duration_days", "observed_mean_tail_area"),
         "farm_prevalence_best_lag_correlation": _calibration_lookup(lag_diagnostics, "farm_prevalence", "best_lag_correlation"),
         "farm_prevalence_best_lag_days": _calibration_lookup(lag_diagnostics, "farm_prevalence", "best_lag_days"),
         "farm_incidence_best_lag_correlation": _calibration_lookup(lag_diagnostics, "farm_incidence", "best_lag_correlation"),
@@ -3246,7 +3219,7 @@ def _aggregate_grouped_numeric_frames(
             numeric = pd.to_numeric(series, errors="coerce")
             finite = numeric[np.isfinite(numeric.to_numpy(dtype=float))]
             if len(finite):
-                row[column] = float(finite.median())
+                row[column] = float(finite.mean())
                 if row["posterior_num_runs"] > 1:
                     row[f"{column}_q05"] = float(finite.quantile(0.05))
                     row[f"{column}_q95"] = float(finite.quantile(0.95))
@@ -3282,7 +3255,7 @@ def _aggregate_summary_payloads(
         numeric = pd.to_numeric(series, errors="coerce")
         finite = numeric[np.isfinite(numeric.to_numpy(dtype=float))]
         if len(finite):
-            payload[column] = float(finite.median())
+            payload[column] = float(finite.mean())
             if len(summaries) > 1:
                 payload[f"{column}_q05"] = float(finite.quantile(0.05))
                 payload[f"{column}_q95"] = float(finite.quantile(0.95))
@@ -3417,8 +3390,8 @@ def _plot_metric_panel(
     summary_value: Optional[object] = None,
     lower_column: Optional[str] = None,
     upper_column: Optional[str] = None,
-    observed_label: str = "Observed median",
-    synthetic_label: str = "Synthetic median",
+    observed_label: str = "Observed mean",
+    synthetic_label: str = "Synthetic mean",
 ) -> None:
     _plot_line_with_band(
         ax,
@@ -3458,7 +3431,7 @@ def _plot_dashboard_scorecard(ax, summary: dict) -> None:
         f"Model: {summary.get('simulation_model', 'unknown')}",
         f"Replicates: {int(summary.get('num_replicates', 0) or 0)}",
         f"Prevalence corr: {_metric_text(summary.get('farm_prevalence_curve_correlation'))}",
-        f"Incidence median corr: {_metric_text(summary.get('farm_incidence_curve_correlation'))}",
+        f"Incidence corr: {_metric_text(summary.get('farm_incidence_curve_correlation'))}",
         f"Attack W1: {_metric_text(summary.get('farm_attack_rate_wasserstein'))}",
         f"Peak W1: {_metric_text(summary.get('farm_peak_prevalence_wasserstein'))}",
         f"Duration W1: {_metric_text(summary.get('farm_duration_wasserstein'))}",
@@ -3596,14 +3569,14 @@ def _write_sample_parity_plot(
     fig.suptitle(f"Farm-outcome parity: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
 
     for ax, (_, row) in zip(axes_array, plot_metrics.iterrows()):
-        original = float(pd.to_numeric(pd.Series([row["original_median"]]), errors="coerce").fillna(0.0).iloc[0])
-        synthetic = float(pd.to_numeric(pd.Series([row["synthetic_median"]]), errors="coerce").fillna(0.0).iloc[0])
+        original = float(pd.to_numeric(pd.Series([row["original_mean"]]), errors="coerce").fillna(0.0).iloc[0])
+        synthetic = float(pd.to_numeric(pd.Series([row["synthetic_mean"]]), errors="coerce").fillna(0.0).iloc[0])
         limit = max(original, synthetic, 1e-6)
         ax.scatter([original], [synthetic], s=80, color=PLOT_COLORS["accent"], edgecolors="white", linewidths=0.8)
         ax.plot([0.0, limit * 1.05], [0.0, limit * 1.05], linestyle="--", color=PLOT_COLORS["neutral"], linewidth=1.2)
         ax.set_title(row["metric"].replace("_", " ").title())
-        ax.set_xlabel("Observed median")
-        ax.set_ylabel("Synthetic median")
+        ax.set_xlabel("Observed mean")
+        ax.set_ylabel("Synthetic mean")
         ax.set_xlim(0.0, limit * 1.08)
         ax.set_ylim(0.0, limit * 1.08)
     for ax in axes_array[len(plot_metrics):]:
@@ -3634,7 +3607,7 @@ def _write_curve_delta_plot(
     fig, axes = plt.subplots(2, 2, figsize=(13.2, 9.2), constrained_layout=True)
     axes_array = np.atleast_1d(axes).ravel()
     _style_figure(fig, axes_array)
-    fig.suptitle(f"Observed vs synthetic median trajectory deltas: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
+    fig.suptitle(f"Observed vs synthetic mean trajectory deltas: {sample_label}", fontsize=16, fontweight="bold", color=PLOT_COLORS["text"])
     x_values = per_snapshot["day_index"].to_numpy(dtype=float)
     for ax, (column, title) in zip(axes_array, metric_specs):
         values = _frame_numeric_series(per_snapshot, column).fillna(0.0).to_numpy(dtype=float)
@@ -4439,20 +4412,30 @@ def _write_outcome_distribution_plot(
         if len(observed) == 0 and len(synthetic) == 0:
             ax.text(0.5, 0.5, "No replicate data", ha="center", va="center", transform=ax.transAxes)
             continue
-        box = ax.boxplot(
-            [observed if len(observed) else np.array([np.nan]), synthetic if len(synthetic) else np.array([np.nan])],
-            patch_artist=True,
-            widths=0.55,
-        )
-        for patch, color in zip(box["boxes"], [PLOT_COLORS["original"], PLOT_COLORS["synthetic"]]):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.28)
-            patch.set_edgecolor(color)
-        for median in box["medians"]:
-            median.set_color(PLOT_COLORS["text"])
-            median.set_linewidth(1.8)
+        for position, values, color, label in [
+            (1.0, observed, PLOT_COLORS["original"], "Observed"),
+            (2.0, synthetic, PLOT_COLORS["synthetic"], "Synthetic"),
+        ]:
+            if len(values) == 0:
+                continue
+            q05 = float(np.quantile(values, 0.05))
+            q95 = float(np.quantile(values, 0.95))
+            mean_value = float(np.mean(values))
+            jitter = np.linspace(-0.08, 0.08, num=len(values)) if len(values) > 1 else np.asarray([0.0])
+            ax.scatter(
+                np.full(len(values), position, dtype=float) + jitter,
+                values,
+                s=20,
+                color=color,
+                alpha=0.36,
+                edgecolors="none",
+                label=label,
+                zorder=2,
+            )
+            ax.vlines(position, q05, q95, color=color, linewidth=6.0, alpha=0.22, zorder=1)
+            ax.scatter([position], [mean_value], s=92, color=color, edgecolors="white", linewidths=1.0, zorder=3)
         ax.set_xticks([1, 2], ["Observed", "Synthetic"])
-        ax.set_title(f"{title} (W1={_metric_text(_metric_lookup(outcome_summary, metric_name, 'wasserstein_distance'), digits=3)})")
+        ax.set_title(f"{title} mean (W1={_metric_text(_metric_lookup(outcome_summary, metric_name, 'wasserstein_distance'), digits=3)})")
         ax.set_ylabel(title)
 
     primary_subset = outcome_summary.loc[
@@ -4600,7 +4583,7 @@ def _simulation_figure_reading_notes(*, include_scenario_overview: bool = False)
             ),
             (
                 "Farm incidence panel",
-                "This panel uses the daywise mean rather than the median because sparse outbreaks often leave the daily median at zero for long stretches. Read it together with the uncertainty band, not as a single deterministic curve.",
+                "This panel uses the daywise mean across replicates. Read it together with the uncertainty band, not as a single deterministic curve.",
             ),
             (
                 "Infection-event probability panel",
@@ -4608,15 +4591,15 @@ def _simulation_figure_reading_notes(*, include_scenario_overview: bool = False)
             ),
             (
                 "Delta view",
-                "Delta curves are synthetic minus observed medians. Long runs above zero mean the synthetic process overshoots the observed panel, while long runs below zero mean it misses sustained activity.",
+                "Delta curves are synthetic minus observed means. Long runs above zero mean the synthetic process overshoots the observed panel, while long runs below zero mean it misses sustained activity.",
             ),
             (
                 "Daily mean view",
-                "The daily mean figure shows the average trajectory across replicates. It is useful when the daily median stays at zero and hides timing or magnitude shifts that are visible in the mean.",
+                "The daily mean figure shows the average trajectory across replicates. It is useful for seeing timing or magnitude shifts in sparse outbreak runs.",
             ),
             (
                 "Distribution and parity views",
-                "The distribution figure shows the full replicate spread for scalar endpoints such as attack rate, peak size, peak day, and duration. The parity figure condenses each endpoint to observed versus synthetic medians for fast scanning.",
+                "The distribution figure shows the full replicate spread for scalar endpoints such as attack rate, peak size, peak day, and duration. The parity figure condenses each endpoint to observed versus synthetic means for fast scanning.",
             ),
             (
                 "Hybrid-channel diagnostics",
@@ -4672,7 +4655,7 @@ def _simulation_table_reading_notes(*, include_scenario_scorecard: bool = False)
             ),
             (
                 "Scalar in-band flags and tail area",
-                "An in-band value of 1 means the observed median falls inside the synthetic 90% interval. Tail area close to 1 means the observed median sits near the center of the synthetic distribution, while values near 0 mean it lands in the tails.",
+                "An in-band value of 1 means the observed mean falls inside the synthetic 90% interval. Tail area close to 1 means the observed mean sits near the center of the synthetic distribution, while values near 0 mean it lands in the tails.",
             ),
             (
                 "Network uncertainty share",
@@ -4981,7 +4964,7 @@ def write_report(
             "",
             "## Distribution-level temporal diagnostics",
             "",
-            "These metrics compare the full replicate distribution of trajectories rather than only their medians. Energy distance measures overall ensemble mismatch; the lag diagnostics show whether synthetic curves line up better after a small phase shift.",
+            "These metrics compare the full replicate distribution of trajectories rather than only the center curves. Energy distance measures overall ensemble mismatch; the lag diagnostics show whether synthetic curves line up better after a small phase shift.",
             "",
             f"- Farm prevalence trajectory energy distance: {_metric_text(summary.get('farm_prevalence_trajectory_energy_distance'))}",
             f"- Farm incidence trajectory energy distance: {_metric_text(summary.get('farm_incidence_trajectory_energy_distance'))}",
@@ -4995,7 +4978,7 @@ def write_report(
             "",
             "## Daily mean comparison",
             "",
-            "These metrics compare the mean trajectory across replicates for each day. They are useful when daily medians stay flat for long stretches and hide smaller timing shifts.",
+            "These metrics compare the mean trajectory across replicates for each day. They are useful for sparse trajectories where smaller timing shifts can be hard to see.",
             "",
             "| Metric | Mean-curve corr | Mean abs daily gap | RMSE | Max abs daily gap |",
             "|---|---:|---:|---:|---:|",
@@ -5030,13 +5013,13 @@ def write_report(
                 "",
                 "### Scalar-outcome calibration against synthetic 90% intervals",
                 "",
-                "| Metric | Observed median in synthetic 90% interval | Tail area | Interval width |",
+                "| Metric | Observed mean in synthetic 90% interval | Tail area | Interval width |",
                 "|---|---:|---:|---:|",
             ])
             for _, row in scalar_calibration.iterrows():
                 metric = str(row.get("metric", ""))
-                in_interval = _metric_text(row.get("observed_median_in_synthetic_90pct"), digits=0)
-                tail = _metric_text(row.get("observed_median_tail_area"), digits=3)
+                in_interval = _metric_text(row.get("observed_mean_in_synthetic_90pct"), digits=0)
+                tail = _metric_text(row.get("observed_mean_tail_area"), digits=3)
                 width = _metric_text(row.get("synthetic_interval_width"), digits=3)
                 lines.append(f"| {metric} | {in_interval} | {tail} | {width} |")
 
@@ -5047,15 +5030,15 @@ def write_report(
             "",
             "The table below separates between-panel variability (network uncertainty) from within-panel epidemic stochasticity using the repeated synthetic samples available for this setting.",
             "",
-            "| Metric | Network uncertainty share | Epidemic stochasticity share | Observed median in pooled synthetic 90% interval | Pooled tail area |",
+            "| Metric | Network uncertainty share | Epidemic stochasticity share | Observed mean in pooled synthetic 90% interval | Pooled tail area |",
             "|---|---:|---:|---:|---:|",
         ])
         for _, row in uncertainty_decomposition.iterrows():
             metric = str(row.get("metric", ""))
             network_share = _metric_text(row.get("network_uncertainty_share"), digits=3)
             epidemic_share = _metric_text(row.get("epidemic_stochasticity_share"), digits=3)
-            in_interval = _metric_text(row.get("observed_median_in_pooled_synthetic_90pct"), digits=0)
-            tail = _metric_text(row.get("observed_median_pooled_tail_area"), digits=3)
+            in_interval = _metric_text(row.get("observed_mean_in_pooled_synthetic_90pct"), digits=0)
+            tail = _metric_text(row.get("observed_mean_pooled_tail_area"), digits=3)
             lines.append(f"| {metric} | {network_share} | {epidemic_share} | {in_interval} | {tail} |")
 
     lines.extend(
@@ -5197,12 +5180,12 @@ def _summary_payload_to_row(label: str, payload: dict[str, object]) -> Optional[
         "reservoir_total_mean_curve_mae",
         "reservoir_max_mean_curve_mae",
         "reservoir_positive_regions_mean_curve_mae",
-        "farm_attack_rate_observed_median_in_synthetic_90pct",
-        "farm_attack_rate_observed_median_tail_area",
-        "farm_peak_prevalence_observed_median_in_synthetic_90pct",
-        "farm_peak_prevalence_observed_median_tail_area",
-        "farm_duration_observed_median_in_synthetic_90pct",
-        "farm_duration_observed_median_tail_area",
+        "farm_attack_rate_observed_mean_in_synthetic_90pct",
+        "farm_attack_rate_observed_mean_tail_area",
+        "farm_peak_prevalence_observed_mean_in_synthetic_90pct",
+        "farm_peak_prevalence_observed_mean_tail_area",
+        "farm_duration_observed_mean_in_synthetic_90pct",
+        "farm_duration_observed_mean_tail_area",
         "farm_prevalence_best_lag_correlation",
         "farm_prevalence_best_lag_days",
         "farm_incidence_best_lag_correlation",
@@ -5227,24 +5210,24 @@ def _summary_payload_to_row(label: str, payload: dict[str, object]) -> Optional[
         "farm_corop_attack_probability_mae",
         "farm_attack_rate_network_uncertainty_share",
         "farm_attack_rate_epidemic_stochasticity_share",
-        "farm_attack_rate_observed_median_in_pooled_synthetic_90pct",
-        "farm_attack_rate_observed_median_pooled_tail_area",
+        "farm_attack_rate_observed_mean_in_pooled_synthetic_90pct",
+        "farm_attack_rate_observed_mean_pooled_tail_area",
         "farm_peak_prevalence_network_uncertainty_share",
         "farm_peak_prevalence_epidemic_stochasticity_share",
-        "farm_peak_prevalence_observed_median_in_pooled_synthetic_90pct",
-        "farm_peak_prevalence_observed_median_pooled_tail_area",
+        "farm_peak_prevalence_observed_mean_in_pooled_synthetic_90pct",
+        "farm_peak_prevalence_observed_mean_pooled_tail_area",
         "farm_duration_network_uncertainty_share",
         "farm_duration_epidemic_stochasticity_share",
-        "farm_duration_observed_median_in_pooled_synthetic_90pct",
-        "farm_duration_observed_median_pooled_tail_area",
+        "farm_duration_observed_mean_in_pooled_synthetic_90pct",
+        "farm_duration_observed_mean_pooled_tail_area",
         "farm_peak_day_network_uncertainty_share",
         "farm_peak_day_epidemic_stochasticity_share",
-        "farm_peak_day_observed_median_in_pooled_synthetic_90pct",
-        "farm_peak_day_observed_median_pooled_tail_area",
+        "farm_peak_day_observed_mean_in_pooled_synthetic_90pct",
+        "farm_peak_day_observed_mean_pooled_tail_area",
         "farm_cumulative_incidence_network_uncertainty_share",
         "farm_cumulative_incidence_epidemic_stochasticity_share",
-        "farm_cumulative_incidence_observed_median_in_pooled_synthetic_90pct",
-        "farm_cumulative_incidence_observed_median_pooled_tail_area",
+        "farm_cumulative_incidence_observed_mean_in_pooled_synthetic_90pct",
+        "farm_cumulative_incidence_observed_mean_pooled_tail_area",
         "region_reservoir_spatial_correlation_mean",
         "region_import_spatial_correlation_mean",
         "region_export_spatial_correlation_mean",
@@ -6006,7 +5989,7 @@ def write_scientific_validation_report(
         means = numeric.mean(axis=1, skipna=True).dropna()
         if means.empty:
             return "n/a"
-        return f"{float(means.median()):.3f}"
+        return f"{float(means.mean()):.3f}"
 
     def section_id_for_sample(sample_label: object) -> str:
         return f"setting-{slugify(sample_label)}"
@@ -6026,9 +6009,9 @@ def write_scientific_validation_report(
             "original_network_generated_attack_probability",
             "synthetic_network_generated_attack_probability",
             "network_generated_attack_probability_delta",
-            "original_first_infection_day_median",
-            "synthetic_first_infection_day_median",
-            "first_infection_day_median_delta",
+            "original_first_infection_day_mean",
+            "synthetic_first_infection_day_mean",
+            "first_infection_day_mean_delta",
         ]
         keep_columns = [column for column in keep_columns if column in working.columns]
         if keep_columns:
@@ -6181,8 +6164,8 @@ def write_scientific_validation_report(
             + "".join(body_rows)
             + "</tbody></table>"
         )
-        median_completeness = float(np.median(completeness_values)) if completeness_values else None
-        return table_html, median_completeness
+        mean_completeness = float(np.mean(completeness_values)) if completeness_values else None
+        return table_html, mean_completeness
 
     def setting_visual_section(row: pd.Series, role_label: str) -> str:
         sample_label = str(row["sample_label"])
@@ -6228,10 +6211,10 @@ def write_scientific_validation_report(
         farm_corop_csv_path = artifact_path(sample_label, "farm_corop_summary", extension="csv")
         figures = [
             figure_tag(dashboard_path, f"{sample_label} trajectory dashboard", title_text="Trajectory dashboard"),
-            figure_tag(delta_path, f"{sample_label} trajectory median deltas", title_text="Trajectory median deltas"),
+            figure_tag(delta_path, f"{sample_label} trajectory mean deltas", title_text="Trajectory mean deltas"),
             figure_tag(daily_mean_path, f"{sample_label} daily mean trajectories", title_text="Daily mean trajectories"),
             figure_tag(distribution_path, f"{sample_label} replicate outcome distributions", title_text="Replicate outcome distributions"),
-            figure_tag(parity_path, f"{sample_label} median parity checks", title_text="Median parity checks"),
+            figure_tag(parity_path, f"{sample_label} mean parity checks", title_text="Mean parity checks"),
             figure_tag(channel_path, f"{sample_label} hybrid-channel diagnostics", title_text="Hybrid-channel diagnostics"),
             figure_tag(turnover_path, f"{sample_label} network-delta versus epidemic-delta relationships", title_text="Network-delta versus epidemic-delta relationships"),
             figure_tag(turnover_accumulated_path, f"{sample_label} accumulated turnover and epidemic deltas", title_text="Accumulated turnover and epidemic deltas"),
@@ -6349,7 +6332,7 @@ def write_scientific_validation_report(
                 table_card_from_csv(
                     outcome_distribution_csv_path,
                     "Outcome distribution summary",
-                    note="Observed and synthetic scalar endpoints compared with Wasserstein distance and median location.",
+                    note="Observed and synthetic scalar endpoints compared with Wasserstein distance and mean location.",
                 ),
                 table_card_from_csv(
                     daily_mean_comparison_path,
@@ -6388,7 +6371,7 @@ def write_scientific_validation_report(
                 table_card_from_csv(
                     scalar_calibration_path,
                     "Scalar calibration",
-                    note="Observed scalar medians checked against synthetic 90% intervals.",
+                    note="Observed scalar means checked against synthetic 90% intervals.",
                 ),
                 table_card_from_csv(
                     uncertainty_decomposition_path,
@@ -6493,20 +6476,20 @@ def write_scientific_validation_report(
         )
         return ordered.drop(columns=["_gallery_is_aggregate", "_gallery_prevalence", "_gallery_attack"])
 
-    def column_median(frame: pd.DataFrame, column: str) -> str:
+    def column_mean(frame: pd.DataFrame, column: str) -> str:
         if column not in frame.columns:
             return "n/a"
         values = pd.to_numeric(frame[column], errors="coerce").dropna()
         if values.empty:
             return "n/a"
-        return f"{float(values.median()):.3f}"
+        return f"{float(values.mean()):.3f}"
 
-    coverage_table_html, median_completeness_value = coverage_matrix_html(gallery_rows(headline_source))
-    median_prevalence_coverage = column_median(headline_rows, "farm_prevalence_interval_coverage")
-    median_attack_network_share = column_median(headline_rows, "farm_attack_rate_network_uncertainty_share")
-    median_region_reservoir_spatial = column_median(headline_rows, "region_reservoir_spatial_correlation_mean")
-    median_farm_spatial_corr = column_median(headline_rows, "farm_attack_probability_correlation")
-    median_hybrid_corr = row_mean_text(
+    coverage_table_html, mean_completeness_value = coverage_matrix_html(gallery_rows(headline_source))
+    mean_prevalence_coverage = column_mean(headline_rows, "farm_prevalence_interval_coverage")
+    mean_attack_network_share = column_mean(headline_rows, "farm_attack_rate_network_uncertainty_share")
+    mean_region_reservoir_spatial = column_mean(headline_rows, "region_reservoir_spatial_correlation_mean")
+    mean_farm_spatial_corr = column_mean(headline_rows, "farm_attack_probability_correlation")
+    mean_hybrid_corr = row_mean_text(
         headline_rows,
         [
             "farm_hazard_ff_curve_correlation",
@@ -6515,7 +6498,7 @@ def write_scientific_validation_report(
             "region_pressure_rr_curve_correlation",
         ],
     )
-    median_completeness = f"{median_completeness_value * 100.0:.0f}%" if median_completeness_value is not None else "n/a"
+    mean_completeness = f"{mean_completeness_value * 100.0:.0f}%" if mean_completeness_value is not None else "n/a"
 
     selected_columns = [
         ("sample_label", "Setting"),
@@ -6648,8 +6631,8 @@ def write_scientific_validation_report(
     uncertainty_columns = [
         ("sample_label", "Setting"),
         ("farm_prevalence_interval_coverage", "Prev. interval coverage"),
-        ("farm_attack_rate_observed_median_in_synthetic_90pct", "Attack in 90% band"),
-        ("farm_attack_rate_observed_median_tail_area", "Attack tail area"),
+        ("farm_attack_rate_observed_mean_in_synthetic_90pct", "Attack in 90% band"),
+        ("farm_attack_rate_observed_mean_tail_area", "Attack tail area"),
         ("farm_attack_rate_network_uncertainty_share", "Attack network share"),
         ("farm_peak_prevalence_network_uncertainty_share", "Peak network share"),
         ("farm_duration_network_uncertainty_share", "Duration network share"),
@@ -7198,11 +7181,11 @@ def write_scientific_validation_report(
         "<div class='summary-card'><h3>Run details</h3><div class='metric-value'>" + str(int(len(detail_rows))) + "</div></div>",
         "<div class='summary-card'><h3>Best farm prevalence corr</h3><div class='metric-value'>" + f"{float(pd.to_numeric(headline_rows['farm_prevalence_curve_correlation'], errors='coerce').max()):.3f}" + "</div></div>",
         "<div class='summary-card'><h3>Lowest farm attack-rate W1</h3><div class='metric-value'>" + f"{float(pd.to_numeric(headline_rows['farm_attack_rate_wasserstein'], errors='coerce').min()):.3f}" + "</div></div>",
-        "<div class='summary-card'><h3>Median prev. coverage</h3><div class='metric-value'>" + html.escape(median_prevalence_coverage) + "</div></div>",
-        "<div class='summary-card'><h3>Median region spatial corr</h3><div class='metric-value'>" + html.escape(median_region_reservoir_spatial) + "</div></div>",
-        "<div class='summary-card'><h3>Median farm risk corr</h3><div class='metric-value'>" + html.escape(median_farm_spatial_corr) + "</div></div>",
-        "<div class='summary-card'><h3>Median hybrid channel corr</h3><div class='metric-value'>" + html.escape(median_hybrid_corr) + "</div></div>",
-        "<div class='summary-card'><h3>Median report completeness</h3><div class='metric-value'>" + html.escape(median_completeness) + "</div></div>",
+        "<div class='summary-card'><h3>Mean prev. coverage</h3><div class='metric-value'>" + html.escape(mean_prevalence_coverage) + "</div></div>",
+        "<div class='summary-card'><h3>Mean region spatial corr</h3><div class='metric-value'>" + html.escape(mean_region_reservoir_spatial) + "</div></div>",
+        "<div class='summary-card'><h3>Mean farm risk corr</h3><div class='metric-value'>" + html.escape(mean_farm_spatial_corr) + "</div></div>",
+        "<div class='summary-card'><h3>Mean hybrid channel corr</h3><div class='metric-value'>" + html.escape(mean_hybrid_corr) + "</div></div>",
+        "<div class='summary-card'><h3>Mean report completeness</h3><div class='metric-value'>" + html.escape(mean_completeness) + "</div></div>",
         "</div>",
         "<div class='jumpbar'>",
         jumpbar_html,
@@ -7651,30 +7634,26 @@ def _compute_uncertainty_decomposition(
         epidemic_share = float(within_var / total_var) if np.isfinite(total_var) and total_var > 0 else np.nan
 
         if len(observed) and len(pooled):
-            observed_median = float(np.median(observed))
             observed_mean = float(np.mean(observed))
             pooled_q05 = float(np.quantile(pooled, 0.05))
             pooled_q95 = float(np.quantile(pooled, 0.95))
-            pooled_percentile = float(np.mean(pooled <= observed_median))
+            pooled_percentile = float(np.mean(pooled <= observed_mean))
             pooled_tail = float(min(1.0, 2.0 * min(pooled_percentile, 1.0 - pooled_percentile)))
-            observed_median_in_pooled = float(pooled_q05 <= observed_median <= pooled_q95)
+            observed_mean_in_pooled = float(pooled_q05 <= observed_mean <= pooled_q95)
         else:
-            observed_median = np.nan
             observed_mean = np.nan
             pooled_q05 = np.nan
             pooled_q95 = np.nan
             pooled_percentile = np.nan
             pooled_tail = np.nan
-            observed_median_in_pooled = np.nan
+            observed_mean_in_pooled = np.nan
 
         rows.append({
             "metric": metric_name,
             "sample_count": int(len(sample_means)),
             "pooled_replicate_count": int(len(pooled)),
             "observed_mean": observed_mean,
-            "observed_median": observed_median,
             "pooled_synthetic_mean": float(np.mean(pooled)) if len(pooled) else np.nan,
-            "pooled_synthetic_median": float(np.median(pooled)) if len(pooled) else np.nan,
             "pooled_synthetic_q05": pooled_q05,
             "pooled_synthetic_q95": pooled_q95,
             "between_sample_variance": between_var,
@@ -7686,9 +7665,9 @@ def _compute_uncertainty_decomposition(
             "sample_mean_max": float(np.max(sample_means)) if sample_means else np.nan,
             "sample_mean_q05": float(np.quantile(sample_means, 0.05)) if sample_means else np.nan,
             "sample_mean_q95": float(np.quantile(sample_means, 0.95)) if sample_means else np.nan,
-            "observed_median_in_pooled_synthetic_90pct": observed_median_in_pooled,
-            "observed_median_pooled_percentile": pooled_percentile,
-            "observed_median_pooled_tail_area": pooled_tail,
+            "observed_mean_in_pooled_synthetic_90pct": observed_mean_in_pooled,
+            "observed_mean_pooled_percentile": pooled_percentile,
+            "observed_mean_pooled_tail_area": pooled_tail,
         })
 
     return pd.DataFrame(rows)
@@ -7773,8 +7752,8 @@ def aggregate_posterior_reports(
         ]:
             summary[f"{summary_prefix}_network_uncertainty_share"] = _metric_lookup(uncertainty_decomposition, metric_name, "network_uncertainty_share")
             summary[f"{summary_prefix}_epidemic_stochasticity_share"] = _metric_lookup(uncertainty_decomposition, metric_name, "epidemic_stochasticity_share")
-            summary[f"{summary_prefix}_observed_median_in_pooled_synthetic_90pct"] = _metric_lookup(uncertainty_decomposition, metric_name, "observed_median_in_pooled_synthetic_90pct")
-            summary[f"{summary_prefix}_observed_median_pooled_tail_area"] = _metric_lookup(uncertainty_decomposition, metric_name, "observed_median_pooled_tail_area")
+            summary[f"{summary_prefix}_observed_mean_in_pooled_synthetic_90pct"] = _metric_lookup(uncertainty_decomposition, metric_name, "observed_mean_in_pooled_synthetic_90pct")
+            summary[f"{summary_prefix}_observed_mean_pooled_tail_area"] = _metric_lookup(uncertainty_decomposition, metric_name, "observed_mean_pooled_tail_area")
 
     outputs = write_report(
         per_snapshot=per_snapshot,
@@ -8097,13 +8076,13 @@ def write_scenario_comparison_report(
     def fmt_from_row(row: pd.Series, key: str, *, digits: int = 3) -> str:
         return _metric_text(row.get(key), digits=digits)
 
-    def column_median(column: str) -> str:
+    def column_mean(column: str) -> str:
         if column not in summary_rows.columns:
             return "n/a"
         values = pd.to_numeric(summary_rows[column], errors="coerce").dropna()
         if values.empty:
             return "n/a"
-        return f"{float(values.median()):.3f}"
+        return f"{float(values.mean()):.3f}"
 
     def relative_asset(path: Optional[Path]) -> Optional[str]:
         if path is None:
@@ -8144,7 +8123,7 @@ def write_scenario_comparison_report(
         figures = "".join(
             fig for fig in [
                 figure_tag(dashboard_path, f"{scenario_name} trajectory dashboard"),
-                figure_tag(delta_path, f"{scenario_name} trajectory median deltas"),
+                figure_tag(delta_path, f"{scenario_name} trajectory mean deltas"),
                 figure_tag(daily_mean_path, f"{scenario_name} daily mean trajectories"),
                 figure_tag(distribution_path, f"{scenario_name} replicate distributions"),
                 figure_tag(parity_path, f"{scenario_name} parity summary"),
@@ -8193,8 +8172,8 @@ def write_scenario_comparison_report(
         )
 
     scenario_cards = "\n".join(scenario_card(row, idx + 1) for idx, (_, row) in enumerate(summary_rows.iterrows()))
-    median_prevalence_coverage = column_median("farm_prevalence_interval_coverage")
-    median_attack_network_share = column_median("farm_attack_rate_network_uncertainty_share")
+    mean_prevalence_coverage = column_mean("farm_prevalence_interval_coverage")
+    mean_attack_network_share = column_mean("farm_attack_rate_network_uncertainty_share")
 
     scorecard_columns = [
         ("scenario_name", "Scenario"),
@@ -8259,14 +8238,14 @@ def write_scenario_comparison_report(
 
     scalar_uncertainty_columns = [
         ("scenario_name", "Scenario"),
-        ("farm_attack_rate_observed_median_in_pooled_synthetic_90pct", "Attack in 90% band"),
-        ("farm_attack_rate_observed_median_pooled_tail_area", "Attack tail"),
-        ("farm_peak_prevalence_observed_median_in_pooled_synthetic_90pct", "Peak in 90% band"),
-        ("farm_peak_prevalence_observed_median_pooled_tail_area", "Peak tail"),
-        ("farm_peak_day_observed_median_in_pooled_synthetic_90pct", "Peak day in 90% band"),
-        ("farm_peak_day_observed_median_pooled_tail_area", "Peak day tail"),
-        ("farm_duration_observed_median_in_pooled_synthetic_90pct", "Duration in 90% band"),
-        ("farm_duration_observed_median_pooled_tail_area", "Duration tail"),
+        ("farm_attack_rate_observed_mean_in_pooled_synthetic_90pct", "Attack in 90% band"),
+        ("farm_attack_rate_observed_mean_pooled_tail_area", "Attack tail"),
+        ("farm_peak_prevalence_observed_mean_in_pooled_synthetic_90pct", "Peak in 90% band"),
+        ("farm_peak_prevalence_observed_mean_pooled_tail_area", "Peak tail"),
+        ("farm_peak_day_observed_mean_in_pooled_synthetic_90pct", "Peak day in 90% band"),
+        ("farm_peak_day_observed_mean_pooled_tail_area", "Peak day tail"),
+        ("farm_duration_observed_mean_in_pooled_synthetic_90pct", "Duration in 90% band"),
+        ("farm_duration_observed_mean_pooled_tail_area", "Duration tail"),
         ("farm_attack_rate_network_uncertainty_share", "Attack net share"),
         ("farm_peak_prevalence_network_uncertainty_share", "Peak net share"),
         ("farm_peak_day_network_uncertainty_share", "Peak day net share"),
@@ -8375,8 +8354,8 @@ def write_scenario_comparison_report(
         "<div class='summary-card'><h3>Scenarios</h3><div class='metric-value'>" + str(int(len(summary_rows))) + "</div></div>",
         "<div class='summary-card'><h3>Best fit</h3><div class='metric-value'>" + html.escape(str(best_row["scenario_name"])) + "</div></div>",
         "<div class='summary-card'><h3>Strongest separator</h3><div class='metric-value'>" + html.escape(str(stress_row["scenario_name"])) + "</div></div>",
-        "<div class='summary-card'><h3>Median prev. 90% cov</h3><div class='metric-value'>" + html.escape(median_prevalence_coverage) + "</div></div>",
-        "<div class='summary-card'><h3>Median attack net share</h3><div class='metric-value'>" + html.escape(median_attack_network_share) + "</div></div>",
+        "<div class='summary-card'><h3>Mean prev. 90% cov</h3><div class='metric-value'>" + html.escape(mean_prevalence_coverage) + "</div></div>",
+        "<div class='summary-card'><h3>Mean attack net share</h3><div class='metric-value'>" + html.escape(mean_attack_network_share) + "</div></div>",
         "</div>",
         "</section>",
         scenario_browser_section_html,
@@ -8464,7 +8443,7 @@ def write_scenario_comparison_report(
                     explain_text="These columns compare the mean trajectory across replicates for each day. Higher correlations mean the timing and shape line up well, while lower mean absolute error means the daily gap stays small.",
                     button_label="How to read this table",
                 ),
-                "<p class='subtitle'>These columns summarize the daywise mean trajectory fit. They are helpful when the median stays flat at zero for long stretches and hides smaller shifts in timing or scale.</p>",
+                "<p class='subtitle'>These columns summarize the daywise mean trajectory fit. They are helpful for seeing smaller shifts in timing or scale across sparse trajectories.</p>",
                 "<div class='table-wrap'>",
                 "<table class='report-table'>",
                 "<thead><tr>" + "".join(f"<th>{html.escape(label)}</th>" for _, label in available_daily_mean) + "</tr></thead>",
@@ -8527,7 +8506,7 @@ def write_scenario_comparison_report(
                 _render_section_heading(
                     "Scalar calibration and uncertainty",
                     control_id="scalar_uncertainty_explain",
-                    explain_text="An in-band value of 1 means the observed median falls inside the pooled synthetic 90% interval. Tail area close to 1 means the observed median sits near the center of the synthetic distribution, while values near 0 place it in the tails. Network uncertainty share near 1 means panel-to-panel network variation dominates predictive variance.",
+                    explain_text="An in-band value of 1 means the observed mean falls inside the pooled synthetic 90% interval. Tail area close to 1 means the observed mean sits near the center of the synthetic distribution, while values near 0 place it in the tails. Network uncertainty share near 1 means panel-to-panel network variation dominates predictive variance.",
                     button_label="How to read this table",
                 ),
                 "<p class='subtitle'>These columns show whether the observed scalar endpoints fall inside pooled synthetic 90% intervals and how much predictive variance comes from between-panel network differences rather than within-panel epidemic stochasticity.</p>",
