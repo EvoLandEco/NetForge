@@ -82,20 +82,23 @@ class PipelineWeightAlignmentTests(unittest.TestCase):
 
         args = parser.parse_args([])
 
-        self.assertEqual(args.temporal_generator_mode, "markov_turnover")
-        self.assertEqual(args.temporal_activity_level, "auto")
-        self.assertEqual(args.temporal_group_mode, "auto")
-        self.assertEqual(args.temporal_activity_count_constraint, "observed")
-        self.assertEqual(args.temporal_activity_initial, "observed")
+        self.assertEqual(args.temporal_generator_mode, "operational")
+        self.assertEqual(args.temporal_activity_level, "block")
+        self.assertEqual(args.temporal_group_mode, "block_pair")
         self.assertEqual(args.temporal_proposal_rounds, 3)
         self.assertEqual(args.temporal_proposal_rounds_max, 12)
-        self.assertEqual(args.temporal_proposal_mode, "auto")
+        self.assertEqual(args.temporal_proposal_mode, "sbm")
         self.assertEqual(args.temporal_random_proposal_multiplier, 1.0)
+        self.assertFalse(hasattr(args, "temporal_activity_count_constraint"))
+        self.assertFalse(hasattr(args, "temporal_activity_initial"))
+        self.assertFalse(hasattr(args, "temporal_activity_prior_strength"))
+        self.assertFalse(hasattr(args, "temporal_activity_snapshot_match_attempts"))
+        self.assertFalse(hasattr(args, "temporal_activity_composition_weight"))
 
     def test_generation_config_parser_accepts_temporal_generator_ablation_keys(self):
         args = _build_namespace_from_config(
             {
-                "temporal_generator_mode": "markov_turnover_random",
+                "temporal_generator_mode": "operational",
                 "temporal_group_mode": "type_pair",
                 "temporal_proposal_mode": "random",
                 "temporal_random_proposal_multiplier": 1.5,
@@ -105,67 +108,74 @@ class PipelineWeightAlignmentTests(unittest.TestCase):
             adders=[add_generation_arguments],
         )
 
-        self.assertEqual(args.temporal_generator_mode, "markov_turnover_random")
+        self.assertEqual(args.temporal_generator_mode, "operational")
         self.assertEqual(args.temporal_group_mode, "type_pair")
         self.assertEqual(args.temporal_proposal_mode, "random")
         self.assertEqual(args.temporal_random_proposal_multiplier, 1.5)
         self.assertEqual(args.temporal_proposal_rounds, 16)
         self.assertEqual(args.temporal_proposal_rounds_max, 64)
 
-    def test_temporal_generator_mode_defaults_to_markov_turnover(self):
-        self.assertEqual(_temporal_generator_mode_name(argparse.Namespace()), "markov_turnover")
+    def test_temporal_generator_mode_defaults_to_operational(self):
+        self.assertEqual(_temporal_generator_mode_name(argparse.Namespace()), "operational")
 
-    def test_temporal_generator_mode_maps_random_alias(self):
+    def test_temporal_activity_level_requires_explicit_value(self):
         self.assertEqual(
-            _temporal_generator_mode_name(argparse.Namespace(temporal_generator_mode="random")),
-            "markov_turnover_random",
-        )
-
-    def test_temporal_activity_level_auto_prefers_blocks(self):
-        self.assertEqual(
-            _temporal_activity_level_name(argparse.Namespace(temporal_activity_level="auto"), has_blocks=True),
+            _temporal_activity_level_name(argparse.Namespace(temporal_activity_level="block"), has_blocks=True),
             "block",
         )
         self.assertEqual(
-            _temporal_activity_level_name(argparse.Namespace(temporal_activity_level="auto"), has_blocks=False),
+            _temporal_activity_level_name(argparse.Namespace(temporal_activity_level="node"), has_blocks=True),
             "node",
         )
 
-    def test_temporal_group_mode_auto_falls_back_by_available_structure(self):
-        args = argparse.Namespace(temporal_group_mode="auto")
-
+    def test_temporal_group_mode_requires_available_structure(self):
         self.assertEqual(
-            _temporal_group_mode_name(args, has_blocks=True, has_types=True, activity_level="block"),
+            _temporal_group_mode_name(
+                argparse.Namespace(temporal_group_mode="block_pair"),
+                has_blocks=True,
+                has_types=True,
+                activity_level="block",
+            ),
             "block_pair",
         )
         self.assertEqual(
-            _temporal_group_mode_name(args, has_blocks=False, has_types=True, activity_level="node"),
+            _temporal_group_mode_name(
+                argparse.Namespace(temporal_group_mode="type_pair"),
+                has_blocks=True,
+                has_types=True,
+                activity_level="node",
+            ),
             "type_pair",
         )
         self.assertEqual(
-            _temporal_group_mode_name(args, has_blocks=False, has_types=False, activity_level="node"),
+            _temporal_group_mode_name(
+                argparse.Namespace(temporal_group_mode="global"),
+                has_blocks=True,
+                has_types=False,
+                activity_level="node",
+            ),
             "global",
         )
 
-    def test_temporal_proposal_mode_auto_follows_temporal_generator_mode(self):
+    def test_temporal_proposal_mode_uses_explicit_value(self):
         self.assertEqual(
-            _temporal_proposal_mode_name(argparse.Namespace(), temporal_mode="markov_turnover"),
+            _temporal_proposal_mode_name(argparse.Namespace(), temporal_mode="operational"),
             "sbm",
         )
         self.assertEqual(
             _temporal_proposal_mode_name(
-                argparse.Namespace(temporal_generator_mode="markov_turnover_random"),
-                temporal_mode="markov_turnover_random",
+                argparse.Namespace(temporal_proposal_mode="random"),
+                temporal_mode="operational",
             ),
             "random",
         )
 
-    def test_sample_synthetic_panel_routes_none_mode_to_legacy_sampler(self):
-        args = argparse.Namespace(temporal_generator_mode="none")
+    def test_sample_synthetic_panel_routes_independent_sbm_mode_to_independent_sampler(self):
+        args = argparse.Namespace(temporal_generator_mode="independent_sbm")
 
         with (
             mock.patch("temporal_sbm.pipeline._sample_synthetic_panel_independent_layers", return_value={"mode": "legacy"}) as legacy,
-            mock.patch("temporal_sbm.pipeline._sample_synthetic_panel_markov_turnover") as turnover,
+            mock.patch("temporal_sbm.pipeline._sample_synthetic_panel_operational_turnover") as turnover,
         ):
             result = sample_synthetic_panel(
                 graph=object(),
@@ -182,12 +192,12 @@ class PipelineWeightAlignmentTests(unittest.TestCase):
         turnover.assert_not_called()
         self.assertEqual(result, {"mode": "legacy"})
 
-    def test_sample_synthetic_panel_routes_default_mode_to_markov_turnover(self):
+    def test_sample_synthetic_panel_routes_default_mode_to_operational_turnover(self):
         args = argparse.Namespace()
 
         with (
             mock.patch("temporal_sbm.pipeline._sample_synthetic_panel_independent_layers") as legacy,
-            mock.patch("temporal_sbm.pipeline._sample_synthetic_panel_markov_turnover", return_value={"mode": "markov_turnover"}) as turnover,
+            mock.patch("temporal_sbm.pipeline._sample_synthetic_panel_operational_turnover", return_value={"mode": "operational"}) as turnover,
         ):
             result = sample_synthetic_panel(
                 graph=object(),
@@ -202,14 +212,14 @@ class PipelineWeightAlignmentTests(unittest.TestCase):
 
         legacy.assert_not_called()
         turnover.assert_called_once()
-        self.assertEqual(result, {"mode": "markov_turnover"})
+        self.assertEqual(result, {"mode": "operational"})
 
-    def test_sample_synthetic_panel_routes_random_temporal_mode_to_markov_turnover(self):
-        args = argparse.Namespace(temporal_generator_mode="markov_turnover_random")
+    def test_sample_synthetic_panel_routes_random_proposal_mode_to_operational_turnover(self):
+        args = argparse.Namespace(temporal_generator_mode="operational", temporal_proposal_mode="random")
 
         with (
             mock.patch("temporal_sbm.pipeline._sample_synthetic_panel_independent_layers") as legacy,
-            mock.patch("temporal_sbm.pipeline._sample_synthetic_panel_markov_turnover", return_value={"mode": "markov_turnover_random"}) as turnover,
+            mock.patch("temporal_sbm.pipeline._sample_synthetic_panel_operational_turnover", return_value={"mode": "operational_random"}) as turnover,
         ):
             result = sample_synthetic_panel(
                 graph=object(),
@@ -224,7 +234,7 @@ class PipelineWeightAlignmentTests(unittest.TestCase):
 
         legacy.assert_not_called()
         turnover.assert_called_once()
-        self.assertEqual(result, {"mode": "markov_turnover_random"})
+        self.assertEqual(result, {"mode": "operational_random"})
 
     def test_default_metadata_fields_include_rebuilt_cr35_tags(self):
         self.assertIn("coord_source", DEFAULT_METADATA_FIELDS)
@@ -267,7 +277,7 @@ class PipelineWeightAlignmentTests(unittest.TestCase):
             mock.patch("temporal_sbm.pipeline._fit_with_weight_candidates", return_value=("state", weight_model, [])),
             mock.patch(
                 "temporal_sbm.pipeline._fit_temporal_generator_model",
-                return_value={"format": "temporal_generator_model_v1", "summary": {}},
+                return_value={"format": "temporal_generator_model_v3", "summary": {}},
             ),
             mock.patch("temporal_sbm.pipeline.attach_partition_maps"),
             mock.patch("temporal_sbm.pipeline.write_fit_artifacts", return_value={"run_dir": "/tmp/netforge-fit"}),

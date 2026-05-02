@@ -45,19 +45,6 @@ LOGGER = logging.getLogger(__name__)
 _ACTIVE_LOG_TEE: Optional["_TerminalLogTee"] = None
 
 
-def _parse_positive_int_or_inf(value: object) -> Optional[int]:
-    text = str(value).strip().lower()
-    if text in {"inf", "infinity", "unbounded", "unlimited"}:
-        return None
-    try:
-        parsed = int(text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("Expected a positive integer or 'inf'.") from exc
-    if parsed < 1:
-        raise argparse.ArgumentTypeError("Expected a positive integer or 'inf'.")
-    return parsed
-
-
 class _TerminalLogTee:
     def __init__(self, log_path: Path) -> None:
         self.log_path = Path(log_path)
@@ -498,69 +485,27 @@ def add_generation_arguments(
         )
     parser.add_argument(
         "--temporal-generator-mode",
-        default="markov_turnover",
-        choices=["markov_turnover", "markov_turnover_random", "none"],
-        help="Temporal generator used for snapshot sampling. 'markov_turnover' uses SBM proposals, 'markov_turnover_random' uses random proposals, and 'none' uses the older independent-layer sampler.",
+        default="operational",
+        choices=["operational", "independent_sbm"],
+        help="Topology sampler used for generation. 'operational' uses stored block activity, turnover quotas, and proposal pools. 'independent_sbm' samples each layer directly from the SBM for ablations.",
     )
     parser.add_argument(
         "--temporal-activity-level",
-        default="auto",
-        choices=["auto", "node", "block"],
-        help="Level used by the temporal activity model. 'auto' uses blocks when block labels are available and falls back to nodes otherwise.",
+        default="block",
+        choices=["block", "node"],
+        help="Stored activity path level used by operational temporal generation.",
     )
     parser.add_argument(
         "--temporal-group-mode",
-        default="auto",
-        choices=["auto", "block_pair", "type_pair", "global"],
-        help="Grouping used for temporal turnover targets. 'auto' prefers block pairs, then type pairs, then a single global pool.",
-    )
-    parser.add_argument(
-        "--temporal-activity-count-constraint",
-        default="observed",
-        choices=["observed", "model"],
-        help="Keep the observed active-entity count in each snapshot or let the Markov activity model sample counts on its own.",
-    )
-    parser.add_argument(
-        "--temporal-activity-initial",
-        default="observed",
-        choices=["observed", "model"],
-        help="Start the activity process from the observed first snapshot or sample the initial active set from the fitted activity model.",
-    )
-    parser.add_argument(
-        "--temporal-activity-snapshot-match-mode",
-        default="none",
-        choices=["none", "stored", "stepwise", "full_panel"],
-        help="How the temporal activity sampler handles stored daily activity snapshots. 'stepwise' runs the step-by-step exact-match bridge search, 'full_panel' searches over whole-panel draws, 'stored' reuses the saved snapshots directly, and 'none' leaves activity states unconstrained.",
-    )
-    parser.add_argument(
-        "--temporal-activity-snapshot-match-attempts",
-        type=_parse_positive_int_or_inf,
-        default=32,
-        help="Maximum number of per-day search attempts used when snapshot matching runs in search mode. Use 'inf' for an unbounded search.",
-    )
-    parser.add_argument(
-        "--temporal-activity-prior-strength",
-        type=float,
-        default=8.0,
-        help="Pseudo-count strength used by the temporal activity Markov model.",
-    )
-    parser.add_argument(
-        "--temporal-activity-composition-mode",
-        default="auto",
-        choices=["auto", "none", "total", "type_count"],
-        help="How strongly the sampled activity state tracks observed realized active-node totals. 'auto' uses type counts when node types are available and total counts otherwise.",
-    )
-    parser.add_argument(
-        "--temporal-activity-composition-weight",
-        type=float,
-        default=0.15,
-        help="Weight applied when the activity sampler scores candidates against realized active-node composition targets.",
+        default="block_pair",
+        choices=["block_pair", "type_pair", "global"],
+        help="Grouping used for operational turnover quotas.",
     )
     parser.add_argument(
         "--temporal-realized-activity-mode",
-        default="auto",
-        choices=["auto", "none", "total", "type_count"],
-        help="How strongly turnover-pool selection favors edges that reduce realized active-node shortfall. 'auto' uses type counts when node types are available and total counts otherwise.",
+        default="total",
+        choices=["none", "total", "type_count"],
+        help="How strongly turnover-pool selection favors edges that reduce realized active-node shortfall.",
     )
     parser.add_argument(
         "--temporal-realized-activity-weight",
@@ -582,9 +527,9 @@ def add_generation_arguments(
     )
     parser.add_argument(
         "--temporal-proposal-mode",
-        default="auto",
-        choices=["auto", "sbm", "random"],
-        help="Proposal source used by the temporal generator. 'auto' follows the selected temporal generator mode.",
+        default="sbm",
+        choices=["sbm", "random"],
+        help="Proposal source used by operational temporal generation. Use 'random' for the random dyad ablation.",
     )
     parser.add_argument(
         "--temporal-random-proposal-multiplier",

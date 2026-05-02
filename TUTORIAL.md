@@ -185,10 +185,10 @@ netforge generate \
   --posterior-partition-sweep-niter 10
 ```
 
-The default generation label is `markov_turnover__proposal_sbm__micro__rewire_none`, so the samples land under:
+The default generation label is `operational__proposal_sbm__micro__rewire_none`, so the samples land under:
 
 ```text
-examples/toy_nl/processed_data/TOY_NL/graph_tool_out/netforge/generated/markov_turnover__proposal_sbm__micro__rewire_none/
+examples/toy_nl/processed_data/TOY_NL/graph_tool_out/netforge/generated/operational__proposal_sbm__micro__rewire_none/
 ```
 
 Each `sample_####/` directory contains `synthetic_edges.csv` and `sample_manifest.json`.

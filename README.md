@@ -72,7 +72,7 @@ netforge generate \
   --posterior-partition-sweep-niter 10
 ```
 
-By default this generation batch is stored under `generated/markov_turnover__proposal_sbm__micro__rewire_none/`, with one `sample_####/` directory per draw.
+By default this generation batch is stored under `generated/operational__proposal_sbm__micro__rewire_none/`, with one `sample_####/` directory per draw.
 
 Write diagnostics:
 

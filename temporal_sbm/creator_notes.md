@@ -4,7 +4,7 @@
 
 - farm and region nodes carry metadata and numeric covariates
 - blocks drive cross sectional structure
-- block activity follows a two state Markov chain through time
+- block activity follows a stored activity path through time
 - each snapshot is assembled from persist, reactivated, and new contacts
 - weights are sampled after topology from a shifted negative binomial law
 

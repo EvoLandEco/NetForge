@@ -54,18 +54,20 @@ Common flags:
 - `--output-subdir` to choose the setting directory under `<run-dir>/generated/`
 - `--posterior-partition-sweeps`, `--posterior-partition-sweep-niter`, and `--posterior-partition-beta` to refresh the fitted partition before each draw
 - `--weight-generation-mode`, `--weight-parametric-partition-policy`, and `--weight-pure-generative` to control how weighted generation uses the saved weight model
-- `--temporal-generator-mode` to choose between the stored Markov turnover generator and the older independent-layer sampler
-- `--temporal-activity-level`, `--temporal-group-mode`, and the temporal proposal flags to control turnover targets and proposal pools
+- `--temporal-generator-mode` to choose between operational generation and independent SBM generation for ablations
+- `--temporal-activity-level`, `--temporal-group-mode`, and the temporal proposal flags to control stored activity paths, turnover targets, and proposal pools
 - `--rewire-model` and `--rewire-n-iter` for rewiring sensitivity analyses after each sampled snapshot
 - `--save-graph-tool-snapshots` to save `.gt` files for each generated snapshot
 
-The default temporal generation path uses `--temporal-generator-mode markov_turnover`, so the default setting label is `markov_turnover__proposal_sbm__micro__rewire_none`. Each generation batch writes:
+The default temporal generation path uses `--temporal-generator-mode operational`, so the default setting label is `operational__proposal_sbm__micro__rewire_none`. Each generation batch writes:
 
 - `generated/<setting-label>/setting_manifest.json`
 - `generated/<setting-label>/sample_####/synthetic_edges.csv`
 - `generated/<setting-label>/sample_####/sample_manifest.json`
 
 When the temporal generator is active, sample directories also include `temporal_generation_summary.json`.
+
+For ablations, use `--temporal-proposal-mode random` to keep the stored activity path and turnover quotas while replacing SBM proposal pools with random active dyads. Use `--temporal-generator-mode independent_sbm` to sample snapshots directly from the SBM without stored activity paths or turnover quotas.
 
 ## `netforge report`
 
